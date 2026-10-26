@@ -112,6 +112,58 @@ export function createDatabase(dbPath?: string): DatabaseSync {
       media_url TEXT,
       created_at INTEGER NOT NULL
     );
+
+    -- Superpoderes Extendidos: Gestión de Equipo, Canned Responses, Growth Links y Pagos
+    CREATE TABLE IF NOT EXISTS agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL,
+      phone TEXT,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      role TEXT NOT NULL DEFAULT 'agent', -- 'admin' | 'agent'
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_assignments (
+      contact_phone TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      assigned_at INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'OPEN' -- 'OPEN' | 'RESOLVED'
+    );
+
+    CREATE TABLE IF NOT EXISTS canned_responses (
+      id TEXT PRIMARY KEY,
+      shortcut TEXT UNIQUE NOT NULL, -- Ej: '/precio', '/cuenta', '/promo'
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      media_url TEXT,
+      category TEXT NOT NULL DEFAULT 'general',
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS growth_links (
+      id TEXT PRIMARY KEY,
+      slug TEXT UNIQUE NOT NULL, -- Ej: 'promo-verano', 'fb-ads'
+      target_flow_id TEXT,
+      initial_tag TEXT,
+      prefilled_text TEXT NOT NULL,
+      clicks INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_transactions (
+      id TEXT PRIMARY KEY,
+      contact_phone TEXT NOT NULL,
+      amount REAL NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'COP',
+      description TEXT NOT NULL,
+      gateway TEXT NOT NULL, -- 'wompi' | 'mercadopago' | 'stripe' | 'simulator'
+      external_id TEXT,
+      payment_link TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PENDING', -- 'PENDING' | 'APPROVED' | 'REJECTED'
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
   `)
 
   return db

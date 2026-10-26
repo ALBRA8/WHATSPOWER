@@ -5,6 +5,11 @@ import { ConversationRouter } from './engine/router.ts'
 import { MockTransportSender, HttpAlbraTransportSender } from './adapters/transport.ts'
 import { MockCrmClient, HttpCrmClient } from './adapters/crm-client.ts'
 import { renderStudioHtml } from './studio/studio-html.ts'
+import { TeamManager } from './state/team-manager.ts'
+import { CannedResponseManager } from './engine/canned-responses.ts'
+import { GrowthToolsManager } from './engine/growth-tools.ts'
+import { CrmTriggerListener } from './engine/crm-triggers.ts'
+import { PaymentGatewayManager } from './payments/payment-gateway.ts'
 import type { InboundEvent, TransportSender, CrmClientInterface } from './types.ts'
 
 try {
@@ -16,6 +21,7 @@ export function createAgenticServer(options?: {
   transport?: TransportSender
   crm?: CrmClientInterface
   webhookSecret?: string
+  businessPhone?: string
 }) {
   const db = createDatabase(options?.dbPath)
   const transport = options?.transport || new MockTransportSender()
@@ -23,6 +29,11 @@ export function createAgenticServer(options?: {
   const webhookSecret = options?.webhookSecret || process.env.WEBHOOK_SECRET || 'dev_secret_shared_albra_2a'
 
   const router = new ConversationRouter(db, transport, crm)
+  const teamManager = new TeamManager(db)
+  const cannedManager = new CannedResponseManager(db)
+  const growthManager = new GrowthToolsManager(db, options?.businessPhone || '573001234567')
+  const crmTriggers = new CrmTriggerListener(db, router.getFlowEngine())
+  const paymentManager = new PaymentGatewayManager(db)
 
   function verifyHmac(payload: string, signatureHeader?: string): boolean {
     if (!signatureHeader) return false
@@ -333,11 +344,174 @@ export function createAgenticServer(options?: {
       return
     }
 
+    // ==========================================
+    // EXTENSIONES: EQUIPO, CANNED, GROWTH, PAGOS
+    // ==========================================
+
+    // 1. Team & Round-Robin
+    if (req.method === 'GET' && url.pathname === '/api/team/agents') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(teamManager.getActiveAgents()))
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/team/agents') {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        try {
+          const data = JSON.parse(body)
+          const agent = teamManager.registerAgent(data)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(agent))
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: e.message }))
+        }
+      })
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/team/assign') {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        try {
+          const { phone, strategy } = JSON.parse(body)
+          const agent = strategy === 'least_loaded'
+            ? teamManager.assignLeastLoaded(phone)
+            : teamManager.assignRoundRobin(phone)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ assignedAgent: agent }))
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: e.message }))
+        }
+      })
+      return
+    }
+
+    // 2. Canned Responses (/canned)
+    if (req.method === 'GET' && url.pathname === '/api/canned') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(cannedManager.listAll()))
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/canned') {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        try {
+          const item = cannedManager.createResponse(JSON.parse(body))
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(item))
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: e.message }))
+        }
+      })
+      return
+    }
+
+    // 3. Growth Links & Ref URLs (/ref/:slug)
+    if (req.method === 'GET' && url.pathname.startsWith('/ref/')) {
+      const slug = url.pathname.replace('/ref/', '')
+      const redirectUrl = growthManager.registerClick(slug)
+      if (redirectUrl) {
+        res.writeHead(302, { Location: redirectUrl })
+        res.end()
+        return
+      }
+      res.writeHead(404, { 'Content-Type': 'text/plain' })
+      res.end('Enlace de crecimiento no encontrado')
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/growth/links') {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        try {
+          const link = growthManager.createGrowthLink(JSON.parse(body))
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(link))
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: e.message }))
+        }
+      })
+      return
+    }
+
+    // 4. CRM Stage Change Trigger
+    if (req.method === 'POST' && url.pathname === '/api/crm/stage-change') {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', async () => {
+        try {
+          const event = JSON.parse(body)
+          const result = await crmTriggers.handleStageChange(event)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(result))
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: e.message }))
+        }
+      })
+      return
+    }
+
+    // 5. Payment Links & Webhooks
+    if (req.method === 'POST' && url.pathname === '/api/payments/create-link') {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        try {
+          const tx = paymentManager.createPaymentLink(JSON.parse(body))
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(tx))
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: e.message }))
+        }
+      })
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/payments/webhook') {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        try {
+          const { transactionId, status } = JSON.parse(body)
+          const tx = paymentManager.handlePaymentWebhook(transactionId, status)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, transaction: tx }))
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: e.message }))
+        }
+      })
+      return
+    }
+
     res.writeHead(404, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ error: 'Ruta no encontrada' }))
   })
 
-  return { server, db, router, transport, crm }
+  return {
+    server,
+    db,
+    router,
+    transport,
+    crm,
+    teamManager,
+    cannedManager,
+    growthManager,
+    crmTriggers,
+    paymentManager,
+  }
 }
 
 // Auto-arranque si se ejecuta directamente con node
