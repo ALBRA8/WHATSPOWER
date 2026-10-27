@@ -15,7 +15,7 @@ export interface InboundMessage {
 export interface InboundEvent {
   eventId: string
   orgId: string
-  correlationId: string
+  correlationId?: string
   timestamp: string
   channel: 'whatsapp' | 'instagram' | 'telegram'
   contact: InboundContact

@@ -42,7 +42,10 @@ export class ConversationRouter {
    * Procesa un evento de mensaje entrante de forma determinista y segura.
    */
   async processInbound(event: InboundEvent): Promise<ExecutionResult> {
-    const { eventId, orgId, correlationId, contact, message } = event
+    // correlationId es opcional en el contrato inbound: si no llega, se usa el eventId
+    // (evita binds SQLite con undefined → 500 en POST /api/inbound).
+    const { eventId, orgId, contact, message } = event
+    const correlationId = event.correlationId || eventId
     const phone = contact.phone
 
     // 1. DEDUPLICACIÓN E IDEMPOTENCIA

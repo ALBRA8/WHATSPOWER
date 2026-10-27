@@ -25,8 +25,17 @@ export function createAgenticServer(options?: {
 }) {
   const db = createDatabase(options?.dbPath)
   const transport = options?.transport || new MockTransportSender()
-  const crm = options?.crm || new MockCrmClient()
-  const webhookSecret = options?.webhookSecret || process.env.WEBHOOK_SECRET || 'dev_secret_shared_albra_2a'
+  // CRM Actions Bridge: cliente HTTP real hacia CRM-ALBRA cuando hay API key configurada;
+  // Mock solo en desarrollo sin credenciales (antes el server de producción usaba SIEMPRE Mock).
+  const crm = options?.crm
+    || (process.env.CRM_API_KEY
+      ? new HttpCrmClient(process.env.CRM_BASE_URL || 'http://localhost:3000', process.env.CRM_API_KEY)
+      : new MockCrmClient())
+  // Secret dual: AGENTIC_2A_WEBHOOK_SECRET (documentado en README) tiene prioridad sobre WEBHOOK_SECRET (legacy).
+  const webhookSecret = options?.webhookSecret
+    || process.env.AGENTIC_2A_WEBHOOK_SECRET
+    || process.env.WEBHOOK_SECRET
+    || 'dev_secret_shared_albra_2a'
 
   const router = new ConversationRouter(db, transport, crm)
   const teamManager = new TeamManager(db)
