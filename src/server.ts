@@ -32,10 +32,11 @@ export function createAgenticServer(options?: {
       ? new HttpCrmClient(process.env.CRM_BASE_URL || 'http://localhost:3000', process.env.CRM_API_KEY)
       : new MockCrmClient())
   // Secret dual: AGENTIC_2A_WEBHOOK_SECRET (documentado en README) tiene prioridad sobre WEBHOOK_SECRET (legacy).
+  // FAIL-CLOSED (rotación 2026-10-27): eliminado fallback hardcodeado del webhookSecret
+  // (un valor publicado en el repo permitía forjar firmas). Sin secret configurado, verifyHmac rechaza todo.
   const webhookSecret = options?.webhookSecret
     || process.env.AGENTIC_2A_WEBHOOK_SECRET
     || process.env.WEBHOOK_SECRET
-    || 'dev_secret_shared_albra_2a'
 
   const router = new ConversationRouter(db, transport, crm)
   const teamManager = new TeamManager(db)
@@ -45,7 +46,7 @@ export function createAgenticServer(options?: {
   const paymentManager = new PaymentGatewayManager(db)
 
   function verifyHmac(payload: string, signatureHeader?: string): boolean {
-    if (!signatureHeader) return false
+    if (!webhookSecret || !signatureHeader) return false
     const expected = createHmac('sha256', webhookSecret).update(payload).digest('hex')
     return expected === signatureHeader
   }
@@ -190,7 +191,13 @@ export function createAgenticServer(options?: {
 
     if (req.method === 'GET' && url.pathname === '/qr/data') {
       try {
-        const daemonSecret = process.env.INTERNAL_API_SECRET || 'crm_albra_internal_secret_key_fixed_length_for_daemon_2026'
+        // FAIL-CLOSED (rotación 2026-10-27): sin secret configurado no se consulta el daemon
+        const daemonSecret = process.env.INTERNAL_API_SECRET
+        if (!daemonSecret) {
+          res.writeHead(503, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Service Unavailable: INTERNAL_API_SECRET no configurado' }))
+          return
+        }
         const daemonRes = await fetch('http://localhost:3002/qr', {
           headers: { 'Authorization': 'Bearer ' + daemonSecret }
         })
@@ -234,8 +241,9 @@ export function createAgenticServer(options?: {
     // 3.2 Registro Administrativo de Supresión (POST /api/internal/suppression/:phone)
     if (req.method === 'POST' && url.pathname.startsWith('/api/internal/suppression/')) {
       const authHeader = req.headers['authorization']
-      const internalSecret = process.env.INTERNAL_API_SECRET || 'crm_albra_internal_secret_key_fixed_length_for_daemon_2026'
-      if (!authHeader || authHeader !== `Bearer ${internalSecret}`) {
+      // FAIL-CLOSED (rotación 2026-10-27): sin secret configurado se rechaza siempre
+      const internalSecret = process.env.INTERNAL_API_SECRET
+      if (!internalSecret || !authHeader || authHeader !== `Bearer ${internalSecret}`) {
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
         return
@@ -272,8 +280,9 @@ export function createAgenticServer(options?: {
     // 3.3 Eliminación Administrativa de Supresión (DELETE /api/internal/suppression/:phone)
     if (req.method === 'DELETE' && url.pathname.startsWith('/api/internal/suppression/')) {
       const authHeader = req.headers['authorization']
-      const internalSecret = process.env.INTERNAL_API_SECRET || 'crm_albra_internal_secret_key_fixed_length_for_daemon_2026'
-      if (!authHeader || authHeader !== `Bearer ${internalSecret}`) {
+      // FAIL-CLOSED (rotación 2026-10-27): sin secret configurado se rechaza siempre
+      const internalSecret = process.env.INTERNAL_API_SECRET
+      if (!internalSecret || !authHeader || authHeader !== `Bearer ${internalSecret}`) {
         console.warn(`[Seguridad 2A ALERTA] Intento no autorizado de eliminar baja en: ${url.pathname} (IP: ${req.socket.remoteAddress}, Auth: ${authHeader ? 'Inválida' : 'Ausente'})`)
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))

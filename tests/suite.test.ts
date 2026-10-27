@@ -267,7 +267,12 @@ async function runTestSuite() {
 
     try {
       const phone = '573199998877'
-      const secret = 'crm_albra_internal_secret_key_fixed_length_for_daemon_2026'
+      // FAIL-CLOSED (rotación 2026-10-27): la suite exige el secret en el entorno, sin literales publicadas
+      const secret = process.env.INTERNAL_API_SECRET
+      if (!secret) {
+        console.error('FAIL-CLOSED: CP-11 exige INTERNAL_API_SECRET en el entorno. Abortando.')
+        process.exit(1)
+      }
 
       // 1. Consulta inicial: no suprimido
       const resGet1 = await fetch(`http://localhost:${testPort}/api/internal/suppression/${phone}`)
