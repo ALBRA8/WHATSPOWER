@@ -14,7 +14,7 @@ jobs:
         with:
           node-version: 24
       - name: TypeScript (fail-fast)
-        run: npx --yes typescript@5 tsc --noEmit -p tsconfig.json
+        run: npm install --no-save typescript@5 && npx tsc --noEmit -p tsconfig.json
       - name: Suite completa (incluye seguridad AUTH/WH/ENV/TR/IDEM)
         run: npm test
         env:
