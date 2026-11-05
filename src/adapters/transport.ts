@@ -51,6 +51,14 @@ export class HttpAlbraTransportSender implements TransportSender {
   }
 
   async sendMessage(to: string, text: string, correlationId: string): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+    // Salvaguarda dura (orden de cierre 2026-11-06): NINGÚN envío real sale sin
+    // ALLOW_REAL_DISPATCH=true, independientemente del entorno o la URL. Fail-closed.
+    if (process.env.ALLOW_REAL_DISPATCH !== 'true') {
+      return {
+        ok: false,
+        error: 'DISPATCH_BLOCKED_BY_SAFETY_GUARD: envío real bloqueado — ALLOW_REAL_DISPATCH no está en true (fail-closed)',
+      }
+    }
     try {
       const res = await fetch(`${this.crmBaseUrl}/api/whatsapp/daemon-proxy`, {
         method: 'POST',

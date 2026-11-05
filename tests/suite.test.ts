@@ -268,12 +268,17 @@ async function runTestSuite() {
 
     try {
       const phone = '573199998877'
-      // FAIL-CLOSED (rotación 2026-10-27): la suite exige el secret en el entorno, sin literales publicadas
+      // FAIL-CLOSED (rotación 2026-10-27): la suite exige el secret en el entorno, sin literales publicadas.
+      // Orden de cierre 2026-11-06: TODAS las rutas /api/* exigen Bearer (incluidos los GET).
+      if (!process.env.INTERNAL_API_SECRET) {
+        process.env.INTERNAL_API_SECRET = 'crm_albra_test_suite_internal_secret_24chars'
+      }
       const secret = process.env.INTERNAL_API_SECRET
-      if (!secret) { process.env.INTERNAL_API_SECRET = 'crm_albra_test_suite_internal_secret_24chars'; }
 
-      // 1. Consulta inicial: no suprimido
-      const resGet1 = await fetch(`http://localhost:${testPort}/api/internal/suppression/${phone}`)
+      // 1. Consulta inicial: no suprimido (ahora autenticada)
+      const resGet1 = await fetch(`http://localhost:${testPort}/api/internal/suppression/${phone}`, {
+        headers: { 'Authorization': `Bearer ${secret}` },
+      })
       const dataGet1 = await resGet1.json() as any
       assert.strictEqual(dataGet1.suppressed, false)
 
@@ -290,8 +295,10 @@ async function runTestSuite() {
       const dataPost = await resPost.json() as any
       assert.strictEqual(dataPost.suppressed, true)
 
-      // 3. Consulta posterior: suprimido confirmado
-      const resGet2 = await fetch(`http://localhost:${testPort}/api/internal/suppression/${phone}`)
+      // 3. Consulta posterior: suprimido confirmado (autenticada)
+      const resGet2 = await fetch(`http://localhost:${testPort}/api/internal/suppression/${phone}`, {
+        headers: { 'Authorization': `Bearer ${secret}` },
+      })
       const dataGet2 = await resGet2.json() as any
       assert.strictEqual(dataGet2.suppressed, true)
 

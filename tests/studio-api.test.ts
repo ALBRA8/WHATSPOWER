@@ -2,6 +2,11 @@ import { test } from 'node:test'
 import assert from 'node:assert'
 import { createAgenticServer } from '../src/server.ts'
 
+// Orden de cierre 2026-11-06: las rutas /api/* exigen Bearer INTERNAL_API_SECRET.
+// El secreto de test se define en el entorno antes de crear el servidor.
+process.env.INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET || 'wp_test_internal_secret_min24chars_000'
+const AUTH = { 'Authorization': `Bearer ${process.env.INTERNAL_API_SECRET}` }
+
 test('SUITE: WhatsPower Studio HTTP API & Web Interface', async () => {
   const { server } = createAgenticServer({ dbPath: ':memory:' })
   await new Promise<void>((resolve) => server.listen(3015, () => resolve()))
@@ -14,17 +19,21 @@ test('SUITE: WhatsPower Studio HTTP API & Web Interface', async () => {
     assert.ok(html.includes('WhatsPower Flow Studio'))
     assert.ok(html.includes('Simulador'))
 
-    // 2. GET /api/flows
-    const resFlows = await fetch('http://localhost:3015/api/flows')
+    // 1b. GET /api/flows SIN auth → 401 (contrato nuevo)
+    const resAnon = await fetch('http://localhost:3015/api/flows')
+    assert.strictEqual(resAnon.status, 401)
+
+    // 2. GET /api/flows autenticado
+    const resFlows = await fetch('http://localhost:3015/api/flows', { headers: AUTH })
     assert.strictEqual(resFlows.status, 200)
     const flows = await resFlows.json()
     assert.ok(flows.length >= 1)
     assert.ok(flows[0].name.includes('Calificación'))
 
-    // 3. POST /api/flows/simulate
+    // 3. POST /api/flows/simulate autenticado
     const resSim = await fetch('http://localhost:3015/api/flows/simulate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...AUTH },
       body: JSON.stringify({ phone: '+573009991122', messageText: 'precio', name: 'Simulada' })
     })
     assert.strictEqual(resSim.status, 200)

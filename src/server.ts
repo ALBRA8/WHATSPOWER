@@ -11,6 +11,13 @@ import { GrowthToolsManager } from './engine/growth-tools.ts'
 import { CrmTriggerListener } from './engine/crm-triggers.ts'
 import { PaymentGatewayManager } from './payments/payment-gateway.ts'
 import type { InboundEvent, TransportSender, CrmClientInterface } from './types.ts'
+import {
+  isAuthorizedBearer,
+  checkWebhookSecurity,
+  readBody,
+  ReplayCache,
+  productionConfigProblems,
+} from './security.ts'
 
 try {
   process.loadEnvFile()
@@ -24,13 +31,39 @@ export function createAgenticServer(options?: {
   businessPhone?: string
 }) {
   const db = createDatabase(options?.dbPath)
-  const transport = options?.transport || new MockTransportSender()
+  // MOCK vs REAL (orden de cierre): el transporte se decide por TRANSPORT env con decisión
+  // explícita. En producción NO se admite Mock silencioso: exige ALLOW_MOCK_TRANSPORT=true.
+  const isProduction = process.env.NODE_ENV === 'production'
+  const transport: TransportSender = options?.transport ?? (() => {
+    const mode = process.env.TRANSPORT || (isProduction ? undefined : 'mock')
+    if (!mode) {
+      throw new Error('TRANSPORT no configurado: en producción define TRANSPORT=http (real) o TRANSPORT=mock con ALLOW_MOCK_TRANSPORT=true (decisión explícita)')
+    }
+    if (mode === 'http') {
+      const daemonSecret = process.env.INTERNAL_API_SECRET
+      if (!daemonSecret) throw new Error('TRANSPORT=http exige INTERNAL_API_SECRET configurado (falla segura, no se envía nada sin él)')
+      if (process.env.ALLOW_REAL_DISPATCH !== 'true') {
+        console.warn('[Capa 2A AVISO] TRANSPORT=http con ALLOW_REAL_DISPATCH=false: los envíos quedarán BLOQUEADOS por la salvaguarda.')
+      }
+      return new HttpAlbraTransportSender(process.env.WHATSAPP_DAEMON_URL || 'http://localhost:3002', daemonSecret)
+    }
+    if (mode === 'mock') {
+      if (isProduction && process.env.ALLOW_MOCK_TRANSPORT !== 'true') {
+        throw new Error('TRANSPORT=mock rechazado en producción sin ALLOW_MOCK_TRANSPORT=true (prohibido el Mock silencioso)')
+      }
+      if (isProduction) console.warn('[Capa 2A AVISO] Transporte en modo MOCK por decisión explícita (ALLOW_MOCK_TRANSPORT=true): NO se enviarán mensajes reales.')
+      return new MockTransportSender()
+    }
+    throw new Error(`TRANSPORT inválido: "${mode}" (valores válidos: http | mock)`)
+  })()
   // CRM Actions Bridge: cliente HTTP real hacia CRM-ALBRA cuando hay API key configurada;
-  // Mock solo en desarrollo sin credenciales (antes el server de producción usaba SIEMPRE Mock).
+  // en producción sin CRM_API_KEY se falla al arranque (prohibido el Mock silencioso).
   const crm = options?.crm
-    || (process.env.CRM_API_KEY
+    ?? (process.env.CRM_API_KEY
       ? new HttpCrmClient(process.env.CRM_BASE_URL || 'http://localhost:3000', process.env.CRM_API_KEY)
-      : new MockCrmClient())
+      : (isProduction
+        ? (() => { throw new Error('CRM_API_KEY no configurada: en producción el puente CRM no puede usar MockCrmClient silenciosamente (configura CRM_API_KEY)') })()
+        : (console.warn('[Capa 2A AVISO] CRM en modo Mock — SOLO desarrollo. Configura CRM_API_KEY para el puente real.'), new MockCrmClient())))
   // Secret dual: AGENTIC_2A_WEBHOOK_SECRET (documentado en README) tiene prioridad sobre WEBHOOK_SECRET (legacy).
   // FAIL-CLOSED (rotación 2026-10-27): eliminado fallback hardcodeado del webhookSecret
   // (un valor publicado en el repo permitía forjar firmas). Sin secret configurado, verifyHmac rechaza todo.
@@ -50,9 +83,39 @@ export function createAgenticServer(options?: {
     const expected = createHmac('sha256', webhookSecret).update(payload).digest('hex')
     return expected === signatureHeader
   }
+  void verifyHmac // conservado por compatibilidad de firma pública; la validación dura usa checkWebhookSecurity
+
+  const inboundReplay = new ReplayCache()
+  const paymentsReplay = new ReplayCache()
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
+
+    // ==========================================================
+    // PUERTA DE AUTENTICACIÓN (orden de cierre 2026-11-06)
+    // Toda ruta /api/* es administrativa y exige Bearer INTERNAL_API_SECRET
+    // (comparación timing-safe), SALVO: /api/health (público),
+    // /api/inbound (protegida por HMAC+timestamp+replay propio) y
+    // /api/payments/webhook (protegida por HMAC de la pasarela).
+    // Fail-closed: sin secret configurado responde 503, nunca acepta.
+    // ==========================================================
+    const isPublicApiPath = url.pathname === '/api/health'
+      || url.pathname === '/api/inbound'
+      || url.pathname === '/api/payments/webhook'
+    if (url.pathname.startsWith('/api/') && !isPublicApiPath) {
+      const internalSecret = process.env.INTERNAL_API_SECRET
+      if (!internalSecret) {
+        res.writeHead(503, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Service Unavailable: INTERNAL_API_SECRET no configurado (fail-closed)' }))
+        return
+      }
+      if (!isAuthorizedBearer(req.headers['authorization'], internalSecret)) {
+        console.warn(`[Seguridad 2A ALERTA] Acceso administrativo no autorizado: ${req.method} ${url.pathname} (IP: ${req.socket.remoteAddress})`)
+        res.writeHead(401, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
+        return
+      }
+    }
 
     // WhatsPower Flow Studio (Lienzo visual ManyChat)
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/studio')) {
@@ -70,36 +133,40 @@ export function createAgenticServer(options?: {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/flows') {
-      let body = ''
-      req.on('data', chunk => body += chunk)
-      req.on('end', () => {
-        try {
-          const flow = JSON.parse(body)
-          router.getFlowEngine().saveFlow(flow)
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ ok: true, id: flow.id }))
-        } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: e.message }))
-        }
-      })
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const flow = JSON.parse(rb.body)
+        router.getFlowEngine().saveFlow(flow)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, id: flow.id }))
+      } catch (e: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: e.message }))
+      }
       return
     }
 
     if (req.method === 'POST' && url.pathname === '/api/flows/simulate') {
-      let body = ''
-      req.on('data', chunk => body += chunk)
-      req.on('end', async () => {
-        try {
-          const { phone, messageText, name } = JSON.parse(body)
-          const stepRes = await router.getFlowEngine().evaluateStep(phone, messageText, { name })
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify(stepRes))
-        } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: e.message }))
-        }
-      })
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const { phone, messageText, name } = JSON.parse(rb.body)
+        const stepRes = await router.getFlowEngine().evaluateStep(phone, messageText, { name })
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(stepRes))
+      } catch (e: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: e.message }))
+      }
       return
     }
 
@@ -198,7 +265,7 @@ export function createAgenticServer(options?: {
           res.end(JSON.stringify({ error: 'Service Unavailable: INTERNAL_API_SECRET no configurado' }))
           return
         }
-        const daemonRes = await fetch('http://localhost:3002/qr', {
+        const daemonRes = await fetch(`${process.env.WHATSAPP_DAEMON_URL || 'http://localhost:3002'}/qr`, {
           headers: { 'Authorization': 'Bearer ' + daemonSecret }
         })
         const data = await daemonRes.json()
@@ -316,49 +383,46 @@ export function createAgenticServer(options?: {
     }
 
     // 5. Inbound Webhook (POST /api/inbound)
+    // Endurecido (orden de cierre): firma HMAC OBLIGATORIA siempre + timestamp OBLIGATORIO
+    // en ventana ±5min + caché anti-replay + comparación timing-safe. Sin excepción en dev:
+    // el puente del CRM ya firma (X-Signature-SHA256 + X-Timestamp).
     if (req.method === 'POST' && url.pathname === '/api/inbound') {
-      let body = ''
-      req.on('data', (chunk) => (body += chunk))
-      req.on('end', async () => {
-        try {
-          const signature = req.headers['x-signature-sha256'] as string | undefined
-          const timestampHeader = req.headers['x-timestamp'] as string | undefined
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const signature = req.headers['x-signature-sha256'] as string | undefined
+        const timestampHeader = req.headers['x-timestamp'] as string | undefined
 
-          // 1. Validación de Timestamp (descarte de peticiones con más de 300s de desfase / replay protection)
-          if (timestampHeader) {
-            const reqTime = Number(timestampHeader) || new Date(timestampHeader).getTime()
-            const now = Date.now()
-            if (Number.isFinite(reqTime) && Math.abs(now - reqTime) > 300_000) {
-              res.writeHead(401, { 'Content-Type': 'application/json' })
-              res.end(JSON.stringify({ error: 'Timestamp expirado o fuera de ventana de tolerancia (replay protection)' }))
-              return
-            }
-          }
-
-          // 2. Validación estricta de firma HMAC (siempre exigida si hay signature o en producción)
-          if (signature || process.env.NODE_ENV === 'production') {
-            if (!verifyHmac(body, signature)) {
-              res.writeHead(401, { 'Content-Type': 'application/json' })
-              res.end(JSON.stringify({ error: 'Firma HMAC inválida o ausente' }))
-              return
-            }
-          }
-
-          const event = JSON.parse(body) as InboundEvent
-          if (!event.eventId || !event.orgId || !event.contact?.phone || !event.message?.text) {
-            res.writeHead(400, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify({ error: 'Payload de evento inbound incompleto' }))
-            return
-          }
-
-          const result = await router.processInbound(event)
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify(result))
-        } catch (err: any) {
-          res.writeHead(500, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: err.message }))
+        const sec = checkWebhookSecurity(rb.body, signature, timestampHeader, webhookSecret, inboundReplay)
+        if (!sec.ok) {
+          res.writeHead(sec.status, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: sec.error }))
+          return
         }
-      })
+
+        const event = JSON.parse(rb.body) as InboundEvent
+        if (!event.eventId || !event.orgId || !event.contact?.phone || !event.message?.text) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Payload de evento inbound incompleto' }))
+          return
+        }
+        if (!/^[a-zA-Z0-9_-]{1,64}$/.test(event.orgId)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'orgId inválido' }))
+          return
+        }
+
+        const result = await router.processInbound(event)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(result))
+      } catch (err: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: err.message }))
+      }
       return
     }
 
@@ -374,38 +438,42 @@ export function createAgenticServer(options?: {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/team/agents') {
-      let body = ''
-      req.on('data', (c) => (body += c))
-      req.on('end', () => {
-        try {
-          const data = JSON.parse(body)
-          const agent = teamManager.registerAgent(data)
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify(agent))
-        } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: e.message }))
-        }
-      })
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const data = JSON.parse(rb.body)
+        const agent = teamManager.registerAgent(data)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(agent))
+      } catch (e: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: e.message }))
+      }
       return
     }
 
     if (req.method === 'POST' && url.pathname === '/api/team/assign') {
-      let body = ''
-      req.on('data', (c) => (body += c))
-      req.on('end', () => {
-        try {
-          const { phone, strategy } = JSON.parse(body)
-          const agent = strategy === 'least_loaded'
-            ? teamManager.assignLeastLoaded(phone)
-            : teamManager.assignRoundRobin(phone)
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ assignedAgent: agent }))
-        } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: e.message }))
-        }
-      })
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const { phone, strategy } = JSON.parse(rb.body)
+        const agent = strategy === 'least_loaded'
+          ? teamManager.assignLeastLoaded(phone)
+          : teamManager.assignRoundRobin(phone)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ assignedAgent: agent }))
+      } catch (e: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: e.message }))
+      }
       return
     }
 
@@ -417,18 +485,20 @@ export function createAgenticServer(options?: {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/canned') {
-      let body = ''
-      req.on('data', (c) => (body += c))
-      req.on('end', () => {
-        try {
-          const item = cannedManager.createResponse(JSON.parse(body))
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify(item))
-        } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: e.message }))
-        }
-      })
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const item = cannedManager.createResponse(JSON.parse(rb.body))
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(item))
+      } catch (e: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: e.message }))
+      }
       return
     }
 
@@ -447,70 +517,93 @@ export function createAgenticServer(options?: {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/growth/links') {
-      let body = ''
-      req.on('data', (c) => (body += c))
-      req.on('end', () => {
-        try {
-          const link = growthManager.createGrowthLink(JSON.parse(body))
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify(link))
-        } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: e.message }))
-        }
-      })
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const link = growthManager.createGrowthLink(JSON.parse(rb.body))
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(link))
+      } catch (e: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: e.message }))
+      }
       return
     }
 
     // 4. CRM Stage Change Trigger
     if (req.method === 'POST' && url.pathname === '/api/crm/stage-change') {
-      let body = ''
-      req.on('data', (c) => (body += c))
-      req.on('end', async () => {
-        try {
-          const event = JSON.parse(body)
-          const result = await crmTriggers.handleStageChange(event)
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify(result))
-        } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: e.message }))
-        }
-      })
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const event = JSON.parse(rb.body)
+        const result = await crmTriggers.handleStageChange(event)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(result))
+      } catch (e: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: e.message }))
+      }
       return
     }
 
     // 5. Payment Links & Webhooks
     if (req.method === 'POST' && url.pathname === '/api/payments/create-link') {
-      let body = ''
-      req.on('data', (c) => (body += c))
-      req.on('end', () => {
-        try {
-          const tx = paymentManager.createPaymentLink(JSON.parse(body))
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify(tx))
-        } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: e.message }))
-        }
-      })
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const tx = paymentManager.createPaymentLink(JSON.parse(rb.body))
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(tx))
+      } catch (e: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: e.message }))
+      }
       return
     }
 
+    // Webhook de la pasarela de pagos: exige HMAC propio (PAYMENTS_WEBHOOK_SECRET) +
+    // timestamp + anti-replay. Fail-closed: sin secret configurado, 503.
     if (req.method === 'POST' && url.pathname === '/api/payments/webhook') {
-      let body = ''
-      req.on('data', (c) => (body += c))
-      req.on('end', () => {
-        try {
-          const { transactionId, status } = JSON.parse(body)
-          const tx = paymentManager.handlePaymentWebhook(transactionId, status)
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ ok: true, transaction: tx }))
-        } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: e.message }))
-        }
-      })
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      const sec = checkWebhookSecurity(
+        rb.body,
+        req.headers['x-signature-sha256'] as string | undefined,
+        req.headers['x-timestamp'] as string | undefined,
+        process.env.PAYMENTS_WEBHOOK_SECRET,
+        paymentsReplay,
+      )
+      if (!sec.ok) {
+        console.warn(`[Seguridad 2A ALERTA] Webhook de pagos rechazado: ${sec.error} (IP: ${req.socket.remoteAddress})`)
+        res.writeHead(sec.status, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: sec.error }))
+        return
+      }
+      try {
+        const { transactionId, status } = JSON.parse(rb.body)
+        const tx = paymentManager.handlePaymentWebhook(transactionId, status)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, transaction: tx }))
+      } catch (e: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: e.message }))
+      }
       return
     }
 
@@ -534,6 +627,16 @@ export function createAgenticServer(options?: {
 
 // Auto-arranque si se ejecuta directamente con node
 if (process.argv[1]?.includes('server.ts')) {
+  // Guard fail-fast de entorno en producción (orden de cierre): sin secretos robustos
+  // o con Mock no explícito, el servicio NO arranca. Lista variables, jamás valores.
+  if (process.env.NODE_ENV === 'production') {
+    const problems = productionConfigProblems()
+    if (problems.length > 0) {
+      console.error('[Capa 2A ✋] Arranque bloqueado por configuración insegura/incompleta:')
+      for (const p of problems) console.error(`  - ${p}`)
+      process.exit(1)
+    }
+  }
   const PORT = Number(process.env.PORT || 3003)
   const { server } = createAgenticServer()
   server.listen(PORT, () => {

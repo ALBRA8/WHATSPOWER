@@ -47,9 +47,12 @@ export class ConversationRouter {
     const { eventId, orgId, contact, message } = event
     const correlationId = event.correlationId || eventId
     const phone = contact.phone
+    // Idempotencia SCOPED POR ORGANIZACIÓN (orden de cierre): un eventId repetido entre
+    // orgs distintas NO colisiona — la clave incluye la organización emisora.
+    const idemKey = `${orgId}::${eventId}`
 
     // 1. DEDUPLICACIÓN E IDEMPOTENCIA
-    const cached = this.db.prepare('SELECT response_json FROM idempotency_keys WHERE key = ?').get(eventId) as { response_json: string } | undefined
+    const cached = this.db.prepare('SELECT response_json FROM idempotency_keys WHERE key = ?').get(idemKey) as { response_json: string } | undefined
     if (cached) {
       try {
         const parsed = JSON.parse(cached.response_json) as ExecutionResult
@@ -79,7 +82,7 @@ export class ConversationRouter {
         crmSynced: Boolean(contact.clientId),
         correlationId,
       }
-      this.saveIdempotency(eventId, result)
+      this.saveIdempotency(idemKey, result)
       return result
     }
 
@@ -91,7 +94,7 @@ export class ConversationRouter {
         error: 'Contacto suprimido por política de baja',
         correlationId,
       }
-      this.saveIdempotency(eventId, result)
+      this.saveIdempotency(idemKey, result)
       return result
     }
 
@@ -104,7 +107,7 @@ export class ConversationRouter {
         error: lockAcquisition.reason || 'Contacto ocupado en otra conversación',
         correlationId,
       }
-      this.saveIdempotency(eventId, result)
+      this.saveIdempotency(idemKey, result)
       return result
     }
 
@@ -160,7 +163,7 @@ export class ConversationRouter {
           correlationId,
           flowId: flowStep.flowId,
         }
-        this.saveIdempotency(eventId, result)
+        this.saveIdempotency(idemKey, result)
         return result
       }
 
@@ -172,7 +175,7 @@ export class ConversationRouter {
         correlationId,
         flowId: flowStep.flowId,
       }
-      this.saveIdempotency(eventId, result)
+      this.saveIdempotency(idemKey, result)
       return result
     }
 
@@ -199,7 +202,7 @@ export class ConversationRouter {
         crmSynced,
         correlationId,
       }
-      this.saveIdempotency(eventId, result)
+      this.saveIdempotency(idemKey, result)
       return result
     }
 
@@ -215,7 +218,7 @@ export class ConversationRouter {
         crmSynced: false,
         correlationId,
       }
-      this.saveIdempotency(eventId, result)
+      this.saveIdempotency(idemKey, result)
       return result
     }
 
@@ -235,7 +238,7 @@ export class ConversationRouter {
         crmSynced: crmRes.ok,
         correlationId,
       }
-      this.saveIdempotency(eventId, result)
+      this.saveIdempotency(idemKey, result)
       return result
     }
 
@@ -250,7 +253,7 @@ export class ConversationRouter {
       crmSynced: true,
       correlationId,
     }
-    this.saveIdempotency(eventId, result)
+    this.saveIdempotency(idemKey, result)
     return result
   }
 
