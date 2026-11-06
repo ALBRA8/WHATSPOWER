@@ -39,7 +39,7 @@ export interface SuppressionEntry {
 
 export interface ExecutionResult {
   handled: boolean
-  actionTaken: 'new_lead_welcome' | 'keyword_rule' | 'handoff_human' | 'suppression_opt_out' | 'deduplicated' | 'locked_busy' | 'ignored' | 'visual_flow_execution'
+  actionTaken: 'new_lead_welcome' | 'keyword_rule' | 'handoff_human' | 'suppression_opt_out' | 'deduplicated' | 'locked_busy' | 'ignored' | 'visual_flow_execution' | 'in_flight'
   replyText?: string
   crmSynced?: boolean
   error?: string

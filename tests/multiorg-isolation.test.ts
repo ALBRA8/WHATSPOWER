@@ -23,8 +23,9 @@ import { ConversationRouter } from '../src/engine/router.ts'
 // ---------------------------------------------------------------------------
 class MockTransport implements TransportSender {
   dispatched: Array<{ phone: string; text: string; correlationId: string }> = []
-  async sendMessage(phone: string, text: string, correlationId: string): Promise<void> {
+  async sendMessage(phone: string, text: string, correlationId: string): Promise<{ ok: boolean; messageId?: string; error?: string }> {
     this.dispatched.push({ phone, text, correlationId })
+    return { ok: true, messageId: `mock_${this.dispatched.length}` }
   }
 }
 
