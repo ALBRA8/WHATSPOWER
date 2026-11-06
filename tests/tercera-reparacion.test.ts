@@ -267,25 +267,35 @@ test('T3-06: endpoints de team/canned/growth exigen x-org-id y aislan por organi
   }
 })
 
-test('T3-07: respuestas internas de locks/suppression CONFIRMAN la organización (eco) y el auth es timing-safe', async () => {
+test('T3-07: respuestas internas de locks/suppression CONFIRMAN la organización (eco) y exigen credencial de servicio (B3)', async () => {
+  // B3: los endpoints de servicio exigen credencial VINCULADA a la organización;
+  // el secreto global ya no autoriza /api/internal/locks|suppression.
+  const orgCredA = 'org_a_service_credential_min16chars'
+  process.env.ORG_SERVICE_CREDENTIALS = `org_a:${orgCredA}`
   const { server } = createAgenticServer({ dbPath: ':memory:' })
   await new Promise<void>((resolve) => server.listen(3079, () => resolve()))
   const base = 'http://localhost:3079'
+  const ORG_AUTH = { Authorization: `Bearer ${orgCredA}` }
   try {
-    const lockRes = await fetch(`${base}/api/internal/locks/573001234567`, { headers: { ...AUTH, 'X-Org-Id': 'org_a' } })
+    const lockRes = await fetch(`${base}/api/internal/locks/573001234567`, { headers: { ...ORG_AUTH, 'X-Org-Id': 'org_a' } })
     assert.strictEqual(lockRes.status, 200)
     const lockData = await lockRes.json()
     assert.strictEqual(lockData.organizationId, 'org_a', 'la respuesta confirma la organización consultada')
 
-    // Auth con secreto INCORRECTO → 401 (isAuthorizedBearer timing-safe)
-    const bad = await fetch(`${base}/api/internal/suppression/573001234567`, { method: 'POST', headers: { 'Authorization': 'Bearer secreto-incorrecto', 'Content-Type': 'application/json', 'X-Org-Id': 'org_a' }, body: '{}' })
-    assert.strictEqual(bad.status, 401)
+    // El secreto GLOBAL ya no autoriza el servicio (fallback eliminado, B3) → 403
+    const globalOnly = await fetch(`${base}/api/internal/locks/573001234567`, { headers: { ...AUTH, 'X-Org-Id': 'org_a' } })
+    assert.strictEqual(globalOnly.status, 403, 'el secreto global no sustituye la validación de organización')
 
-    // Sin x-org-id → 400
-    const noOrg = await fetch(`${base}/api/internal/suppression/573001234567`, { method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' }, body: '{}' })
-    assert.strictEqual(noOrg.status, 400)
+    // Auth con credencial INCORRECTA → 401 (sin x-org-id) / 403 (org declarada sin credencial válida)
+    const bad = await fetch(`${base}/api/internal/suppression/573001234567`, { method: 'POST', headers: { 'Authorization': 'Bearer credencial-incorrecta-0000', 'Content-Type': 'application/json', 'X-Org-Id': 'org_a' }, body: '{}' })
+    assert.strictEqual(bad.status, 403, 'credencial inválida para la org declarada → 403')
+
+    // Sin x-org-id ni credencial → 401
+    const noOrg = await fetch(`${base}/api/internal/suppression/573001234567`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...AUTH }, body: '{}' })
+    assert.strictEqual(noOrg.status, 401)
   } finally {
     server.close()
+    delete process.env.ORG_SERVICE_CREDENTIALS
   }
 })
 

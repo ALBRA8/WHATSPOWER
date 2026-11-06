@@ -603,7 +603,7 @@ export function createDatabase(dbPath?: string): DatabaseSync {
       key TEXT NOT NULL,
       effect_key TEXT NOT NULL,
       effect_type TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'PENDING', -- 'PENDING' | 'DONE'
+      status TEXT NOT NULL DEFAULT 'PENDING', -- 'PENDING' | 'DONE' | 'REJECTED'
       result_json TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
@@ -615,6 +615,14 @@ export function createDatabase(dbPath?: string): DatabaseSync {
       key TEXT PRIMARY KEY,
       payload_json TEXT NOT NULL,
       created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS service_credentials (
+      org_id TEXT NOT NULL,
+      credential_hash TEXT NOT NULL,
+      label TEXT,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (org_id, credential_hash)
     );
   `)
 

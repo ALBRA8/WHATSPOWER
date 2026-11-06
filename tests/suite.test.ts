@@ -12,6 +12,9 @@ async function runTestSuite() {
   console.log('============================================================\n')
 
   process.env.INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET || 'crm_albra_test_suite_internal_secret_24chars';
+  // B3: provisión de credenciales de servicio ANTES del arranque (los endpoints
+  // /api/internal/* exigen credencial vinculada a la organización).
+  process.env.ORG_SERVICE_CREDENTIALS = 'org_test_1:org_test_1_service_credential_min16ch';
   const transport = new MockTransportSender()
   const crm = new MockCrmClient()
   const webhookSecret = 'test_secret_key_12345'
@@ -273,7 +276,9 @@ async function runTestSuite() {
       if (!process.env.INTERNAL_API_SECRET) {
         process.env.INTERNAL_API_SECRET = 'crm_albra_test_suite_internal_secret_24chars'
       }
-      const secret = process.env.INTERNAL_API_SECRET
+      // B3: credencial de servicio de la org (provisionada en el arranque, arriba).
+      const orgCred = 'org_test_1_service_credential_min16ch'
+      const secret = orgCred
 
       // 1. Consulta inicial: no suprimido (ahora autenticada)
       const resGet1 = await fetch(`http://localhost:${testPort}/api/internal/suppression/${phone}`, {

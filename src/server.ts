@@ -21,6 +21,11 @@ import {
   resolveStudioSession,
   productionConfigProblems,
 } from './security.ts'
+import {
+  verifyOrgServiceCredential,
+  extractOrgServiceAuth,
+  provisionOrgServiceCredentialsFromEnv,
+} from './org-auth.ts'
 
 try {
   process.loadEnvFile()
@@ -89,6 +94,39 @@ export function createAgenticServer(options?: {
     || process.env.WEBHOOK_SECRET
 
   const router = new ConversationRouter(db, transport, crm)
+  // B3: provisión de credenciales de servicio por organización (env ORG_SERVICE_CREDENTIALS
+  // formato "orgId:credencial,orgId2:credencial2"). Solo se persisten hashes; nunca se loguean.
+  const provisionedCreds = provisionOrgServiceCredentialsFromEnv(db)
+  if (provisionedCreds > 0) console.log(`[Seguridad 2A] Credenciales de servicio registradas para ${provisionedCreds} organización(es) (hashes only)`)
+
+  /**
+   * B3 — GUARD DE IDENTIDAD DE SERVICIO POR ORGANIZACIÓN (fail-closed).
+   * Exige X-Org-Id + Bearer <credencial de ESA organización> y valida la
+   * credencial CONTRA ESA organización en service_credentials. El secreto
+   * global (INTERNAL_API_SECRET) NO autoriza estas rutas (fallback eliminado):
+   * una credencial válida de otra organización, ausente o sin registrar →
+   * 401/403. Devuelve null si la petición es válida; si no, ya respondió.
+   */
+  const requireOrgServiceAuth = (
+    req: IncomingMessage,
+    res: ServerResponse
+  ): { orgId: string } | null => {
+    const auth = extractOrgServiceAuth(req.headers as Record<string, string | string[] | undefined>)
+    if (!auth) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Unauthorized: identidad de servicio requerida (X-Org-Id + Bearer de credencial de la organización)' }))
+      return null
+    }
+    if (!verifyOrgServiceCredential(db, auth.orgId, auth.credential)) {
+      // Credencial inválida, de OTRA organización, u org sin credenciales registradas:
+      // fail-closed (el secreto global no sustituye la validación de organización).
+      console.warn(`[Seguridad 2A ALERTA] Credencial de servicio inválida o no vinculada a la org declarada (org: ${auth.orgId}, IP: ${req.socket.remoteAddress})`)
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Forbidden: credencial de servicio no válida para la organización declarada' }))
+      return null
+    }
+    return { orgId: auth.orgId }
+  }
   const teamManager = new TeamManager(db)
   const cannedManager = new CannedResponseManager(db)
   const growthManager = new GrowthToolsManager(db, options?.businessPhone || '573001234567')
@@ -165,12 +203,18 @@ export function createAgenticServer(options?: {
     // Toda ruta /api/* es administrativa y exige Bearer INTERNAL_API_SECRET
     // (comparación timing-safe) O cookie de sesión del Studio (HttpOnly),
     // SALVO: /api/health (público), /api/inbound (protegida por HMAC+timestamp+
-    // replay propio) y /api/payments/webhook (protegida por HMAC de la pasarela).
+    // replay propio), /api/payments/webhook (protegida por HMAC de la pasarela) y
+    // las rutas de SERVICIO por organización /api/internal/locks|suppression —
+    // B3: esas ya NO aceptan el secreto global; exigen credencial de servicio
+    // VINCULADA a la organización (verificación por endpoint, fail-closed).
     // Fail-closed: sin secret configurado responde 503, nunca acepta.
     // ==========================================================
+    const isOrgScopedServicePath =
+      url.pathname.startsWith('/api/internal/locks/') || url.pathname.startsWith('/api/internal/suppression/')
     const isPublicApiPath = url.pathname === '/api/health'
       || url.pathname === '/api/inbound'
       || url.pathname === '/api/payments/webhook'
+      || isOrgScopedServicePath
     if (url.pathname.startsWith('/api/') && !isPublicApiPath) {
       const internalSecret = process.env.INTERNAL_API_SECRET
       if (!internalSecret) {
@@ -439,14 +483,10 @@ export function createAgenticServer(options?: {
     // 2. Consulta de Locks para Capa 2B (GET /api/internal/locks/:phone)
     if (req.method === 'GET' && url.pathname.startsWith('/api/internal/locks/')) {
       const phone = decodeURIComponent(url.pathname.replace('/api/internal/locks/', ''))
-      // (segunda reparación §3.A) El lock es POR organización: la org viaja en
-      // x-org-id (fail-closed si falta).
-      const orgId = String(req.headers['x-org-id'] || '')
-      if (!orgId) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
-        return
-      }
+      // B3: identidad de servicio POR ORGANIZACIÓN (el secreto global no autoriza aquí).
+      const orgAuth = requireOrgServiceAuth(req, res)
+      if (!orgAuth) return
+      const orgId = orgAuth.orgId
       const lock = router.getLockManager().getLock(phone, orgId)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       // (contrato v2) La respuesta CONFIRMA la organización consultada: el cliente
@@ -460,12 +500,10 @@ export function createAgenticServer(options?: {
       const rawPhone = decodeURIComponent(url.pathname.replace('/api/internal/suppression/', ''))
       const digits = rawPhone.replace(/\D/g, '')
       const phone = (digits.length === 10 && digits.startsWith('3')) ? `57${digits}` : digits
-      const orgId = String(req.headers['x-org-id'] || '')
-      if (!orgId) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
-        return
-      }
+      // B3: identidad de servicio POR ORGANIZACIÓN (el secreto global no autoriza aquí).
+      const orgAuthSupp = requireOrgServiceAuth(req, res)
+      if (!orgAuthSupp) return
+      const orgId = orgAuthSupp.orgId
       const suppressed = router.getSuppressionStore().isSuppressed(orgId, phone)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       // (contrato v2) Eco de organización para verificación del cliente (5.A)
@@ -475,13 +513,10 @@ export function createAgenticServer(options?: {
 
     // 3.2 Registro Administrativo de Supresión (POST /api/internal/suppression/:phone)
     if (req.method === 'POST' && url.pathname.startsWith('/api/internal/suppression/')) {
-      // FAIL-CLOSED + comparación timing-safe (4.F): sin secret configurado se rechaza siempre
-      const internalSecret = process.env.INTERNAL_API_SECRET
-      if (!isAuthorizedBearer(req.headers['authorization'], internalSecret || '')) {
-        res.writeHead(401, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
-        return
-      }
+      // B3: identidad de servicio POR ORGANIZACIÓN (fail-closed; el secreto
+      // global ya no autoriza escrituras de servicio de una org concreta).
+      const orgAuthPost = requireOrgServiceAuth(req, res)
+      if (!orgAuthPost) return
 
       const rawPhone = decodeURIComponent(url.pathname.replace('/api/internal/suppression/', ''))
       const digits = rawPhone.replace(/\D/g, '')
@@ -506,12 +541,7 @@ export function createAgenticServer(options?: {
         }
       } catch {}
 
-      const orgId = requireOrgHeader(req)
-      if (!orgId) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
-        return
-      }
+      const orgId = orgAuthPost.orgId
       router.getSuppressionStore().addSuppression(orgId, phone, reason)
       console.log(`[Seguridad 2A AUDIT] Registro de supresión para: ${phone.slice(0, 4)}***${phone.slice(-2)} (org: ${orgId}, Motivo: "${reason}", IP: ${req.socket.remoteAddress}, Time: ${new Date().toISOString()})`)
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -521,14 +551,9 @@ export function createAgenticServer(options?: {
 
     // 3.3 Eliminación Administrativa de Supresión (DELETE /api/internal/suppression/:phone)
     if (req.method === 'DELETE' && url.pathname.startsWith('/api/internal/suppression/')) {
-      // FAIL-CLOSED + comparación timing-safe (4.F)
-      const internalSecret = process.env.INTERNAL_API_SECRET
-      if (!isAuthorizedBearer(req.headers['authorization'], internalSecret || '')) {
-        console.warn(`[Seguridad 2A ALERTA] Intento no autorizado de eliminar baja en: ${url.pathname} (IP: ${req.socket.remoteAddress}, Auth: ${req.headers['authorization'] ? 'Inválida' : 'Ausente'})`)
-        res.writeHead(401, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
-        return
-      }
+      // B3: identidad de servicio POR ORGANIZACIÓN (fail-closed)
+      const orgAuthDel = requireOrgServiceAuth(req, res)
+      if (!orgAuthDel) return
 
       const rawPhone = decodeURIComponent(url.pathname.replace('/api/internal/suppression/', ''))
       const digits = rawPhone.replace(/\D/g, '')
@@ -539,12 +564,7 @@ export function createAgenticServer(options?: {
         return
       }
 
-      const orgId = String(req.headers['x-org-id'] || '')
-      if (!orgId) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
-        return
-      }
+      const orgId = orgAuthDel.orgId
       const wasSuppressed = router.getSuppressionStore().isSuppressed(orgId, phone)
       router.getSuppressionStore().removeSuppression(orgId, phone)
       console.log(`[Seguridad 2A AUDIT] Eliminación autorizada de supresión para: ${phone.slice(0, 4)}***${phone.slice(-2)} (org: ${orgId}, Estaba suprimido: ${wasSuppressed}, IP: ${req.socket.remoteAddress}, Time: ${new Date().toISOString()})`)
@@ -556,12 +576,10 @@ export function createAgenticServer(options?: {
     // 4. Liberación de Lock (POST /api/internal/locks/:phone/release)
     if (req.method === 'POST' && url.pathname.endsWith('/release') && url.pathname.startsWith('/api/internal/locks/')) {
       const phone = decodeURIComponent(url.pathname.replace('/api/internal/locks/', '').replace('/release', ''))
-      const orgId = String(req.headers['x-org-id'] || '')
-      if (!orgId) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
-        return
-      }
+      // B3: identidad de servicio POR ORGANIZACIÓN (el secreto global no autoriza aquí).
+      const orgAuthRel = requireOrgServiceAuth(req, res)
+      if (!orgAuthRel) return
+      const orgId = orgAuthRel.orgId
       router.getLockManager().releaseLock(phone, orgId)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ phone, released: true }))

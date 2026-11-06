@@ -86,17 +86,28 @@ describe('AUTH: superficie administrativa protegida', () => {
       } finally { server.close() }
     })
 
-    it(`AUTH-OK: ${r.m} ${r.p} con secreto válido → jamás 401/503`, async () => {
+    it(`AUTH-OK: ${r.m} ${r.p} con credencial válida → jamás 401/503`, async () => {
+      // B3: los endpoints de servicio por organización exigen credencial VINCULADA
+      // a la org (el secreto global ya no autoriza /api/internal/locks|suppression).
+      const isOrgScoped = r.p.startsWith('/api/internal/locks/') || r.p.startsWith('/api/internal/suppression/')
+      const orgCred = 'org_auth_service_credential_min16ch'
+      if (isOrgScoped) process.env.ORG_SERVICE_CREDENTIALS = `org_auth_test:${orgCred}`
       const { server } = bootServer()
       const base = await listenEphemeral(server)
       try {
+        const headers = isOrgScoped
+          ? { ...AUTH_JSON, Authorization: `Bearer ${orgCred}`, 'X-Org-Id': 'org_auth_test' }
+          : AUTH_JSON
         const res = await fetch(`${base}${r.p}`, {
           method: r.m,
-          headers: AUTH_JSON,
+          headers,
           body: r.body ? JSON.stringify(r.body) : undefined,
         })
         assert.ok(res.status !== 401 && res.status !== 503, `con credencial válida no debe rechazarse (obtenido ${res.status})`)
-      } finally { server.close() }
+      } finally {
+        server.close()
+        if (isOrgScoped) delete process.env.ORG_SERVICE_CREDENTIALS
+      }
     })
   }
 
