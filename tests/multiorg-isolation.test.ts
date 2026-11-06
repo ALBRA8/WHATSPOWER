@@ -115,7 +115,6 @@ test('MO-03: etiquetas, campos y sesiones de flujo por (org, contacto)', async (
     name: 'Seq Alpha',
     isActive: true,
     steps: [],
-    createdAt: Date.now(),
   })
   fe.enrollContactInSequence('org_alpha', phone, 'seq_1')
   const rowsAlpha = (db.prepare("SELECT count(*) c FROM sequence_enrollments WHERE organization_id = 'org_alpha' AND contact_phone = ?").get(phone) as any).c
