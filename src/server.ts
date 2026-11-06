@@ -191,6 +191,19 @@ export function createAgenticServer(options?: {
   }
 
   /**
+   * CUARTA FASE: autorización interna consciente de identidad — acepta el
+   * secreto global (identidad de servicio) O una clave dedicada registrada en
+   * INTERNAL_API_KEYS. La coherencia clave↔X-Org-Id ya la garantizó la puerta
+   * (403 ORG_KEY_MISMATCH); esto solo verifica autenticidad de la credencial.
+   */
+  function isInternalAuthorized(req: IncomingMessage): boolean {
+    const authHeader = req.headers['authorization']
+    if (isAuthorizedBearer(authHeader, process.env.INTERNAL_API_SECRET || '')) return true
+    const keys = Object.values(parseInternalApiKeys())
+    return keys.some((k) => isAuthorizedBearer(authHeader, k))
+  }
+
+  /**
    * Verifica que la identidad del req permite operar SOBRE orgId.
    *  - identidad org → SOLO su propia org.
    *  - identidad service → cualquier org SIN clave dedicada (con clave → 403).
@@ -573,9 +586,9 @@ export function createAgenticServer(options?: {
 
     // 3.2 Registro Administrativo de Supresión (POST /api/internal/suppression/:phone)
     if (req.method === 'POST' && url.pathname.startsWith('/api/internal/suppression/')) {
-      // FAIL-CLOSED + comparación timing-safe (4.F): sin secret configurado se rechaza siempre
-      const internalSecret = process.env.INTERNAL_API_SECRET
-      if (!isAuthorizedBearer(req.headers['authorization'], internalSecret || '')) {
+      // FAIL-CLOSED + comparación timing-safe (4.F): sin credencial válida se rechaza siempre
+      // (CUARTA FASE: credencial = secreto global O clave dedicada de la organización)
+      if (!isInternalAuthorized(req)) {
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
         return
@@ -620,8 +633,8 @@ export function createAgenticServer(options?: {
     // 3.3 Eliminación Administrativa de Supresión (DELETE /api/internal/suppression/:phone)
     if (req.method === 'DELETE' && url.pathname.startsWith('/api/internal/suppression/')) {
       // FAIL-CLOSED + comparación timing-safe (4.F)
-      const internalSecret = process.env.INTERNAL_API_SECRET
-      if (!isAuthorizedBearer(req.headers['authorization'], internalSecret || '')) {
+      // (CUARTA FASE: credencial = secreto global O clave dedicada de la organización)
+      if (!isInternalAuthorized(req)) {
         console.warn(`[Seguridad 2A ALERTA] Intento no autorizado de eliminar baja en: ${url.pathname} (IP: ${req.socket.remoteAddress}, Auth: ${req.headers['authorization'] ? 'Inválida' : 'Ausente'})`)
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
