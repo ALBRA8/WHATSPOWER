@@ -1,0 +1,95 @@
+{
+  "at": "2026-11-06T21:07:55.848Z",
+  "results": [
+    {
+      "id": "I-01",
+      "name": "Healthcheck de los 3 servicios",
+      "ok": true,
+      "detail": "health 200 en los 3 servicios"
+    },
+    {
+      "id": "I-02",
+      "name": "Dos organizaciones operan SIMULTÁNEAMENTE (campañas y despachos)",
+      "ok": true,
+      "detail": "campañas de dos orgs despachan en paralelo por sus propias claves"
+    },
+    {
+      "id": "I-03",
+      "name": "Las organizaciones no pueden verse (listados y detalle 404; flujos por org)",
+      "ok": true,
+      "detail": "listados y detalle sin fuga cross-org (404 sin oráculo)"
+    },
+    {
+      "id": "I-04",
+      "name": "Inbound solo dispara flujos de SU organización (keyword idéntica en dos orgs)",
+      "ok": true,
+      "detail": "el mensaje de cada org solo ejecuta flujos de ESA organización"
+    },
+    {
+      "id": "I-05",
+      "name": "ULTRA consulta locks/supresiones de 2A con X-Org-Id real; aislamiento de locks y bajas",
+      "ok": true,
+      "detail": "locks/supresiones consultadas con X-Org-Id real; ecos verificados; aislamiento OK"
+    },
+    {
+      "id": "I-06",
+      "name": "Sin X-Org-Id → 400; identidad por organización: secreto global para org con clave dedicada → 403; clave cruzada → 403",
+      "ok": true,
+      "detail": "toda consulta sin X-Org-Id es rechazada (400); identidad por organización v3 aplicada (403 al secreto global y a la clave cruzada)"
+    },
+    {
+      "id": "I-07",
+      "name": "Respuestas con eco de organización; las sin eco/mismatch se rechazan (contrato v2)",
+      "ok": true,
+      "detail": "eco organizationId presente y coincidente (respuestas sin eco se rechazan en tests de contrato U3/T3)"
+    },
+    {
+      "id": "I-08",
+      "name": "Campaña CANCELADA no envía mensajes y es terminal",
+      "ok": true,
+      "detail": "cancelada no despacha y es terminal (resume 409)"
+    },
+    {
+      "id": "I-09",
+      "name": "Campaña PAUSADA no envía mensajes",
+      "ok": true,
+      "detail": "pausada no despacha"
+    },
+    {
+      "id": "I-10",
+      "name": "Reintento del mismo evento NO duplica efectos externos (idempotencia)",
+      "ok": true,
+      "detail": "reenvío del mismo evento → deduplicated; exactamente 1 efecto externo (1)"
+    },
+    {
+      "id": "I-11",
+      "name": "Webhook de pago duplicado → 1 transición; org ajena → rechazado",
+      "ok": true,
+      "detail": "webhook duplicado idempotente; webhook de org ajena rechazado"
+    },
+    {
+      "id": "I-12",
+      "name": "Caída de un servicio → fail-closed en el otro, sin fuga ni autorización implícita",
+      "ok": true,
+      "detail": "fallo de un servicio → fail-closed en el otro; nada se autoriza implícitamente"
+    },
+    {
+      "id": "I-13",
+      "name": "Reinicio de servicio NO rompe el estado de seguridad (locks/anti-replay/idempotencia)",
+      "ok": true,
+      "detail": "reinicio no rompe el estado de seguridad (locks + anti-replay + idempotencia duraderos)"
+    },
+    {
+      "id": "I-14",
+      "name": "Workers concurrentes sobre la misma campaña: cada ítem se despacha UNA vez",
+      "ok": true,
+      "detail": "4 ítems, 4 envíos, 0 duplicados y 0 en vuelo con dos workers concurrentes"
+    },
+    {
+      "id": "I-15",
+      "name": "Puente 2A→CRM real: cliente creado en la org correcta; org sin credencial → fail-closed",
+      "ok": true,
+      "detail": "cliente creado EN org A (Lead Integración A); org sin credencial → fail-closed sin creación"
+    }
+  ]
+}
