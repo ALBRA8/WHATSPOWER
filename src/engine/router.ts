@@ -40,6 +40,11 @@ export class ConversationRouter {
 
   /**
    * Procesa un evento de mensaje entrante de forma determinista y segura.
+   * Idempotencia atómica (contrato v1.1.0 §3.7): la RECLAMACIÓN se hace con
+   * INSERT OR IGNORE ANTES de ejecutar efectos externos. Dos peticiones
+   * simultáneas del mismo evento ⇒ UNA sola ejecuta operaciones; la otra
+   * espera la respuesta final y devuelve 'deduplicated' (o 409 lógico si
+   * sigue en curso).
    */
   async processInbound(event: InboundEvent): Promise<ExecutionResult> {
     // correlationId es opcional en el contrato inbound: si no llega, se usa el eventId
@@ -47,11 +52,37 @@ export class ConversationRouter {
     const { eventId, orgId, contact, message } = event
     const correlationId = event.correlationId || eventId
     const phone = contact.phone
-    // Idempotencia SCOPED POR ORGANIZACIÓN (orden de cierre): un eventId repetido entre
+    // Idempotencia SCOPED POR ORGANIZACIÓN (contrato §3): un eventId repetido entre
     // orgs distintas NO colisiona — la clave incluye la organización emisora.
     const idemKey = `${orgId}::${eventId}`
 
-    // 1. DEDUPLICACIÓN E IDEMPOTENCIA
+    // 1. RECLAMACIÓN ATÓMICA DEL EVENTO (antes de cualquier efecto externo)
+    const nowSec = Math.floor(Date.now() / 1000)
+    const claim = this.db.prepare('INSERT OR IGNORE INTO idempotency_claims (key, claimed_at) VALUES (?, ?)').run(idemKey, nowSec)
+    if (claim.changes === 0) {
+      // Otro proceso ya atiende (o atendió) este evento. Espera limitada por la
+      // respuesta final; sin respuesta ⇒ en curso (el emisor puede reintentar y
+      // obtendrá la respuesta deduplicada — jamás se ejecuta dos veces).
+      const deadline = Date.now() + 3000
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50))
+        const cachedEarly = this.db.prepare('SELECT response_json FROM idempotency_keys WHERE key = ?').get(idemKey) as { response_json: string } | undefined
+        if (cachedEarly) {
+          try {
+            const parsed = JSON.parse(cachedEarly.response_json) as ExecutionResult
+            return { ...parsed, actionTaken: 'deduplicated' }
+          } catch { /* corrupto: continuar esperando */ }
+        }
+      }
+      return {
+        handled: false,
+        actionTaken: 'event_in_progress',
+        error: 'Evento en proceso por otra operación concurrente (idempotencia)',
+        correlationId,
+      }
+    }
+
+    // 1.b DEDUPLICACIÓN (eventos ya completados)
     const cached = this.db.prepare('SELECT response_json FROM idempotency_keys WHERE key = ?').get(idemKey) as { response_json: string } | undefined
     if (cached) {
       try {
@@ -62,11 +93,11 @@ export class ConversationRouter {
       }
     }
 
-    // 2. VERIFICACIÓN DE BAJA / SUPRESIÓN
+    // 2. VERIFICACIÓN DE BAJA / SUPRESIÓN (scoped por organización)
     // Si el contacto solicita baja explícita en este mensaje
     if (this.suppressionStore.isOptOutKeyword(message.text)) {
-      this.suppressionStore.addSuppression(phone, 'Solicitud voluntaria de baja')
-      this.lockManager.releaseLock(phone)
+      this.suppressionStore.addSuppression(phone, 'Solicitud voluntaria de baja', orgId)
+      this.lockManager.releaseLock(phone, orgId)
 
       const farewell = '🚫 Has sido dado de baja correctamente. No volverás a recibir mensajes automáticos de nuestra parte.'
       await this.transport.sendMessage(phone, farewell, correlationId)
@@ -86,8 +117,8 @@ export class ConversationRouter {
       return result
     }
 
-    // Si ya estaba en la lista de supresión, se descarta en silencio
-    if (this.suppressionStore.isSuppressed(phone)) {
+    // Si ya estaba en la lista de supresión de SU organización, se descarta en silencio
+    if (this.suppressionStore.isSuppressed(phone, orgId)) {
       const result: ExecutionResult = {
         handled: false,
         actionTaken: 'ignored',
@@ -112,7 +143,7 @@ export class ConversationRouter {
     }
 
     // 4. EVALUACIÓN DE FLUJOS VISUALES (FLOW ENGINE ESTILO MANYCHAT)
-    const flowStep = await this.flowEngine.evaluateStep(phone, message.text, contact)
+    const flowStep = await this.flowEngine.evaluateStep(orgId, phone, message.text, contact)
     if (flowStep.handled) {
       let crmSynced = false
 
@@ -271,5 +302,14 @@ export class ConversationRouter {
   private saveIdempotency(key: string, result: ExecutionResult): void {
     const now = Math.floor(Date.now() / 1000)
     this.db.prepare('INSERT OR REPLACE INTO idempotency_keys (key, processed_at, response_json) VALUES (?, ?, ?)').run(key, now, JSON.stringify(result))
+  }
+
+  /** Purga de idempotencia con más de 7 días (contrato §3); oportunidad de limpieza barata. */
+  purgeExpiredIdempotency(): void {
+    const cutoff = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60
+    try {
+      this.db.prepare('DELETE FROM idempotency_claims WHERE claimed_at < ?').run(cutoff)
+      this.db.prepare('DELETE FROM idempotency_keys WHERE processed_at < ?').run(cutoff)
+    } catch { /* la purga jamás rompe el tráfico */ }
   }
 }

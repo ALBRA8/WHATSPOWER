@@ -104,8 +104,8 @@ async function runTestSuite() {
     assert.strictEqual(crm.executedActions[0].action, 'add_note')
     assert.ok((crm.executedActions[0].params.content as string).includes('Handoff IA'))
 
-    // Comprobar que el lock quedó en HANDOFF_HUMAN
-    const lock = router.getLockManager().getLock('+573000000003')
+    // Comprobar que el lock quedó en HANDOFF_HUMAN (org del evento: org_test_1)
+    const lock = router.getLockManager().getLock('+573000000003', 'org_test_1')
     assert.ok(lock)
     assert.strictEqual(lock.currentState, 'HANDOFF_HUMAN')
   })
@@ -164,45 +164,66 @@ async function runTestSuite() {
     const phone = '+573000000006'
     router.getLockManager().acquireLock(phone, 'org_test_1', 'corr_006')
 
-    const lockInfo = router.getLockManager().getLock(phone)
+    const lockInfo = router.getLockManager().getLock(phone, 'org_test_1')
     assert.ok(lockInfo)
     assert.strictEqual(lockInfo.currentState, 'IN_FLOW_2A')
 
     // Liberar lock simula cierre de conversación
-    router.getLockManager().releaseLock(phone)
-    const freeLock = router.getLockManager().getLock(phone)
+    router.getLockManager().releaseLock(phone, 'org_test_1')
+    const freeLock = router.getLockManager().getLock(phone, 'org_test_1')
     assert.strictEqual(freeLock, null)
   })
 
   // -------------------------------------------------------------
-  // CP-07: Aislamiento Multi-tenant
+  // CP-07: Aislamiento Multi-tenant (contrato v1.1.0 §9)
   // -------------------------------------------------------------
-  await test('CP-07: Locks y eventos entre organizaciones no se cruzan', async () => {
+  await test('CP-07: Locks y eventos entre organizaciones NO comparten estado', async () => {
     const phone = '+573000000007'
     router.getLockManager().acquireLock(phone, 'org_albra_alpha', 'corr_007_a')
 
-    const lockA = router.getLockManager().getLock(phone)
+    // El lock de α es visible para α y con su organización correcta
+    const lockA = router.getLockManager().getLock(phone, 'org_albra_alpha')
+    assert.ok(lockA)
     assert.strictEqual(lockA?.organizationId, 'org_albra_alpha')
 
-    // Si otra org intenta adquirirlo sobre el mismo número activo, es bloqueado por concurrencia
+    // El lock de α es INVISIBLE para β (sin oráculo: se reporta como libre)
+    const lockForB = router.getLockManager().getLock(phone, 'org_albra_beta')
+    assert.strictEqual(lockForB, null)
+
+    // β puede adquirir SU PROPIO lock sobre el mismo teléfono sin heredar el de α
     const lockTryB = router.getLockManager().acquireLock(phone, 'org_albra_beta', 'corr_007_b')
-    assert.strictEqual(lockTryB.acquired, true) // Extiende el lock
-    assert.strictEqual(router.getLockManager().getLock(phone)?.organizationId, 'org_albra_alpha')
+    assert.strictEqual(lockTryB.acquired, true)
+
+    // Ambos locks coexisten INDEPENDIENTES (dos organizaciones, mismo teléfono)
+    assert.strictEqual(router.getLockManager().getLock(phone, 'org_albra_alpha')?.organizationId, 'org_albra_alpha')
+    assert.strictEqual(router.getLockManager().getLock(phone, 'org_albra_beta')?.organizationId, 'org_albra_beta')
   })
 
   // -------------------------------------------------------------
-  // CP-08: Evento falsificado (Firma HMAC)
+  // CP-08: Evento falsificado (Firma HMAC v2 — contra el código REAL del servidor)
   // -------------------------------------------------------------
-  await test('CP-08: Validación de firma HMAC SHA-256 rechaza firmas corruptas', async () => {
+  await test('CP-08: checkWebhookSecurity (v2) rechaza firmas corruptas y timestamps alterados', async () => {
+    const { checkWebhookSecurity, PersistentReplayStore } = await import('../src/security.ts')
+    const { createDatabase } = await import('../src/db.ts')
+    const replay = new PersistentReplayStore(createDatabase(':memory:'))
     const payload = JSON.stringify({ test: 'data' })
-    const validSignature = createHmac('sha256', webhookSecret).update(payload).digest('hex')
-    const invalidSignature = 'bad_signature_99999'
+    const ts = String(Date.now())
+    const validSignature = createHmac('sha256', webhookSecret).update(`${ts}.${payload}`, 'utf8').digest('hex')
 
-    assert.notStrictEqual(validSignature, invalidSignature)
-    // Simulación de verificación interna
-    const verify = (sig: string) => sig === createHmac('sha256', webhookSecret).update(payload).digest('hex')
-    assert.strictEqual(verify(validSignature), true)
-    assert.strictEqual(verify(invalidSignature), false)
+    // Firma válida + timestamp en ventana → aceptada (y registrada en anti-replay)
+    const ok = checkWebhookSecurity(payload, validSignature, ts, webhookSecret, replay)
+    assert.strictEqual(ok.ok, true)
+
+    // Firma corrupta → 401
+    const bad = checkWebhookSecurity(payload, 'bad_signature_99999', ts, webhookSecret, replay)
+    assert.strictEqual(bad.ok, false)
+    assert.strictEqual(bad.status, 401)
+
+    // RECHAZO 1 (contrato §4): firma válida + timestamp MODIFICADO → 401 (el timestamp entra en la MAC)
+    const otherTs = String(Date.now() + 1000)
+    const tampered = checkWebhookSecurity(payload, validSignature, otherTs, webhookSecret, replay)
+    assert.strictEqual(tampered.ok, false)
+    assert.strictEqual(tampered.status, 401)
   })
 
   // -------------------------------------------------------------
@@ -222,7 +243,7 @@ async function runTestSuite() {
 
     const res = await router.processInbound(eventOptOut)
     assert.strictEqual(res.actionTaken, 'suppression_opt_out')
-    assert.ok(router.getSuppressionStore().isSuppressed(phone))
+    assert.ok(router.getSuppressionStore().isSuppressed(phone, 'org_test_1'))
     assert.ok(transport.dispatched[0].text.includes('dado de baja correctamente'))
 
     // Intento subsiguiente de mensaje normal
@@ -252,10 +273,10 @@ async function runTestSuite() {
     // Simulamos que el lock fue adquirido hace 16 minutos (960 segundos atrás)
     const oldTimestamp = Math.floor(Date.now() / 1000) - 960
     const pastExpires = oldTimestamp + 900 // Ya venció hace 60s
-    router['db'].prepare('UPDATE conversation_locks SET locked_at = ?, expires_at = ? WHERE contact_phone = ?').run(oldTimestamp, pastExpires, phone)
+    router['db'].prepare('UPDATE conversation_locks SET locked_at = ?, expires_at = ? WHERE organization_id = ? AND contact_phone = ?').run(oldTimestamp, pastExpires, 'org_test_1', phone)
 
     // Al consultar, debe detectar expiración por TTL y liberarlo
-    const lockAfterTtl = router.getLockManager().getLock(phone)
+    const lockAfterTtl = router.getLockManager().getLock(phone, 'org_test_1')
     assert.strictEqual(lockAfterTtl, null)
   })
 

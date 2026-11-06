@@ -13,7 +13,7 @@ test('SUITE: WhatsPower Studio HTTP API & Web Interface', async () => {
 
   try {
     // 1. GET /studio
-    const resStudio = await fetch('http://localhost:3015/studio')
+    const resStudio = await fetch('http://localhost:3015/studio', { headers: AUTH })
     assert.strictEqual(resStudio.status, 200)
     const html = await resStudio.text()
     assert.ok(html.includes('WhatsPower Flow Studio'))

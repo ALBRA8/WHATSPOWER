@@ -1,6 +1,5 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
-import { createHmac } from 'node:crypto'
-import { createDatabase } from './db.ts'
+import { createDatabase, purgeExpiredSecurityRows } from './db.ts'
 import { ConversationRouter } from './engine/router.ts'
 import { MockTransportSender, HttpAlbraTransportSender } from './adapters/transport.ts'
 import { MockCrmClient, HttpCrmClient } from './adapters/crm-client.ts'
@@ -9,14 +8,21 @@ import { TeamManager } from './state/team-manager.ts'
 import { CannedResponseManager } from './engine/canned-responses.ts'
 import { GrowthToolsManager } from './engine/growth-tools.ts'
 import { CrmTriggerListener } from './engine/crm-triggers.ts'
-import { PaymentGatewayManager } from './payments/payment-gateway.ts'
+import { PaymentGatewayManager, PaymentError } from './payments/payment-gateway.ts'
 import type { InboundEvent, TransportSender, CrmClientInterface } from './types.ts'
 import {
-  isAuthorizedBearer,
   checkWebhookSecurity,
+  verifyWebhookWithOrg,
+  parseWebhookSecrets,
+  resolveAdminIdentity,
+  orgHeaderAllowed,
   readBody,
-  ReplayCache,
+  PersistentReplayStore,
+  RateLimiter,
+  clientIp,
+  maskPhone,
   productionConfigProblems,
+  type InternalIdentity,
 } from './security.ts'
 
 try {
@@ -64,10 +70,13 @@ export function createAgenticServer(options?: {
       : (isProduction
         ? (() => { throw new Error('CRM_API_KEY no configurada: en producción el puente CRM no puede usar MockCrmClient silenciosamente (configura CRM_API_KEY)') })()
         : (console.warn('[Capa 2A AVISO] CRM en modo Mock — SOLO desarrollo. Configura CRM_API_KEY para el puente real.'), new MockCrmClient())))
-  // Secret dual: AGENTIC_2A_WEBHOOK_SECRET (documentado en README) tiene prioridad sobre WEBHOOK_SECRET (legacy).
-  // FAIL-CLOSED (rotación 2026-10-27): eliminado fallback hardcodeado del webhookSecret
-  // (un valor publicado en el repo permitía forjar firmas). Sin secret configurado, verifyHmac rechaza todo.
-  const webhookSecret = options?.webhookSecret
+
+  // Secretos de webhook v1.1.0:
+  //  - WEBHOOK_SECRETS="orgId:secreto,..." → el secreto que valida el HMAC VINCULA la org.
+  //  - Legado AGENTIC_2A_WEBHOOK_SECRET/WEBHOOK_SECRET (o override options.webhookSecret)
+  //    → modo de transición: la organización viene del payload autenticado por HMAC.
+  const perOrgWebhookSecrets = parseWebhookSecrets(process.env.WEBHOOK_SECRETS)
+  const legacyWebhookSecret = options?.webhookSecret
     || process.env.AGENTIC_2A_WEBHOOK_SECRET
     || process.env.WEBHOOK_SECRET
 
@@ -78,47 +87,84 @@ export function createAgenticServer(options?: {
   const crmTriggers = new CrmTriggerListener(db, router.getFlowEngine())
   const paymentManager = new PaymentGatewayManager(db)
 
-  function verifyHmac(payload: string, signatureHeader?: string): boolean {
-    if (!webhookSecret || !signatureHeader) return false
-    const expected = createHmac('sha256', webhookSecret).update(payload).digest('hex')
-    return expected === signatureHeader
-  }
-  void verifyHmac // conservado por compatibilidad de firma pública; la validación dura usa checkWebhookSecurity
+  // Anti-replay PERSISTENTE (sobrevive reinicios; purga >600s) — instancia única por BD.
+  const inboundReplay = new PersistentReplayStore(db)
+  const paymentsReplay = new PersistentReplayStore(db)
 
-  const inboundReplay = new ReplayCache()
-  const paymentsReplay = new ReplayCache()
+  // Rate limiting por ruta (contrato §7): 429 + Retry-After.
+  const rateLimiter = new RateLimiter()
+
+  // Purga de antigüedad al arrancar + cada hora (idempotencia >7d, replay lo hace su store).
+  purgeExpiredSecurityRows(db)
+  router.purgeExpiredIdempotency()
+  const purgeTimer = setInterval(() => {
+    purgeExpiredSecurityRows(db)
+    router.purgeExpiredIdempotency()
+  }, 60 * 60 * 1000)
+  purgeTimer.unref?.()
+
+  function json(res: ServerResponse, status: number, payload: unknown, extraHeaders?: Record<string, string>): void {
+    res.writeHead(status, { 'Content-Type': 'application/json', ...extraHeaders })
+    res.end(JSON.stringify(payload))
+  }
+
+  /** Respuesta 429 uniforme con Retry-After (contrato §7). */
+  function tooManyRequests(res: ServerResponse, retryAfterSec: number): void {
+    json(res, 429, { error: 'Too Many Requests: límite de tasa excedido' }, { 'Retry-After': String(retryAfterSec) })
+  }
+
+  /** Respuesta 5xx genérica: el detalle SOLO va al log del servidor (contrato §7). */
+  function generic500(res: ServerResponse, scope: string, err: unknown): void {
+    console.error(`[Capa 2A ERROR] ${scope}:`, err instanceof Error ? err.message : err)
+    json(res, 500, { error: 'Error interno del servidor' })
+  }
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
 
     // ==========================================================
-    // PUERTA DE AUTENTICACIÓN (orden de cierre 2026-11-06)
-    // Toda ruta /api/* es administrativa y exige Bearer INTERNAL_API_SECRET
-    // (comparación timing-safe), SALVO: /api/health (público),
-    // /api/inbound (protegida por HMAC+timestamp+replay propio) y
-    // /api/payments/webhook (protegida por HMAC de la pasarela).
-    // Fail-closed: sin secret configurado responde 503, nunca acepta.
+    // PUERTA DE AUTENTICACIÓN (contrato v1.1.0 §1-§2)
+    // Toda ruta /api/* es administrativa y exige credencial interna:
+    //  - INTERNAL_API_KEYS="orgId:secreto[:rol],..." (por organización), o
+    //  - legado INTERNAL_API_SECRET → org "default", rol admin.
+    // Fail-closed 503 sin credenciales configuradas; 401 con credenciales inválidas.
+    // X-Org-Id solo puede RESTRINGIR (debe coincidir con la org de la credencial).
+    // SALVO: /api/health (público), /api/inbound (HMAC v2 propio) y
+    // /api/payments/webhook (HMAC de la pasarela).
     // ==========================================================
     const isPublicApiPath = url.pathname === '/api/health'
       || url.pathname === '/api/inbound'
       || url.pathname === '/api/payments/webhook'
+
+    let identity: InternalIdentity | undefined
     if (url.pathname.startsWith('/api/') && !isPublicApiPath) {
-      const internalSecret = process.env.INTERNAL_API_SECRET
-      if (!internalSecret) {
-        res.writeHead(503, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Service Unavailable: INTERNAL_API_SECRET no configurado (fail-closed)' }))
+      const rl = rateLimiter.check(`admin:${clientIp(req)}`, 120)
+      if (!rl.allowed) { tooManyRequests(res, rl.retryAfterSec); return }
+      const resolution = resolveAdminIdentity(req.headers['authorization'])
+      if (!resolution.ok) {
+        if (resolution.status === 503) {
+          json(res, 503, { error: resolution.error })
+        } else {
+          console.warn(`[Seguridad 2A ALERTA] Acceso administrativo no autorizado: ${req.method} ${url.pathname} (IP: ${clientIp(req)})`)
+          json(res, 401, { error: resolution.error })
+        }
         return
       }
-      if (!isAuthorizedBearer(req.headers['authorization'], internalSecret)) {
-        console.warn(`[Seguridad 2A ALERTA] Acceso administrativo no autorizado: ${req.method} ${url.pathname} (IP: ${req.socket.remoteAddress})`)
-        res.writeHead(401, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
+      identity = resolution.identity
+      if (!orgHeaderAllowed(req.headers['x-org-id'], identity!)) {
+        console.warn(`[Seguridad 2A ALERTA] X-Org-Id ajeno a la credencial: ${req.method} ${url.pathname} (org: ${identity!.orgId})`)
+        json(res, 403, { error: 'Forbidden: la organización solicitada no corresponde a la credencial' })
         return
       }
     }
 
-    // WhatsPower Flow Studio (Lienzo visual ManyChat)
+    // WhatsPower Flow Studio (Lienzo visual ManyChat) — autenticado (cualquier rol).
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/studio')) {
+      const resolution = resolveAdminIdentity(req.headers['authorization'])
+      if (!resolution.ok) {
+        json(res, resolution.status, { error: resolution.error })
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(renderStudioHtml())
       return
@@ -127,26 +173,22 @@ export function createAgenticServer(options?: {
     // API REST de Flujos
     if (req.method === 'GET' && url.pathname === '/api/flows') {
       const flows = router.getFlowEngine().listFlows()
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify(flows))
+      json(res, 200, flows)
       return
     }
 
     if (req.method === 'POST' && url.pathname === '/api/flows') {
       const rb = await readBody(req)
       if (!rb.ok) {
-        res.writeHead(413, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        json(res, 413, { error: 'Payload demasiado grande' })
         return
       }
       try {
         const flow = JSON.parse(rb.body)
         router.getFlowEngine().saveFlow(flow)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ ok: true, id: flow.id }))
-      } catch (e: any) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        json(res, 200, { ok: true, id: flow.id })
+      } catch {
+        json(res, 400, { error: 'JSON de flujo inválido' })
       }
       return
     }
@@ -154,24 +196,27 @@ export function createAgenticServer(options?: {
     if (req.method === 'POST' && url.pathname === '/api/flows/simulate') {
       const rb = await readBody(req)
       if (!rb.ok) {
-        res.writeHead(413, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        json(res, 413, { error: 'Payload demasiado grande' })
         return
       }
       try {
         const { phone, messageText, name } = JSON.parse(rb.body)
-        const stepRes = await router.getFlowEngine().evaluateStep(phone, messageText, { name })
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(stepRes))
-      } catch (e: any) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        const stepRes = await router.getFlowEngine().evaluateStep(identity!.orgId, phone, messageText, { name })
+        json(res, 200, stepRes)
+      } catch {
+        json(res, 400, { error: 'Solicitud de simulación inválida' })
       }
       return
     }
 
-    // 0. Visor de QR auto-refrescable en vivo para vinculación de WhatsApp
+    // 0. Visor de QR auto-refrescable — PROTEGIDO (reparación integral): jamás se
+    // sirve la página de vinculación a un anónimo.
     if (req.method === 'GET' && url.pathname === '/qr') {
+      const resolution = resolveAdminIdentity(req.headers['authorization'])
+      if (!resolution.ok) {
+        json(res, resolution.status, { error: resolution.error })
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(`<!DOCTYPE html>
 <html lang="es">
@@ -198,12 +243,12 @@ export function createAgenticServer(options?: {
 <body>
   <div class="card">
     <h1>Vincular WhatsApp en Vivo</h1>
-    <p>Este código QR se refresca automáticamente cada segundo para evitar expiración.</p>
-    
+    <p>Este código QR se refresca automáticamente cada segundo para evitar expiración. Sesión autenticada como administrador.</p>
+
     <div class="qr-container" id="qrContainer">
       <div style="color: #64748b; font-size: 14px;">Generando código QR...</div>
     </div>
-    
+
     <div>
       <div id="statusBadge" class="badge badge-waiting">
         <span class="pulse"></span> <span id="statusText">Sincronizando con WhatsApp...</span>
@@ -222,9 +267,12 @@ export function createAgenticServer(options?: {
   </div>
 
   <script>
+    // El token llega por el localStorage (colocado por el operador tras autenticarse);
+    // la página NUNCA se sirve a anónimos y /qr/data tampoco responde a anónimos.
     async function updateQR() {
       try {
-        const res = await fetch('/qr/data');
+        const token = localStorage.getItem('wp_qr_token') || '';
+        const res = await fetch('/qr/data', { headers: { 'Authorization': 'Bearer ' + token } });
         if (!res.ok) return;
         const data = await res.json();
         const container = document.getElementById('qrContainer');
@@ -256,202 +304,216 @@ export function createAgenticServer(options?: {
       return
     }
 
+    // Datos del QR — PROTEGIDO (reparación integral): exige identidad de administrador.
+    // Jamás se devuelve información de QR/phone a usuarios anónimos.
     if (req.method === 'GET' && url.pathname === '/qr/data') {
+      const resolution = resolveAdminIdentity(req.headers['authorization'])
+      if (!resolution.ok) {
+        json(res, resolution.status, { error: resolution.error })
+        return
+      }
+      if (resolution.identity!.role !== 'admin') {
+        json(res, 403, { error: 'Forbidden: la vinculación de dispositivos exige rol admin' })
+        return
+      }
+      const rl = rateLimiter.check(`qr:${clientIp(req)}`, 30)
+      if (!rl.allowed) { tooManyRequests(res, rl.retryAfterSec); return }
       try {
         // FAIL-CLOSED (rotación 2026-10-27): sin secret configurado no se consulta el daemon
         const daemonSecret = process.env.INTERNAL_API_SECRET
         if (!daemonSecret) {
-          res.writeHead(503, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'Service Unavailable: INTERNAL_API_SECRET no configurado' }))
+          json(res, 503, { error: 'Service Unavailable: INTERNAL_API_SECRET no configurado' })
           return
         }
         const daemonRes = await fetch(`${process.env.WHATSAPP_DAEMON_URL || 'http://localhost:3002'}/qr`, {
           headers: { 'Authorization': 'Bearer ' + daemonSecret }
         })
         const data = await daemonRes.json()
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(data))
-      } catch (e: any) {
-        res.writeHead(500, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        json(res, 200, data)
+      } catch (err) {
+        generic500(res, 'qr/data', err)
       }
       return
     }
 
     // 1. Healthcheck
     if (req.method === 'GET' && url.pathname === '/api/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ status: 'ok', service: 'albra-agentic-2a' }))
+      json(res, 200, { status: 'ok', service: 'albra-agentic-2a' })
       return
     }
 
-    // 2. Consulta de Locks para Capa 2B (GET /api/internal/locks/:phone)
+    // 2. Consulta de Locks para Capa 2B (GET /api/internal/locks/:phone) — scoped por org.
     if (req.method === 'GET' && url.pathname.startsWith('/api/internal/locks/')) {
       const phone = decodeURIComponent(url.pathname.replace('/api/internal/locks/', ''))
-      const lock = router.getLockManager().getLock(phone)
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ phone, locked: Boolean(lock), lock }))
+      const lock = router.getLockManager().getLock(phone, identity!.orgId)
+      json(res, 200, { phone, locked: Boolean(lock), lock })
       return
     }
 
-    // 3.1 Consulta de Supresión para Capa 2B (GET /api/internal/suppression/:phone)
+    // 3.1 Consulta de Supresión para Capa 2B (GET /api/internal/suppression/:phone) — scoped.
     if (req.method === 'GET' && url.pathname.startsWith('/api/internal/suppression/')) {
       const rawPhone = decodeURIComponent(url.pathname.replace('/api/internal/suppression/', ''))
       const digits = rawPhone.replace(/\D/g, '')
       const phone = (digits.length === 10 && digits.startsWith('3')) ? `57${digits}` : digits
-      const suppressed = router.getSuppressionStore().isSuppressed(phone)
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ phone, suppressed }))
+      const suppressed = router.getSuppressionStore().isSuppressed(phone, identity!.orgId)
+      json(res, 200, { phone, suppressed })
       return
     }
 
-    // 3.2 Registro Administrativo de Supresión (POST /api/internal/suppression/:phone)
+    // 3.2 Registro Administrativo de Supresión (POST) — scoped por org.
     if (req.method === 'POST' && url.pathname.startsWith('/api/internal/suppression/')) {
-      const authHeader = req.headers['authorization']
-      // FAIL-CLOSED (rotación 2026-10-27): sin secret configurado se rechaza siempre
-      const internalSecret = process.env.INTERNAL_API_SECRET
-      if (!internalSecret || !authHeader || authHeader !== `Bearer ${internalSecret}`) {
-        res.writeHead(401, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
-        return
-      }
-
       const rawPhone = decodeURIComponent(url.pathname.replace('/api/internal/suppression/', ''))
       const digits = rawPhone.replace(/\D/g, '')
       const phone = (digits.length === 10 && digits.startsWith('3')) ? `57${digits}` : digits
       if (!phone || phone.length < 10) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Bad Request: Teléfono inválido o ambiguo' }))
+        json(res, 400, { error: 'Bad Request: Teléfono inválido o ambiguo' })
         return
       }
 
-      let body = ''
-      req.on('data', (chunk) => (body += chunk))
-      req.on('end', () => {
-        let reason = 'Baja administrativa / CRM'
-        try {
-          if (body) {
-            const parsed = JSON.parse(body)
-            if (parsed.reason) reason = parsed.reason
-          }
-        } catch {}
-
-        router.getSuppressionStore().addSuppression(phone, reason)
-        console.log(`[Seguridad 2A AUDIT] Registro de supresión para: ${phone} (Motivo: "${reason}", IP: ${req.socket.remoteAddress}, Time: ${new Date().toISOString()})`)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ phone, suppressed: true, reason }))
-      })
-      return
-    }
-
-    // 3.3 Eliminación Administrativa de Supresión (DELETE /api/internal/suppression/:phone)
-    if (req.method === 'DELETE' && url.pathname.startsWith('/api/internal/suppression/')) {
-      const authHeader = req.headers['authorization']
-      // FAIL-CLOSED (rotación 2026-10-27): sin secret configurado se rechaza siempre
-      const internalSecret = process.env.INTERNAL_API_SECRET
-      if (!internalSecret || !authHeader || authHeader !== `Bearer ${internalSecret}`) {
-        console.warn(`[Seguridad 2A ALERTA] Intento no autorizado de eliminar baja en: ${url.pathname} (IP: ${req.socket.remoteAddress}, Auth: ${authHeader ? 'Inválida' : 'Ausente'})`)
-        res.writeHead(401, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
-        return
-      }
-
-      const rawPhone = decodeURIComponent(url.pathname.replace('/api/internal/suppression/', ''))
-      const digits = rawPhone.replace(/\D/g, '')
-      const phone = (digits.length === 10 && digits.startsWith('3')) ? `57${digits}` : digits
-      if (!phone || phone.length < 10) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Bad Request: Teléfono inválido o ambiguo' }))
-        return
-      }
-
-      const wasSuppressed = router.getSuppressionStore().isSuppressed(phone)
-      router.getSuppressionStore().removeSuppression(phone)
-      console.log(`[Seguridad 2A AUDIT] Eliminación autorizada de supresión para: ${phone} (Estaba suprimido: ${wasSuppressed}, IP: ${req.socket.remoteAddress}, Time: ${new Date().toISOString()})`)
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ phone, suppressed: false, removed: true, wasSuppressed }))
-      return
-    }
-
-    // 4. Liberación de Lock (POST /api/internal/locks/:phone/release)
-    if (req.method === 'POST' && url.pathname.endsWith('/release') && url.pathname.startsWith('/api/internal/locks/')) {
-      const phone = decodeURIComponent(url.pathname.replace('/api/internal/locks/', '').replace('/release', ''))
-      router.getLockManager().releaseLock(phone)
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ phone, released: true }))
-      return
-    }
-
-    // 5. Inbound Webhook (POST /api/inbound)
-    // Endurecido (orden de cierre): firma HMAC OBLIGATORIA siempre + timestamp OBLIGATORIO
-    // en ventana ±5min + caché anti-replay + comparación timing-safe. Sin excepción en dev:
-    // el puente del CRM ya firma (X-Signature-SHA256 + X-Timestamp).
-    if (req.method === 'POST' && url.pathname === '/api/inbound') {
       const rb = await readBody(req)
       if (!rb.ok) {
-        res.writeHead(413, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        json(res, 413, { error: 'Payload demasiado grande' })
+        return
+      }
+      let reason = 'Baja administrativa / CRM'
+      try {
+        if (rb.body) {
+          const parsed = JSON.parse(rb.body)
+          if (parsed.reason) reason = String(parsed.reason).slice(0, 200)
+        }
+      } catch { /* motivo por defecto */ }
+
+      router.getSuppressionStore().addSuppression(phone, reason, identity!.orgId)
+      console.log(`[Seguridad 2A AUDIT] Registro de supresión para ${maskPhone(phone)} (org: ${identity!.orgId}, Motivo: "${reason}", IP: ${clientIp(req)}, Time: ${new Date().toISOString()})`)
+      json(res, 200, { phone, suppressed: true, reason })
+      return
+    }
+
+    // 3.3 Eliminación Administrativa de Supresión (DELETE) — SOLO rol admin (contrato §2).
+    if (req.method === 'DELETE' && url.pathname.startsWith('/api/internal/suppression/')) {
+      if (identity!.role !== 'admin') {
+        console.warn(`[Seguridad 2A ALERTA] Intento de eliminar baja sin rol admin (org: ${identity!.orgId}, IP: ${clientIp(req)})`)
+        json(res, 403, { error: 'Forbidden: eliminar supresiones exige rol admin' })
+        return
+      }
+      const rawPhone = decodeURIComponent(url.pathname.replace('/api/internal/suppression/', ''))
+      const digits = rawPhone.replace(/\D/g, '')
+      const phone = (digits.length === 10 && digits.startsWith('3')) ? `57${digits}` : digits
+      if (!phone || phone.length < 10) {
+        json(res, 400, { error: 'Bad Request: Teléfono inválido o ambiguo' })
+        return
+      }
+
+      const wasSuppressed = router.getSuppressionStore().isSuppressed(phone, identity!.orgId)
+      router.getSuppressionStore().removeSuppression(phone, identity!.orgId)
+      console.log(`[Seguridad 2A AUDIT] Eliminación autorizada de supresión para ${maskPhone(phone)} (org: ${identity!.orgId}, Estaba suprimido: ${wasSuppressed}, IP: ${clientIp(req)}, Time: ${new Date().toISOString()})`)
+      json(res, 200, { phone, suppressed: false, removed: true, wasSuppressed })
+      return
+    }
+
+    // 4. Liberación de Lock (POST /api/internal/locks/:phone/release) — SOLO rol admin,
+    // scoped a la organización de la credencial.
+    if (req.method === 'POST' && url.pathname.endsWith('/release') && url.pathname.startsWith('/api/internal/locks/')) {
+      if (identity!.role !== 'admin') {
+        json(res, 403, { error: 'Forbidden: liberar locks exige rol admin' })
+        return
+      }
+      const phone = decodeURIComponent(url.pathname.replace('/api/internal/locks/', '').replace('/release', ''))
+      router.getLockManager().releaseLock(phone, identity!.orgId)
+      json(res, 200, { phone, released: true })
+      return
+    }
+
+    // 5. Inbound Webhook (POST /api/inbound) — HMAC v2 (contrato §3):
+    // firma sobre timestamp.body, ventana ±300s, anti-replay PERSISTENTE, secretos
+    // por organización (WEBHOOK_SECRETS) con el secreto VINCULANDO la org.
+    if (req.method === 'POST' && url.pathname === '/api/inbound') {
+      const rl = rateLimiter.check(`inbound:${clientIp(req)}`, 60)
+      if (!rl.allowed) { tooManyRequests(res, rl.retryAfterSec); return }
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        json(res, 413, { error: 'Payload demasiado grande' })
         return
       }
       try {
         const signature = req.headers['x-signature-sha256'] as string | undefined
         const timestampHeader = req.headers['x-timestamp'] as string | undefined
+        const eventIdHeader = req.headers['x-event-id'] as string | undefined
 
-        const sec = checkWebhookSecurity(rb.body, signature, timestampHeader, webhookSecret, inboundReplay)
+        // Pre-parseo SOLO para conocer el orgId declarado (la verificación HMAC es previa
+        // a cualquier efecto; el orgId del payload se valida DESPUÉS contra el secreto).
+        let declaredOrgId: string | undefined
+        let eventId: string | undefined
+        let parsedEvent: InboundEvent | undefined
+        try {
+          parsedEvent = JSON.parse(rb.body) as InboundEvent
+          declaredOrgId = parsedEvent.orgId
+          eventId = parsedEvent.eventId
+        } catch {
+          json(res, 400, { error: 'Payload JSON inválido' })
+          return
+        }
+
+        const sec = verifyWebhookWithOrg(rb.body, signature, timestampHeader, declaredOrgId, {
+          perOrgSecrets: perOrgWebhookSecrets,
+          legacySecret: legacyWebhookSecret,
+          replay: inboundReplay,
+        })
         if (!sec.ok) {
-          res.writeHead(sec.status, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: sec.error }))
+          json(res, sec.status, { error: sec.error })
           return
         }
 
-        const event = JSON.parse(rb.body) as InboundEvent
-        if (!event.eventId || !event.orgId || !event.contact?.phone || !event.message?.text) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'Payload de evento inbound incompleto' }))
+        // Organización resuelta SIEMPRE de la credencial verificada (contrato §1):
+        //  - con WEBHOOK_SECRETS: org vinculada al secreto (403 si el payload declara otra).
+        //  - modo de transición (secreto legado): org del payload autenticado por HMAC.
+        const orgId = sec.boundOrgId || declaredOrgId || 'default'
+        if (!eventId) eventId = eventIdHeader || undefined
+        if (!eventId || !orgId || !parsedEvent!.contact?.phone || !parsedEvent!.message?.text) {
+          json(res, 400, { error: 'Payload de evento inbound incompleto' })
           return
         }
-        if (!/^[a-zA-Z0-9_-]{1,64}$/.test(event.orgId)) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'orgId inválido' }))
+        if (!/^[a-zA-Z0-9_-]{1,64}$/.test(orgId)) {
+          json(res, 400, { error: 'orgId inválido' })
+          return
+        }
+        if (!/^[a-zA-Z0-9._-]{1,128}$/.test(eventId)) {
+          json(res, 400, { error: 'eventId inválido' })
           return
         }
 
+        const event: InboundEvent = { ...parsedEvent!, eventId, orgId }
         const result = await router.processInbound(event)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(result))
-      } catch (err: any) {
-        res.writeHead(500, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: err.message }))
+        json(res, 200, result)
+      } catch (err) {
+        generic500(res, 'inbound', err)
       }
       return
     }
 
     // ==========================================
     // EXTENSIONES: EQUIPO, CANNED, GROWTH, PAGOS
+    // (todas scoped a la organización de la credencial)
     // ==========================================
 
     // 1. Team & Round-Robin
     if (req.method === 'GET' && url.pathname === '/api/team/agents') {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify(teamManager.getActiveAgents()))
+      json(res, 200, teamManager.getActiveAgents())
       return
     }
 
     if (req.method === 'POST' && url.pathname === '/api/team/agents') {
       const rb = await readBody(req)
       if (!rb.ok) {
-        res.writeHead(413, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        json(res, 413, { error: 'Payload demasiado grande' })
         return
       }
       try {
         const data = JSON.parse(rb.body)
         const agent = teamManager.registerAgent(data)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(agent))
-      } catch (e: any) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        json(res, 200, agent)
+      } catch {
+        json(res, 400, { error: 'Datos de agente inválidos' })
       }
       return
     }
@@ -459,45 +521,38 @@ export function createAgenticServer(options?: {
     if (req.method === 'POST' && url.pathname === '/api/team/assign') {
       const rb = await readBody(req)
       if (!rb.ok) {
-        res.writeHead(413, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        json(res, 413, { error: 'Payload demasiado grande' })
         return
       }
       try {
         const { phone, strategy } = JSON.parse(rb.body)
         const agent = strategy === 'least_loaded'
-          ? teamManager.assignLeastLoaded(phone)
-          : teamManager.assignRoundRobin(phone)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ assignedAgent: agent }))
-      } catch (e: any) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+          ? teamManager.assignLeastLoaded(phone, identity!.orgId)
+          : teamManager.assignRoundRobin(phone, identity!.orgId)
+        json(res, 200, { assignedAgent: agent })
+      } catch {
+        json(res, 400, { error: 'Solicitud de asignación inválida' })
       }
       return
     }
 
     // 2. Canned Responses (/canned)
     if (req.method === 'GET' && url.pathname === '/api/canned') {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify(cannedManager.listAll()))
+      json(res, 200, cannedManager.listAll())
       return
     }
 
     if (req.method === 'POST' && url.pathname === '/api/canned') {
       const rb = await readBody(req)
       if (!rb.ok) {
-        res.writeHead(413, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        json(res, 413, { error: 'Payload demasiado grande' })
         return
       }
       try {
         const item = cannedManager.createResponse(JSON.parse(rb.body))
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(item))
-      } catch (e: any) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        json(res, 200, item)
+      } catch {
+        json(res, 400, { error: 'Datos de respuesta canned inválidos' })
       }
       return
     }
@@ -519,17 +574,14 @@ export function createAgenticServer(options?: {
     if (req.method === 'POST' && url.pathname === '/api/growth/links') {
       const rb = await readBody(req)
       if (!rb.ok) {
-        res.writeHead(413, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        json(res, 413, { error: 'Payload demasiado grande' })
         return
       }
       try {
         const link = growthManager.createGrowthLink(JSON.parse(rb.body))
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(link))
-      } catch (e: any) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        json(res, 200, link)
+      } catch {
+        json(res, 400, { error: 'Datos de enlace de crecimiento inválidos' })
       }
       return
     }
@@ -538,18 +590,15 @@ export function createAgenticServer(options?: {
     if (req.method === 'POST' && url.pathname === '/api/crm/stage-change') {
       const rb = await readBody(req)
       if (!rb.ok) {
-        res.writeHead(413, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        json(res, 413, { error: 'Payload demasiado grande' })
         return
       }
       try {
         const event = JSON.parse(rb.body)
-        const result = await crmTriggers.handleStageChange(event)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(result))
-      } catch (e: any) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        const result = await crmTriggers.handleStageChange(event, identity!.orgId)
+        json(res, 200, result)
+      } catch {
+        json(res, 400, { error: 'Evento de cambio de etapa inválido' })
       }
       return
     }
@@ -558,28 +607,30 @@ export function createAgenticServer(options?: {
     if (req.method === 'POST' && url.pathname === '/api/payments/create-link') {
       const rb = await readBody(req)
       if (!rb.ok) {
-        res.writeHead(413, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        json(res, 413, { error: 'Payload demasiado grande' })
         return
       }
       try {
-        const tx = paymentManager.createPaymentLink(JSON.parse(rb.body))
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(tx))
-      } catch (e: any) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        const tx = paymentManager.createPaymentLink(JSON.parse(rb.body), identity!.orgId)
+        json(res, 200, tx)
+      } catch (e) {
+        if (e instanceof PaymentError && e.code === 'GATEWAY_NOT_CONFIGURED') {
+          json(res, 503, { error: 'Service Unavailable: pasarela real no configurada (fail-closed)' })
+        } else {
+          json(res, 400, { error: 'Datos de pago inválidos' })
+        }
       }
       return
     }
 
-    // Webhook de la pasarela de pagos: exige HMAC propio (PAYMENTS_WEBHOOK_SECRET) +
-    // timestamp + anti-replay. Fail-closed: sin secret configurado, 503.
+    // Webhook de la pasarela de pagos: HMAC v2 (PAYMENTS_WEBHOOK_SECRET) + timestamp +
+    // anti-replay persistente. Máquina de estados estricta (contrato §6).
     if (req.method === 'POST' && url.pathname === '/api/payments/webhook') {
+      const rl = rateLimiter.check(`payments:${clientIp(req)}`, 60)
+      if (!rl.allowed) { tooManyRequests(res, rl.retryAfterSec); return }
       const rb = await readBody(req)
       if (!rb.ok) {
-        res.writeHead(413, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        json(res, 413, { error: 'Payload demasiado grande' })
         return
       }
       const sec = checkWebhookSecurity(
@@ -590,25 +641,35 @@ export function createAgenticServer(options?: {
         paymentsReplay,
       )
       if (!sec.ok) {
-        console.warn(`[Seguridad 2A ALERTA] Webhook de pagos rechazado: ${sec.error} (IP: ${req.socket.remoteAddress})`)
-        res.writeHead(sec.status, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: sec.error }))
+        console.warn(`[Seguridad 2A ALERTA] Webhook de pagos rechazado: ${sec.error} (IP: ${clientIp(req)})`)
+        json(res, sec.status, { error: sec.error })
         return
       }
       try {
         const { transactionId, status } = JSON.parse(rb.body)
-        const tx = paymentManager.handlePaymentWebhook(transactionId, status)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ ok: true, transaction: tx }))
-      } catch (e: any) {
-        res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        if (!transactionId || typeof transactionId !== 'string') {
+          json(res, 400, { error: 'transactionId obligatorio' })
+          return
+        }
+        // El webhook de la pasarela opera sobre la organización dueña de la cuenta de
+        // la pasarela (por despliegue): org 'default'. Pasarelas por organización
+        // requerirían secretos de webhook por org (documentado en el contrato).
+        const tx = paymentManager.handlePaymentWebhook(transactionId, String(status || ''), 'default')
+        json(res, 200, { ok: true, transaction: tx })
+      } catch (e) {
+        if (e instanceof PaymentError) {
+          if (e.code === 'INVALID_STATUS') json(res, 400, { error: 'status fuera de la whitelist de transiciones válidas' })
+          else if (e.code === 'NOT_FOUND') json(res, 404, { error: 'transacción no encontrada' })
+          else if (e.code === 'ILLEGAL_TRANSITION') json(res, 409, { error: 'Conflicto: transición de estado ilegal (terminal intocable)' })
+          else json(res, 400, { error: 'Solicitud de pago inválida' })
+        } else {
+          json(res, 400, { error: 'Payload de webhook de pago inválido' })
+        }
       }
       return
     }
 
-    res.writeHead(404, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ error: 'Ruta no encontrada' }))
+    json(res, 404, { error: 'Ruta no encontrada' })
   })
 
   return {

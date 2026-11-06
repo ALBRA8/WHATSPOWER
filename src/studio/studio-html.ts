@@ -174,12 +174,23 @@ export function renderStudioHtml(): string {
   </div>
 
   <script>
+    // Autenticación del Studio (reparación integral): el Studio es una herramienta del
+    // operador; pide el token una sola vez y lo usa en TODAS las llamadas /api/*.
+    function wpToken() {
+      let t = localStorage.getItem('wp_admin_token');
+      if (!t) { t = prompt('Token de acceso (Bearer INTERNAL_API_KEY/SECRET):') || ''; if (t) localStorage.setItem('wp_admin_token', t); }
+      return t;
+    }
+    async function authFetch(url, opts = {}) {
+      const headers = Object.assign({ 'Authorization': 'Bearer ' + wpToken() }, opts.headers || {});
+      return fetch(url, Object.assign({}, opts, { headers }));
+    }
     let currentFlow = null;
     let flowsList = [];
 
     async function loadFlows() {
       try {
-        const res = await fetch('/api/flows');
+        const res = await authFetch('/api/flows');
         flowsList = await res.json();
         const sel = document.getElementById('flowSelect');
         sel.innerHTML = '';
@@ -293,7 +304,7 @@ export function renderStudioHtml(): string {
     async function saveCurrentFlow() {
       if (!currentFlow) return;
       try {
-        const res = await fetch('/api/flows', {
+        const res = await authFetch('/api/flows', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(currentFlow)
@@ -318,7 +329,7 @@ export function renderStudioHtml(): string {
       addSimBubble(text, 'out');
 
       try {
-        const res = await fetch('/api/flows/simulate', {
+        const res = await authFetch('/api/flows/simulate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ phone: simPhone, messageText: text, name: 'Lead Demo' })

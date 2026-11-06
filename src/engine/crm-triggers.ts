@@ -57,7 +57,7 @@ export class CrmTriggerListener {
     })
   }
 
-  async handleStageChange(event: StageChangeEvent): Promise<{
+  async handleStageChange(event: StageChangeEvent, orgId: string = 'default'): Promise<{
     triggered: boolean
     action?: string
     messageSent?: string
@@ -73,12 +73,12 @@ export class CrmTriggerListener {
 
     if (rule.action === 'send_message' && rule.templateMessage) {
       const text = rule.templateMessage.replace(/\{\{nombre\}\}/g, contactName)
-      // Encolar mensaje o registrarlo en inbox
+      // Encolar mensaje o registrarlo en inbox (scoped por organización)
       const now = Math.floor(Date.now() / 1000)
       this.db.prepare(`
-        INSERT INTO inbox_messages (id, contact_phone, direction, text, created_at)
-        VALUES (?, ?, 'outbound', ?, ?)
-      `).run(`msg_trig_${Date.now()}`, event.clientPhone, text, now)
+        INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, created_at)
+        VALUES (?, ?, ?, 'outbound', ?, ?)
+      `).run(`msg_trig_${Date.now()}`, orgId, event.clientPhone, text, now)
 
       return {
         triggered: true,

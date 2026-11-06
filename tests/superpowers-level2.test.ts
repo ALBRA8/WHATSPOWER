@@ -15,28 +15,28 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
     assert.strictEqual(active.length, 3)
 
     // Asignación 1 -> ag_1
-    const a1 = teamManager.assignRoundRobin('573001110001')
+    const a1 = teamManager.assignRoundRobin('573001110001', 'default')
     assert.strictEqual(a1?.id, 'ag_1')
 
     // Asignación 2 -> ag_2
-    const a2 = teamManager.assignRoundRobin('573001110002')
+    const a2 = teamManager.assignRoundRobin('573001110002', 'default')
     assert.strictEqual(a2?.id, 'ag_2')
 
     // Asignación 3 -> ag_3
-    const a3 = teamManager.assignRoundRobin('573001110003')
+    const a3 = teamManager.assignRoundRobin('573001110003', 'default')
     assert.strictEqual(a3?.id, 'ag_3')
 
     // Asignación 4 (Vuelve a empezar Round-Robin) -> ag_1
-    const a4 = teamManager.assignRoundRobin('573001110004')
+    const a4 = teamManager.assignRoundRobin('573001110004', 'default')
     assert.strictEqual(a4?.id, 'ag_1')
 
     // Contacto ya asignado devuelve el mismo asesor asignado (Sticky Assignment)
-    const a1Repeat = teamManager.assignRoundRobin('573001110001')
+    const a1Repeat = teamManager.assignRoundRobin('573001110001', 'default')
     assert.strictEqual(a1Repeat?.id, 'ag_1')
 
     // Resolver conversación
-    teamManager.resolveAssignment('573001110001')
-    const checkResolved = teamManager.getAssignment('573001110001')
+    teamManager.resolveAssignment('573001110001', 'default')
+    const checkResolved = teamManager.getAssignment('573001110001', 'default')
     assert.strictEqual(checkResolved?.status, 'RESOLVED')
   })
 
@@ -115,6 +115,9 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
 
   it('SP2-05: Payment Gateway genera links de cobro y procesa confirmación de webhook', () => {
     const { paymentManager, db } = createAgenticServer({ dbPath: ':memory:' })
+    // Modo sandbox: permite pasarela de prueba explícita (el simulador forzaría gateway=simulator)
+    const prevMode = process.env.PAYMENTS_MODE
+    process.env.PAYMENTS_MODE = 'sandbox'
 
     const tx = paymentManager.createPaymentLink({
       contactPhone: '573009998877',
@@ -122,18 +125,22 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
       currency: 'COP',
       description: 'Suscripción Plan Pro ALBRA',
       gateway: 'wompi',
-    })
+    }, 'default')
 
     assert.strictEqual(tx.status, 'PENDING')
+    assert.strictEqual(tx.mode, 'sandbox')
     assert.ok(tx.paymentLink.includes('wompi.co'))
     assert.ok(tx.paymentLink.includes('amount-in-cents=25000000'))
 
     // Simular webhook de aprobación de pago
-    const approvedTx = paymentManager.handlePaymentWebhook(tx.id, 'APPROVED')
+    const approvedTx = paymentManager.handlePaymentWebhook(tx.id, 'APPROVED', 'default')
     assert.strictEqual(approvedTx?.status, 'APPROVED')
 
     // Confirmar que el contacto fue etiquetado como CLIENTE_PAGADO
     const tagRow = db.prepare('SELECT * FROM contact_tags WHERE contact_phone = ? AND tag_name = ?').get('573009998877', 'CLIENTE_PAGADO')
     assert.ok(tagRow, 'El contacto debe tener la etiqueta CLIENTE_PAGADO')
+
+    if (prevMode === undefined) delete process.env.PAYMENTS_MODE
+    else process.env.PAYMENTS_MODE = prevMode
   })
 })

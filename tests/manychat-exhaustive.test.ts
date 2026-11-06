@@ -13,17 +13,17 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
   // -------------------------------------------------------------
   await t.test('MC-01: Gestión completa de Tags por contacto', () => {
     const phone = '+573001112233'
-    assert.strictEqual(engine.hasTag(phone, 'vip'), false)
+    assert.strictEqual(engine.hasTag('default', phone, 'vip'), false)
 
-    engine.addTag(phone, 'vip')
-    engine.addTag(phone, 'comprador')
-    assert.strictEqual(engine.hasTag(phone, 'vip'), true)
-    assert.strictEqual(engine.hasTag(phone, 'comprador'), true)
-    assert.deepStrictEqual(engine.getTags(phone).sort(), ['comprador', 'vip'])
+    engine.addTag('default', phone, 'vip')
+    engine.addTag('default', phone, 'comprador')
+    assert.strictEqual(engine.hasTag('default', phone, 'vip'), true)
+    assert.strictEqual(engine.hasTag('default', phone, 'comprador'), true)
+    assert.deepStrictEqual(engine.getTags('default', phone).sort(), ['comprador', 'vip'])
 
-    engine.removeTag(phone, 'vip')
-    assert.strictEqual(engine.hasTag(phone, 'vip'), false)
-    assert.strictEqual(engine.hasTag(phone, 'comprador'), true)
+    engine.removeTag('default', phone, 'vip')
+    assert.strictEqual(engine.hasTag('default', phone, 'vip'), false)
+    assert.strictEqual(engine.hasTag('default', phone, 'comprador'), true)
   })
 
   // -------------------------------------------------------------
@@ -31,13 +31,13 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
   // -------------------------------------------------------------
   await t.test('MC-02: Gestión de Custom Fields (Atributos de Contacto)', () => {
     const phone = '+573001112233'
-    engine.setCustomField(phone, 'email', 'cliente@empresa.com')
-    engine.setCustomField(phone, 'presupuesto', '1500')
+    engine.setCustomField('default', phone, 'email', 'cliente@empresa.com')
+    engine.setCustomField('default', phone, 'presupuesto', '1500')
 
-    assert.strictEqual(engine.getCustomField(phone, 'email'), 'cliente@empresa.com')
-    assert.strictEqual(engine.getCustomField(phone, 'presupuesto'), '1500')
+    assert.strictEqual(engine.getCustomField('default', phone, 'email'), 'cliente@empresa.com')
+    assert.strictEqual(engine.getCustomField('default', phone, 'presupuesto'), '1500')
 
-    const all = engine.getAllCustomFields(phone)
+    const all = engine.getAllCustomFields('default', phone)
     assert.strictEqual(all.email, 'cliente@empresa.com')
     assert.strictEqual(all.presupuesto, '1500')
   })
@@ -65,23 +65,23 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
     engine.saveFlow(inputFlow)
 
     // Paso 1: Contacto escribe "registro" -> Recibe el prompt de captura
-    const step1 = await engine.evaluateStep(phone, 'quiero mi registro')
+    const step1 = await engine.evaluateStep('default', phone, 'quiero mi registro')
     assert.strictEqual(step1.handled, true)
     assert.ok(step1.messagesToSend[0].text.includes('¿Cuál es tu correo'))
 
     // Verificar que la sesión está esperando input para 'email'
-    const sess = engine.getSession(phone)
+    const sess = engine.getSession('default', phone)
     assert.ok(sess)
     assert.strictEqual(sess.waitingForInput, true)
     assert.strictEqual(sess.inputTargetField, 'email')
 
     // Paso 2: Contacto responde con su correo
-    const step2 = await engine.evaluateStep(phone, 'juan@perez.com')
+    const step2 = await engine.evaluateStep('default', phone, 'juan@perez.com')
     assert.strictEqual(step2.handled, true)
     assert.ok(step2.messagesToSend[0].text.includes('juan@perez.com'))
 
     // Verificar que quedó guardado en el almacenamiento permanente de Custom Fields
-    assert.strictEqual(engine.getCustomField(phone, 'email'), 'juan@perez.com')
+    assert.strictEqual(engine.getCustomField('default', phone, 'email'), 'juan@perez.com')
   })
 
   // -------------------------------------------------------------
@@ -90,7 +90,7 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
   await t.test('MC-04: Nodo Condición bifurca según etiquetas del contacto', async () => {
     const phoneVip = '+573007778899'
     const phoneRegular = '+573000001122'
-    engine.addTag(phoneVip, 'cliente_vip')
+    engine.addTag('default', phoneVip, 'cliente_vip')
 
     const conditionFlow: FlowDefinition = {
       id: 'flow_vip_check',
@@ -119,12 +119,12 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
     engine.saveFlow(conditionFlow)
 
     // Cliente VIP recibe 30%
-    const resVip = await engine.evaluateStep(phoneVip, 'quiero una promocion')
+    const resVip = await engine.evaluateStep('default', phoneVip, 'quiero una promocion')
     assert.strictEqual(resVip.handled, true)
     assert.ok(resVip.messagesToSend[0].text.includes('30% de descuento exclusivo'))
 
     // Cliente regular recibe 10%
-    const resReg = await engine.evaluateStep(phoneRegular, 'quiero una promocion')
+    const resReg = await engine.evaluateStep('default', phoneRegular, 'quiero una promocion')
     assert.strictEqual(resReg.handled, true)
     assert.ok(resReg.messagesToSend[0].text.includes('10% de descuento'))
   })
@@ -158,9 +158,9 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
     }
     engine.saveFlow(actionFlow)
 
-    const res = await engine.evaluateStep(phone, 'quiero comprar ahora')
+    const res = await engine.evaluateStep('default', phone, 'quiero comprar ahora')
     assert.strictEqual(res.handled, true)
-    assert.strictEqual(engine.hasTag(phone, 'intencion_compra'), true)
+    assert.strictEqual(engine.hasTag('default', phone, 'intencion_compra'), true)
     assert.ok(res.webhookToCall)
     assert.strictEqual(res.webhookToCall.url, 'https://mi-servidor.com/webhook/compra')
     assert.ok(res.messagesToSend[0].text.includes('Pedido iniciado'))
@@ -183,10 +183,10 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
 
     engine.saveSequence(seq)
     const phone = '+573112233445'
-    engine.enrollContactInSequence(phone, seq.id)
+    engine.enrollContactInSequence('default', phone, seq.id)
 
     // Cancelar si compra o pide baja
-    engine.cancelSequenceEnrollment(phone, seq.id)
+    engine.cancelSequenceEnrollment('default', phone, seq.id)
   })
 
   // -------------------------------------------------------------
@@ -212,7 +212,7 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
     }
     engine.saveFlow(abFlow)
 
-    const res = await engine.evaluateStep('+573005556677', 'testab')
+    const res = await engine.evaluateStep('default', '+573005556677', 'testab')
     assert.strictEqual(res.handled, true)
     assert.ok(res.messagesToSend[0].text.includes('Variante A'))
   })

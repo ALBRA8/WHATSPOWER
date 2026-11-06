@@ -20,6 +20,11 @@ const SECRET = process.env.INTERNAL_API_SECRET!
 const AUTH = { 'Authorization': `Bearer ${SECRET}` }
 const AUTH_JSON = { ...AUTH, 'Content-Type': 'application/json' }
 
+/** Firma HMAC v2 (contrato §3): hex = HMAC-SHA256(secret, timestamp + "." + body). */
+function signV2(secret: string, body: string, ts: string): string {
+  return createHmac('sha256', secret).update(`${ts}.${body}`, 'utf8').digest('hex')
+}
+
 async function listenEphemeral(server: any): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
   const { port } = server.address()
@@ -28,14 +33,14 @@ async function listenEphemeral(server: any): Promise<string> {
 
 function bootServer(extra: Record<string, unknown> = {}) {
   const webhookSecret = 'wp_sec_test_webhook_secret_min24chars'
-  const { server } = createAgenticServer({
+  const { server, paymentManager } = createAgenticServer({
     dbPath: ':memory:',
     transport: new MockTransportSender(),
     crm: new MockCrmClient(),
     webhookSecret,
     ...extra,
   })
-  return { server, webhookSecret }
+  return { server, paymentManager, webhookSecret }
 }
 
 describe('AUTH: superficie administrativa protegida', () => {
@@ -124,7 +129,7 @@ describe('WH: endurecimiento de webhooks', () => {
     message: { text: 'hola prueba' },
     channel: 'whatsapp',
   })
-  const sign = (secret: string) => createHmac('sha256', secret).update(PAYLOAD).digest('hex')
+  const sign = (secret: string, ts: string) => signV2(secret, PAYLOAD, ts)
 
   it('WH-01: /api/inbound sin firma → 401 (también fuera de producción)', async () => {
     const { server } = bootServer()
@@ -145,7 +150,7 @@ describe('WH: endurecimiento de webhooks', () => {
     try {
       const res = await fetch(`${base}/api/inbound`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Signature-SHA256': sign(webhookSecret) },
+        headers: { 'Content-Type': 'application/json', 'X-Signature-SHA256': sign(webhookSecret, String(Date.now())) },
         body: PAYLOAD,
       })
       assert.strictEqual(res.status, 401)
@@ -156,12 +161,13 @@ describe('WH: endurecimiento de webhooks', () => {
     const { server, webhookSecret } = bootServer()
     const base = await listenEphemeral(server)
     try {
+      const ts = String(Date.now() - 400_000)
       const res = await fetch(`${base}/api/inbound`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Signature-SHA256': sign(webhookSecret),
-          'X-Timestamp': String(Date.now() - 400_000),
+          'X-Signature-SHA256': sign(webhookSecret, ts),
+          'X-Timestamp': ts,
         },
         body: PAYLOAD,
       })
@@ -175,10 +181,11 @@ describe('WH: endurecimiento de webhooks', () => {
     const { server, webhookSecret } = bootServer()
     const base = await listenEphemeral(server)
     try {
+      const ts = String(Date.now())
       const headers = {
         'Content-Type': 'application/json',
-        'X-Signature-SHA256': sign(webhookSecret),
-        'X-Timestamp': String(Date.now()),
+        'X-Signature-SHA256': sign(webhookSecret, ts),
+        'X-Timestamp': ts,
       }
       const r1 = await fetch(`${base}/api/inbound`, { method: 'POST', headers, body: PAYLOAD })
       assert.strictEqual(r1.status, 200)
@@ -202,19 +209,22 @@ describe('WH: endurecimiento de webhooks', () => {
     } finally { server.close() }
   })
 
-  it('WH-06: /api/payments/webhook con HMAC válido → 200', async () => {
+  it('WH-06: /api/payments/webhook con HMAC válido → 200 (transición válida sobre transacción real)', async () => {
     process.env.PAYMENTS_WEBHOOK_SECRET = 'wp_sec_test_payments_secret_min24chars'
     try {
-      const { server } = bootServer()
+      const { server, paymentManager } = bootServer()
       const base = await listenEphemeral(server)
       try {
-        const body = JSON.stringify({ transactionId: 'tx_sec_1', status: 'PENDING' })
+        // Transacción real en estado PENDING (org default con credencial legado)
+        const tx = paymentManager.createPaymentLink({ contactPhone: '573000000555', amount: 1000, description: 'WH-06' }, 'default')
+        const body = JSON.stringify({ transactionId: tx.id, status: 'APPROVED' })
+        const ts = String(Date.now())
         const res = await fetch(`${base}/api/payments/webhook`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-Signature-SHA256': createHmac('sha256', process.env.PAYMENTS_WEBHOOK_SECRET).update(body).digest('hex'),
-            'X-Timestamp': String(Date.now()),
+            'X-Signature-SHA256': signV2(process.env.PAYMENTS_WEBHOOK_SECRET!, body, ts),
+            'X-Timestamp': ts,
           },
           body,
         })
@@ -362,12 +372,13 @@ describe('IDEM: idempotencia scoped por organización', () => {
       message: { text },
       channel: 'whatsapp',
     })
+    const ts = String(Date.now())
     const res = await fetch(`${base}/api/inbound`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Signature-SHA256': createHmac('sha256', secret).update(body).digest('hex'),
-        'X-Timestamp': String(Date.now()),
+        'X-Signature-SHA256': signV2(secret, body, ts),
+        'X-Timestamp': ts,
       },
       body,
     })
@@ -406,7 +417,7 @@ describe('IDEM: idempotencia scoped por organización', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-Signature-SHA256': createHmac('sha256', webhookSecret).update(body).digest('hex'),
+            'X-Signature-SHA256': signV2(webhookSecret, body, String(ts)),
             'X-Timestamp': String(ts),
           },
           body,
