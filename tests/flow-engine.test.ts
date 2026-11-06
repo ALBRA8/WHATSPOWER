@@ -9,13 +9,21 @@ test('SUITE: WhatsPower Flow Engine (Estilo ManyChat)', async (t) => {
   const db = createDatabase(':memory:')
   const engine = new FlowEngine(db)
 
-  await t.test('FL-01: Registro y consulta de flujo visual', () => {
-    const flows = engine.listFlows()
-    assert.ok(flows.length >= 1, 'Debe haber al menos 1 flujo sembrado')
+  await t.test('FL-01: Registro y consulta de flujo visual (seed perezosa POR ORG)', () => {
+    // (tercera reparación 4.B) La seed del flujo demo es perezosa y POR organización:
+    // la primera consulta/evaluación de una org crea SU PROPIA copia.
+    const flows = engine.listFlows('org_test')
+    assert.ok(flows.length >= 1, 'La primera consulta siembra el flujo demo de ESTA org')
     const defaultFlow = flows[0]
     assert.strictEqual(defaultFlow.isActive, true)
     assert.ok(defaultFlow.triggerKeywords.includes('precio'))
     assert.ok(defaultFlow.nodes.length >= 5)
+    assert.ok(engine.findMatchingFlow('org_test', 'precio'), 'el flujo sembrado debe matcher "precio"')
+    // Aislamiento: un flujo guardado en org_test NO aparece en org_otra
+    engine.saveFlow('org_test', { ...defaultFlow, id: 'flow_privado_test', name: 'Privado org_test', triggerKeywords: ['palabra_privada'] })
+    const flowsB = engine.listFlows('org_otra')
+    assert.ok(flowsB.every((f) => f.id !== 'flow_privado_test'), 'las orgs no comparten flujos')
+    assert.strictEqual(engine.getFlow('org_inexistente', 'flow_privado_test'), null, 'otra org no puede leer el flujo por id')
   })
 
   await t.test('FL-02: Trigger activa flujo y envía mensaje inicial con menú', async () => {
@@ -97,8 +105,8 @@ test('SUITE: WhatsPower Flow Engine (Estilo ManyChat)', async (t) => {
       edges: [{ id: 'e1', source: 't1', target: 'm1' }],
     }
 
-    engine.saveFlow(customFlow)
-    const retrieved = engine.getFlow('flow_soporte_rapido')
+    engine.saveFlow('org_test', customFlow)
+    const retrieved = engine.getFlow('org_test', 'flow_soporte_rapido')
     assert.ok(retrieved)
     assert.strictEqual(retrieved.name, 'Flujo de Soporte y Garantía')
 

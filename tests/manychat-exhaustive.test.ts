@@ -62,7 +62,7 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
         { id: 'e2', source: 'inp1', target: 'msg1' },
       ],
     }
-    engine.saveFlow(inputFlow)
+    engine.saveFlow('org_test', inputFlow)
 
     // Paso 1: Contacto escribe "registro" -> Recibe el prompt de captura
     const step1 = await engine.evaluateStep('org_test', phone, 'quiero mi registro')
@@ -116,7 +116,7 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
         { id: 'eNo', source: 'c1', target: 'mReg', sourceHandle: 'no' },
       ],
     }
-    engine.saveFlow(conditionFlow)
+    engine.saveFlow('org_test', conditionFlow)
 
     // Cliente VIP recibe 30%
     const resVip = await engine.evaluateStep('org_test', phoneVip, 'quiero una promocion')
@@ -156,7 +156,7 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
         { id: 'e3', source: 'act2', target: 'msg1' },
       ],
     }
-    engine.saveFlow(actionFlow)
+    engine.saveFlow('org_test', actionFlow)
 
     const res = await engine.evaluateStep('org_test', phone, 'quiero comprar ahora')
     assert.strictEqual(res.handled, true)
@@ -181,7 +181,7 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
       ],
     }
 
-    engine.saveSequence(seq)
+    engine.saveSequence('org_test', seq)
     const phone = '+573112233445'
     engine.enrollContactInSequence('org_test', phone, seq.id)
 
@@ -210,7 +210,7 @@ test('SUITE EXHAUSTIVA: WhatsPower como Clon 100% ManyChat', async (t) => {
         { id: 'eb', source: 'split1', target: 'mB', sourceHandle: 'b' },
       ],
     }
-    engine.saveFlow(abFlow)
+    engine.saveFlow('org_test', abFlow)
 
     const res = await engine.evaluateStep('org_test', '+573005556677', 'testab')
     assert.strictEqual(res.handled, true)

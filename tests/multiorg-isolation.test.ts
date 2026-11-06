@@ -109,12 +109,23 @@ test('MO-03: etiquetas, campos y sesiones de flujo por (org, contacto)', async (
   assert.ok(fe.getSession('org_alpha', phone))
   assert.strictEqual(fe.getSession('org_beta', phone), null, 'la sesión de flujo no cruza organizaciones')
 
-  // Secuencias: inscripción por org
+  // Secuencias: inscripción por org — la secuencia DEBE existir en la org (4.B)
+  fe.saveSequence('org_alpha', {
+    id: 'seq_1',
+    name: 'Seq Alpha',
+    isActive: true,
+    steps: [],
+    createdAt: Date.now(),
+  })
   fe.enrollContactInSequence('org_alpha', phone, 'seq_1')
   const rowsAlpha = (db.prepare("SELECT count(*) c FROM sequence_enrollments WHERE organization_id = 'org_alpha' AND contact_phone = ?").get(phone) as any).c
   const rowsBeta = (db.prepare("SELECT count(*) c FROM sequence_enrollments WHERE organization_id = 'org_beta' AND contact_phone = ?").get(phone) as any).c
   assert.strictEqual(rowsAlpha, 1)
   assert.strictEqual(rowsBeta, 0)
+  // (tercera reparación 4.B) org_beta NO puede inscribirse en la secuencia de org_alpha
+  fe.enrollContactInSequence('org_beta', phone, 'seq_1')
+  const rowsBetaAfter = (db.prepare("SELECT count(*) c FROM sequence_enrollments WHERE organization_id = 'org_beta' AND contact_phone = ?").get(phone) as any).c
+  assert.strictEqual(rowsBetaAfter, 0, 'una org no puede inscribir contactos en secuencias ajenas')
 })
 
 test('CONC-01: DOS eventos inbound IDÉNTICOS CONCURRENTES → efectos ejecutados UNA sola vez', async () => {

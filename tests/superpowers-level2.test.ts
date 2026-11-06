@@ -6,51 +6,55 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
   it('SP2-01: Team Manager asigna asesores por Round-Robin y Balanceo de Carga', () => {
     const { teamManager } = createAgenticServer({ dbPath: ':memory:' })
 
-    // Registrar 3 agentes
-    teamManager.registerAgent({ id: 'ag_1', name: 'Laura Asesora', email: 'laura@albra.co' })
-    teamManager.registerAgent({ id: 'ag_2', name: 'Carlos Ventas', email: 'carlos@albra.co' })
-    teamManager.registerAgent({ id: 'ag_3', name: 'Sofia Closer', email: 'sofia@albra.co' })
+    // Registrar 3 agentes (en org_demo)
+    teamManager.registerAgent('org_demo', { id: 'ag_1', name: 'Laura Asesora', email: 'laura@albra.co' })
+    teamManager.registerAgent('org_demo', { id: 'ag_2', name: 'Carlos Ventas', email: 'carlos@albra.co' })
+    teamManager.registerAgent('org_demo', { id: 'ag_3', name: 'Sofia Closer', email: 'sofia@albra.co' })
 
-    const active = teamManager.getActiveAgents()
+    const active = teamManager.getActiveAgents('org_demo')
     assert.strictEqual(active.length, 3)
 
-    // Asignación 1 -> ag_1
-    const a1 = teamManager.assignRoundRobin('org_test', '573001110001')
+    // (tercera reparación 4.A) Aislamiento: OTRA org no ve ni asigna agentes ajenos
+    assert.strictEqual(teamManager.getActiveAgents('org_otra').length, 0, 'otra org no lista agentes de org_demo')
+    assert.strictEqual(teamManager.assignRoundRobin('org_otra', '573001119999'), null, 'otra org no puede asignar agentes ajenos')
+
+    // Asignación 1 -> ag_1 (misma org)
+    const a1 = teamManager.assignRoundRobin('org_demo', '573001110001')
     assert.strictEqual(a1?.id, 'ag_1')
 
     // Asignación 2 -> ag_2
-    const a2 = teamManager.assignRoundRobin('org_test', '573001110002')
+    const a2 = teamManager.assignRoundRobin('org_demo', '573001110002')
     assert.strictEqual(a2?.id, 'ag_2')
 
     // Asignación 3 -> ag_3
-    const a3 = teamManager.assignRoundRobin('org_test', '573001110003')
+    const a3 = teamManager.assignRoundRobin('org_demo', '573001110003')
     assert.strictEqual(a3?.id, 'ag_3')
 
     // Asignación 4 (Vuelve a empezar Round-Robin) -> ag_1
-    const a4 = teamManager.assignRoundRobin('org_test', '573001110004')
+    const a4 = teamManager.assignRoundRobin('org_demo', '573001110004')
     assert.strictEqual(a4?.id, 'ag_1')
 
     // Contacto ya asignado devuelve el mismo asesor asignado (Sticky Assignment)
-    const a1Repeat = teamManager.assignRoundRobin('org_test', '573001110001')
+    const a1Repeat = teamManager.assignRoundRobin('org_demo', '573001110001')
     assert.strictEqual(a1Repeat?.id, 'ag_1')
 
     // Resolver conversación
-    teamManager.resolveAssignment('org_test', '573001110001')
-    const checkResolved = teamManager.getAssignment('org_test', '573001110001')
+    teamManager.resolveAssignment('org_demo', '573001110001')
+    const checkResolved = teamManager.getAssignment('org_demo', '573001110001')
     assert.strictEqual(checkResolved?.status, 'RESOLVED')
   })
 
   it('SP2-02: Canned Responses permite registrar y expandir atajos con variables', () => {
     const { cannedManager } = createAgenticServer({ dbPath: ':memory:' })
 
-    cannedManager.createResponse({
+    cannedManager.createResponse('org_demo', {
       shortcut: '/precio',
       title: 'Precios Planes 2026',
       content: 'Hola {{nombre}}, nuestro Plan Pro tiene un valor de $99/mes con {{garantia}} días de garantía.',
       category: 'ventas',
     })
 
-    const found = cannedManager.findByShortcut('/precio')
+    const found = cannedManager.findByShortcut('org_demo', '/precio')
     assert.ok(found)
     assert.strictEqual(found?.title, 'Precios Planes 2026')
 
@@ -65,7 +69,7 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
   it('SP2-03: Growth Tools genera Ref URLs y resuelve payload al recibir mensaje', () => {
     const { growthManager } = createAgenticServer({ dbPath: ':memory:', businessPhone: '573017543786' })
 
-    const link = growthManager.createGrowthLink({
+    const link = growthManager.createGrowthLink('org_demo', {
       slug: 'promo-instagram',
       prefilledText: 'Hola, vi el reel de Instagram y quiero la promo',
       initialTag: 'lead_instagram',
@@ -79,11 +83,11 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
     assert.ok(waLink?.includes('Instagram'))
 
     // Validar conteo de clics
-    const refreshed = growthManager.getLinkBySlug('promo-instagram')
+    const refreshed = growthManager.getLinkBySlug('org_demo', 'promo-instagram')
     assert.strictEqual(refreshed?.clicks, 1)
 
     // Detección automática al entrar el mensaje
-    const match = growthManager.matchIncomingText('Hola, vi el reel de Instagram y quiero la promo')
+    const match = growthManager.matchIncomingText('org_demo', 'Hola, vi el reel de Instagram y quiero la promo')
     assert.ok(match)
     assert.strictEqual(match?.slug, 'promo-instagram')
     assert.strictEqual(match?.initialTag, 'lead_instagram')
@@ -116,6 +120,19 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
 
   it('SP2-05: Payment Gateway genera links de cobro y procesa confirmación de webhook', () => {
     const { paymentManager, db } = createAgenticServer({ dbPath: ':memory:' })
+
+    // (tercera reparación 4.E) Pasarela real SIN configuración → rechazo explícito
+    // (nunca enlaces con claves de test por defecto presentadas como producción).
+    const savedKey = process.env.WOMPI_PUBLIC_KEY
+    delete process.env.WOMPI_PUBLIC_KEY
+    assert.throws(
+      () => paymentManager.createPaymentLink({ orgId: 'org_test', contactPhone: '573009998877', amount: 250000, currency: 'COP', description: 'x', gateway: 'wompi' }),
+      /PAYMENTS_GATEWAY_NOT_CONFIGURED/
+    )
+    // Y el simulador usa un enlace LOCAL claramente no productivo
+    const simTx = paymentManager.createPaymentLink({ orgId: 'org_test', contactPhone: '573009998877', amount: 1000, description: 'sim', gateway: 'simulator' })
+    assert.ok(simTx.paymentLink.startsWith('/payments/simulator/'), 'el simulador NO debe presentar dominios productivos')
+    process.env.WOMPI_PUBLIC_KEY = savedKey || 'pub_test_ci_9f8e7d6c5b4a'
 
     const tx = paymentManager.createPaymentLink({
       orgId: 'org_test',

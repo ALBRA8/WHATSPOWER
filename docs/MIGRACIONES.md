@@ -1,9 +1,68 @@
 # MIGRACIONES — Reparación Integral 2026-11-06 (WHATSPOWER)
 
-Rama: `fix/reparacion-integral` · Base: `main` @ `85d7fcf`
+Rama: `fix/tercera-reparacion-integral` · Base: `fix/segunda-reparacion-integral` @ `f3f6136`
 
 Todas las migraciones son **aditivas y reversibles**. No se modifica ni borra
 ninguna columna/tabla existente.
+
+## W-v4 (TERCERA REPARACIÓN) — Configuración/catálogo por organización
+
+**Causa raíz corregida:** `flows`, `sequences`, `sequence_steps`, `agents`,
+`canned_responses` y `growth_links` eran GLOBALES (PK sin organización): una
+organización veía, editaba y ejecutaba la configuración de otra. Cada tabla se
+RECONSTRUYE con `organization_id` dentro de la PK (rebuild con renombrado, el
+mismo patrón reversible de la fase v3):
+
+| Tabla | PK nueva | Unicidad nueva |
+|---|---|---|
+| `flows` | `(organization_id, id)` | — |
+| `sequences` | `(organization_id, id)` | — |
+| `sequence_steps` | `(organization_id, id)` | — |
+| `agents` | `(organization_id, id)` | — |
+| `canned_responses` | `(organization_id, id)` | `(organization_id, shortcut)` |
+| `growth_links` | `(organization_id, id)` | `(organization_id, slug)` |
+
+**Filas legacy:** las filas previas (sin organización) se atribuyen a
+`'__legacy__'`, un espacio reservado que NINGUNA organización real puede
+consultar — no se inventa atribución.
+
+**Rollback exacto por tabla** (antes de arrancar la versión nueva; si ya
+arrancó, solo hay filas `'__legacy__'` + filas nuevas de orgs reales):
+
+```bash
+# Ejemplo para flows (idéntico patrón para las otras 5 tablas)
+sqlite3 db/operational.db "
+ALTER TABLE flows RENAME TO flows_v4new;
+CREATE TABLE flows (id TEXT PRIMARY KEY, name TEXT NOT NULL, trigger_keywords TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1, graph_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+INSERT INTO flows (id, name, trigger_keywords, is_active, graph_json, created_at, updated_at)
+  SELECT id, name, trigger_keywords, is_active, graph_json, created_at, updated_at FROM flows_v4new;
+DROP TABLE flows_v4new;"
+# (las filas de orgs reales creadas con la v4 se conservan en flows_v4new;.exportar antes si se necesitan)
+```
+
+## W-v4 — Journal de efectos externos + payloads de reconciliación (4.C)
+
+- `inbound_effect_journal(key, effect_key, effect_type, status, result_json,
+  created_at, updated_at, PK(key, effect_key))` — cada efecto externo
+  (envío/acción CRM) PENDING→DONE de forma duradera; un reingreso sólo ejecuta
+  los PENDING (un mensaje ya enviado jamás se reenvía).
+- `idempotency_event_payloads(key PK, payload_json, created_at)` — payload
+  original para reconciliar claves UNCERTAIN.
+- `idempotency_keys.status` incorpora el VALOR `'UNCERTAIN'` (sin cambio de
+  esquema; los índices existentes lo cubren).
+- `payment_webhook_events.organization_id` (columna nueva, nullable; eventos
+  legacy quedan NULL — no se inventa atribución).
+
+**Rollback exacto:**
+
+```bash
+sqlite3 db/operational.db "DROP TABLE IF EXISTS inbound_effect_journal;
+DROP TABLE IF EXISTS idempotency_event_payloads;
+ALTER TABLE payment_webhook_events DROP COLUMN organization_id;"
+# UNCERTAIN desaparece al revertir el código (los valores solo existen con la v4)
+```
 
 ## W1 — Tablas nuevas (se crean con `CREATE TABLE IF NOT EXISTS` al arrancar)
 

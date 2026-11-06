@@ -37,6 +37,8 @@ export interface PaymentWebhookEvent {
   amount?: number
   currency?: string
   reference?: string
+  /** Organización declarada por el emisor (4.E): si viene, DEBE coincidir con la de la transacción. */
+  orgId?: string
 }
 
 export type PaymentWebhookResult =
@@ -88,8 +90,12 @@ export class PaymentGatewayManager {
     const currency = opts.currency || 'COP'
     const gateway = opts.gateway || 'simulator'
 
-    // Distinción explícita simulator/sandbox/production (orden §5):
-    // el simulador queda bloqueado en producción salvo decisión explícita y audible.
+    // Distinción explícita simulator/sandbox/production (orden §5, reforzada 4.E):
+    //  - el simulador queda bloqueado en producción salvo decisión explícita y audible;
+    //  - el enlace del simulador es LOCAL y se marca como tal (jamás un dominio
+    //    productivo aparente: prohibido presentar valores de prueba como integración real);
+    //  - las pasarelas REALES exigen SU configuración: sin clave/URL de la pasarela
+    //    se rechaza la creación (nunca se generan enlaces con claves de test por defecto).
     if (gateway === 'simulator' && process.env.NODE_ENV === 'production' && process.env.PAYMENTS_ALLOW_SIMULATOR !== 'true') {
       throw new Error('PAYMENTS_SIMULATOR_BLOCKED: pasarela simulator rechazada en producción (usa una pasarela real o define PAYMENTS_ALLOW_SIMULATOR=true como decisión explícita)')
     }
@@ -97,13 +103,26 @@ export class PaymentGatewayManager {
     // Generar URL de checkout según pasarela
     let paymentLink = ''
     if (gateway === 'simulator') {
-      paymentLink = `https://checkout.albra.co/pay/${id}?amount=${opts.amount}&currency=${currency}`
+      // Enlace de simulación LOCAL (claramente no productivo)
+      paymentLink = `/payments/simulator/${id}?amount=${encodeURIComponent(String(opts.amount))}&currency=${encodeURIComponent(currency)}`
     } else if (gateway === 'wompi') {
-      paymentLink = `https://checkout.wompi.co/p/?public-key=${process.env.WOMPI_PUBLIC_KEY || 'pub_test_123'}&currency=${currency}&amount-in-cents=${opts.amount * 100}&reference=${id}`
+      const wompiKey = process.env.WOMPI_PUBLIC_KEY
+      if (!wompiKey || !wompiKey.startsWith('pub_')) {
+        throw new Error('PAYMENTS_GATEWAY_NOT_CONFIGURED: WOMPI_PUBLIC_KEY ausente o inválida — NO se generan enlaces de pasarela real con valores de prueba por defecto')
+      }
+      paymentLink = `https://checkout.wompi.co/p/?public-key=${encodeURIComponent(wompiKey)}&currency=${encodeURIComponent(currency)}&amount-in-cents=${Math.round(opts.amount * 100)}&reference=${encodeURIComponent(id)}`
     } else if (gateway === 'mercadopago') {
-      paymentLink = `https://mpago.la/pos/${id}`
+      const mpPrefix = process.env.MERCADOPAGO_LINK_PREFIX
+      if (!mpPrefix) {
+        throw new Error('PAYMENTS_GATEWAY_NOT_CONFIGURED: MERCADOPAGO_LINK_PREFIX ausente — la integración MercadoPago exige su prefijo de enlace real (crea el link con su API y guarda el prefijo)')
+      }
+      paymentLink = `${mpPrefix.replace(/\/+$/, '')}/${id}`
     } else if (gateway === 'stripe') {
-      paymentLink = `https://buy.stripe.com/test_${id}`
+      const stripePrefix = process.env.STRIPE_PAYMENT_LINK_PREFIX
+      if (!stripePrefix) {
+        throw new Error('PAYMENTS_GATEWAY_NOT_CONFIGURED: STRIPE_PAYMENT_LINK_PREFIX ausente — la integración Stripe exige el prefijo de Payment Link real de la cuenta')
+      }
+      paymentLink = `${stripePrefix.replace(/\/+$/, '')}/${id}`
     }
 
     this.db.prepare(`
@@ -180,6 +199,16 @@ export class PaymentGatewayManager {
       return { ok: false, code: 'TXN_NOT_FOUND', message: 'Transacción no encontrada' }
     }
 
+    // --- Vinculación de organización (tercera reparación 4.E) ---
+    // La organización REAL es la de la TRANSACCIÓN (tx.orgId). Si el payload
+    // declara una organización, DEBE coincidir: un webhook que intenta atribuir
+    // el pago a otra org se rechaza (VALIDATION_MISMATCH) sin consumir el eventId.
+    const payloadOrg = typeof (event as { orgId?: unknown }).orgId === 'string' ? String((event as { orgId?: unknown }).orgId).trim() : undefined
+    if (payloadOrg && payloadOrg !== tx.orgId) {
+      this.audit(tx.id, tx.status, tx.status, 'WEBHOOK_ORG_MISMATCH', event.eventId)
+      return { ok: false, code: 'VALIDATION_MISMATCH', message: `la organización del payload (${payloadOrg}) no coincide con la de la transacción (${tx.orgId})` }
+    }
+
     // --- Validación de importe/moneda/referencia ANTES de consumir el eventId ---
     if (event.amount !== undefined && Number(event.amount) !== tx.amount) {
       this.audit(tx.id, tx.status, tx.status, 'WEBHOOK_AMOUNT_MISMATCH', event.eventId)
@@ -224,9 +253,9 @@ export class PaymentGatewayManager {
       //  - otra transacción/estado → posible fraude → rechazo.
       try {
         this.db.prepare(`
-          INSERT INTO payment_webhook_events (event_id, transaction_id, status, payload_json, created_at)
-          VALUES (?, ?, ?, ?, ?)
-        `).run(event.eventId, event.transactionId, event.status, JSON.stringify(event), now)
+          INSERT INTO payment_webhook_events (event_id, transaction_id, organization_id, status, payload_json, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(event.eventId, event.transactionId, tx.orgId, event.status, JSON.stringify(event), now)
       } catch {
         this.db.exec('ROLLBACK')
         const seen = this.db.prepare('SELECT transaction_id, status FROM payment_webhook_events WHERE event_id = ?').get(event.eventId) as any
@@ -273,12 +302,12 @@ export class PaymentGatewayManager {
     return { ok: true, transaction: this.getTransaction(event.transactionId, orgId)! }
   }
 
-  /** Eventos de webhook procesados (trazabilidad de idempotencia). */
-  listWebhookEvents(transactionId?: string): Array<{ eventId: string; transactionId: string; status: string; createdAt: number }> {
+  /** Eventos de webhook procesados (trazabilidad de idempotencia, con organización). */
+  listWebhookEvents(transactionId?: string): Array<{ eventId: string; transactionId: string; organizationId: string | null; status: string; createdAt: number }> {
     const rows = (transactionId
       ? this.db.prepare('SELECT * FROM payment_webhook_events WHERE transaction_id = ? ORDER BY created_at ASC').all(transactionId)
       : this.db.prepare('SELECT * FROM payment_webhook_events ORDER BY created_at ASC').all()) as any[]
-    return rows.map((r) => ({ eventId: r.event_id, transactionId: r.transaction_id, status: r.status, createdAt: r.created_at }))
+    return rows.map((r) => ({ eventId: r.event_id, transactionId: r.transaction_id, organizationId: r.organization_id ?? null, status: r.status, createdAt: r.created_at }))
   }
 
   /** Pistas de auditoría de pagos. */

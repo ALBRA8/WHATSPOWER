@@ -12,24 +12,38 @@ export interface MockActionRecord {
  * (segunda reparación §3.B) simulateResponseOrgId permite simular que el CRM
  * responde atribuyendo la acción a OTRA organización → el consumidor debe
  * rechazar la discrepancia (TENANT_MISMATCH).
+ * (tercera reparación 4.D) simulateMissingOrg permite simular un CRM que NO
+ * confirma la organización en la respuesta → el consumidor debe RECHAZAR la
+ * respuesta ambigua (TENANT_UNVERIFIED), nunca aceptarla.
  */
 export class MockCrmClient implements CrmClientInterface {
   public executedActions: MockActionRecord[] = []
   private simulateUnavailable = false
   /** Si se fija, las respuestas del "CRM" llevan ese orgId (para simular mismatch). */
   simulateResponseOrgId?: string
+  /** Si es true, las respuestas del "CRM" OMITEN el orgId (respuesta ambigua). */
+  simulateMissingOrg = false
 
   setSimulateUnavailable(val: boolean): void {
     this.simulateUnavailable = val
   }
 
   private confirmOrg(orgId: string): CrmActionResult | null {
-    // El CRM REAL devuelve el orgId de la API key usada; el Mock emula el caso
-    // de discrepancia cuando simulateResponseOrgId está fijado.
+    // El CRM REAL devuelve el orgId de la API key usada; el Mock emula los casos
+    // de discrepancia/omisión cuando sus flags de simulación están fijados.
+    if (this.simulateMissingOrg) return null // respuesta SIN org: el consumidor debe rechazarla
     if (this.simulateResponseOrgId && this.simulateResponseOrgId !== orgId) {
       return { ok: false, error: `TENANT_MISMATCH: el CRM confirmó la organización ${this.simulateResponseOrgId}, se esperaba ${orgId}` }
     }
     return null
+  }
+
+  private resultWithOrg(orgId: string, summary: string, extra: Record<string, unknown> = {}): CrmActionResult {
+    if (this.simulateMissingOrg) {
+      // Respuesta ambigua: SIN confirmación de organización (el consumidor debe rechazarla)
+      return { ok: true, summary, ...extra } as CrmActionResult
+    }
+    return { ok: true, summary, orgId, ...extra }
   }
 
   async createClient(orgId: string, name: string, phone: string, correlationId: string): Promise<CrmActionResult> {
@@ -43,7 +57,7 @@ export class MockCrmClient implements CrmClientInterface {
       params: { name, phone },
       correlationId,
     })
-    return { ok: true, summary: `Cliente "${name}" creado`, clientId, orgId }
+    return this.resultWithOrg(orgId, `Cliente "${name}" creado`, { clientId })
   }
 
   async createOpportunity(orgId: string, clientId: string, title: string, amount: number, correlationId: string): Promise<CrmActionResult> {
@@ -56,7 +70,7 @@ export class MockCrmClient implements CrmClientInterface {
       params: { clientId, title, amount },
       correlationId,
     })
-    return { ok: true, summary: `Oportunidad "${title}" creada`, orgId }
+    return this.resultWithOrg(orgId, `Oportunidad "${title}" creada`)
   }
 
   async addNote(orgId: string, clientId: string, content: string, correlationId: string): Promise<CrmActionResult> {
@@ -69,7 +83,7 @@ export class MockCrmClient implements CrmClientInterface {
       params: { clientId, content },
       correlationId,
     })
-    return { ok: true, summary: `Nota añadida al cliente ${clientId}`, orgId }
+    return this.resultWithOrg(orgId, `Nota añadida al cliente ${clientId}`)
   }
 
   clear(): void {
@@ -86,9 +100,12 @@ export class MockCrmClient implements CrmClientInterface {
  *    Una credencial de una org NUNCA se usa para otra.
  *  - La organización viaja en la petición (X-Org-Id) y en la clave de
  *    idempotencia de la acción.
- *  - Se VERIFICA que el CRM confirma la organización esperada en la respuesta
- *    (campo orgId): cualquier discrepancia → TENANT_MISMATCH y la acción se
- *    trata como fallida (jamás se acepta una escritura atribuida a otra org).
+ *  - Se EXIGE que el CRM confirme la organización en la respuesta (campo
+ *    orgId): una respuesta SIN organización se rechaza como ambigua
+ *    (TENANT_UNVERIFIED — jamás se acepta una escritura no verificada) y una
+ *    discrepancia se rechaza (TENANT_MISMATCH). Errores de autenticación o de
+ *    tenant del CRM se tratan como fallo (fail-closed): nunca se acepta una
+ *    respuesta ambigua como válida.
  */
 export class HttpCrmClient implements CrmClientInterface {
   crmBaseUrl: string
@@ -132,16 +149,31 @@ export class HttpCrmClient implements CrmClientInterface {
         body: JSON.stringify({ action, params }),
       })
 
-      const data = await res.json() as any
+      const rawText = await res.text()
       if (!res.ok) {
-        return { ok: false, error: data.error || `HTTP ${res.status}` }
+        // Errores de autenticación/tenant del CRM: fail-closed (nunca se acepta como éxito)
+        let detail = `HTTP ${res.status}`
+        try { detail = (JSON.parse(rawText) as { error?: string }).error || detail } catch {}
+        return { ok: false, error: detail }
       }
-      // Verificación de identidad del tenant: el CRM DEBE confirmar la org a la
-      // que se atribuyó la acción (la org real la decide el CRM desde la API key).
-      if (data.orgId !== undefined && data.orgId !== orgId) {
+      let data: any
+      try {
+        data = JSON.parse(rawText)
+      } catch {
+        // Respuesta no-JSON: ambigua → se rechaza (jamás se acepta como válida)
+        return { ok: false, error: 'TENANT_UNVERIFIED: el CRM no devolvió una respuesta JSON verificable' }
+      }
+      // Verificación ESTRICTA de identidad del tenant (tercera reparación 4.D):
+      // el CRM DEBE confirmar la organización a la que se atribuyó la acción.
+      //  - Sin campo orgId → TENANT_UNVERIFIED (respuesta ambigua, se rechaza).
+      //  - orgId distinto al esperado → TENANT_MISMATCH (escritura ajena, se rechaza).
+      if (typeof data?.orgId !== 'string' || data.orgId.length === 0) {
+        return { ok: false, error: 'TENANT_UNVERIFIED: el CRM no confirmó la organización en la respuesta (se exige orgId en el contrato)' }
+      }
+      if (data.orgId !== orgId) {
         return { ok: false, error: `TENANT_MISMATCH: el CRM confirmó la organización ${data.orgId}, se esperaba ${orgId}` }
       }
-      return { ok: true, summary: data.summary, data: data.data, clientId: data.clientId, orgId: data.orgId ?? orgId }
+      return { ok: true, summary: data.summary, data: data.data, clientId: data.clientId, orgId: data.orgId }
     } catch (err: any) {
       return { ok: false, error: `Fallo de conexión con CRM: ${err?.message || err}` }
     }

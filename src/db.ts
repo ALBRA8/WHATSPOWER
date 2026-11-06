@@ -45,13 +45,15 @@ export function createDatabase(dbPath?: string): DatabaseSync {
     );
 
     CREATE TABLE IF NOT EXISTS flows (
-      id TEXT PRIMARY KEY,
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
       name TEXT NOT NULL,
       trigger_keywords TEXT NOT NULL,
       is_active INTEGER NOT NULL DEFAULT 1,
       graph_json TEXT NOT NULL,
       created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id)
     );
 
     CREATE TABLE IF NOT EXISTS flow_sessions (
@@ -80,19 +82,23 @@ export function createDatabase(dbPath?: string): DatabaseSync {
     );
 
     CREATE TABLE IF NOT EXISTS sequences (
-      id TEXT PRIMARY KEY,
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
       name TEXT NOT NULL,
       is_active INTEGER NOT NULL DEFAULT 1,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id)
     );
 
     CREATE TABLE IF NOT EXISTS sequence_steps (
-      id TEXT PRIMARY KEY,
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
       sequence_id TEXT NOT NULL,
       step_order INTEGER NOT NULL,
       delay_minutes INTEGER NOT NULL,
       message_text TEXT NOT NULL,
-      flow_id TEXT
+      flow_id TEXT,
+      PRIMARY KEY (organization_id, id)
     );
 
     CREATE TABLE IF NOT EXISTS sequence_enrollments (
@@ -115,13 +121,15 @@ export function createDatabase(dbPath?: string): DatabaseSync {
 
     -- Superpoderes Extendidos: Gestión de Equipo, Canned Responses, Growth Links y Pagos
     CREATE TABLE IF NOT EXISTS agents (
-      id TEXT PRIMARY KEY,
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
       name TEXT NOT NULL,
       email TEXT NOT NULL,
       phone TEXT,
       is_active INTEGER NOT NULL DEFAULT 1,
       role TEXT NOT NULL DEFAULT 'agent', -- 'admin' | 'agent'
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id)
     );
 
     CREATE TABLE IF NOT EXISTS agent_assignments (
@@ -132,23 +140,29 @@ export function createDatabase(dbPath?: string): DatabaseSync {
     );
 
     CREATE TABLE IF NOT EXISTS canned_responses (
-      id TEXT PRIMARY KEY,
-      shortcut TEXT UNIQUE NOT NULL, -- Ej: '/precio', '/cuenta', '/promo'
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
+      shortcut TEXT NOT NULL, -- Ej: '/precio', '/cuenta', '/promo'
       title TEXT NOT NULL,
       content TEXT NOT NULL,
       media_url TEXT,
       category TEXT NOT NULL DEFAULT 'general',
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id),
+      UNIQUE (organization_id, shortcut)
     );
 
     CREATE TABLE IF NOT EXISTS growth_links (
-      id TEXT PRIMARY KEY,
-      slug TEXT UNIQUE NOT NULL, -- Ej: 'promo-verano', 'fb-ads'
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
+      slug TEXT NOT NULL, -- Ej: 'promo-verano', 'fb-ads'
       target_flow_id TEXT,
       initial_tag TEXT,
       prefilled_text TEXT NOT NULL,
       clicks INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id),
+      UNIQUE (organization_id, slug)
     );
 
     CREATE TABLE IF NOT EXISTS payment_transactions (
@@ -438,6 +452,171 @@ export function createDatabase(dbPath?: string): DatabaseSync {
       CREATE INDEX IF NOT EXISTS idx_idempotency_lease ON idempotency_keys(status, lease_expires_at);
     `)
   }
+
+  // 12) v4 — TERCERA REPARACIÓN: TABLAS DE CONFIGURACIÓN/CATÁLOGO POR ORGANIZACIÓN
+  //     Causa raíz corregida: flows, sequences, sequence_steps, agents,
+  //     canned_responses y growth_links eran GLOBALES (una organización veía,
+  //     editaba y ejecutaba la configuración de otra). Cada tabla se reconstruye
+  //     con organization_id DENTRO de la PK (y unicidad (org, shortcut)/(org, slug)).
+  //     Filas legacy → '__legacy__' (espacio reservado que NINGUNA organización
+  //     real puede consultar; no se inventa atribución). Rollback exacto en
+  //     docs/MIGRACIONES.md (sección v4 por tabla).
+  function rebuildWithOrg(
+    table: string,
+    createSql: string,
+    legacySelectColumns: string,
+    extraIndexes: string = ''
+  ): void {
+    if (columnExists(db, table, 'organization_id')) return
+    db.exec(`
+      ALTER TABLE ${table} RENAME TO ${table}_v3old;
+      CREATE TABLE ${createSql};
+      INSERT INTO ${createSql.match(/CREATE TABLE (\w+)/)?.[1] ?? table} (${legacySelectColumns})
+        SELECT ${legacySelectColumns.replace(/organization_id/g, `'${LEGACY_ORG}' AS organization_id`)} FROM ${table}_v3old;
+      DROP TABLE ${table}_v3old;
+      ${extraIndexes}
+    `)
+  }
+
+  // 12.1) flows — PK (organization_id, id)
+  rebuildWithOrg(
+    'flows',
+    `flows (
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      trigger_keywords TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      graph_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id)
+    )`,
+    'id, organization_id, name, trigger_keywords, is_active, graph_json, created_at, updated_at'
+  )
+
+  // 12.2) sequences — PK (organization_id, id)
+  rebuildWithOrg(
+    'sequences',
+    `sequences (
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id)
+    )`,
+    'id, organization_id, name, is_active, created_at'
+  )
+
+  // 12.3) sequence_steps — PK (organization_id, id)
+  rebuildWithOrg(
+    'sequence_steps',
+    `sequence_steps (
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
+      sequence_id TEXT NOT NULL,
+      step_order INTEGER NOT NULL,
+      delay_minutes INTEGER NOT NULL,
+      message_text TEXT NOT NULL,
+      flow_id TEXT,
+      PRIMARY KEY (organization_id, id)
+    )`,
+    'id, organization_id, sequence_id, step_order, delay_minutes, message_text, flow_id'
+  )
+
+  // 12.4) agents — PK (organization_id, id): el equipo de cada organización es SUYO
+  rebuildWithOrg(
+    'agents',
+    `agents (
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL,
+      phone TEXT,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      role TEXT NOT NULL DEFAULT 'agent',
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id)
+    )`,
+    'id, organization_id, name, email, phone, is_active, role, created_at'
+  )
+
+  // 12.5) canned_responses — PK (organization_id, id) + UNIQUE (organization_id, shortcut)
+  rebuildWithOrg(
+    'canned_responses',
+    `canned_responses (
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
+      shortcut TEXT NOT NULL,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      media_url TEXT,
+      category TEXT NOT NULL DEFAULT 'general',
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id),
+      UNIQUE (organization_id, shortcut)
+    )`,
+    'id, organization_id, shortcut, title, content, media_url, category, created_at'
+  )
+
+  // 12.6) growth_links — PK (organization_id, id) + UNIQUE (organization_id, slug)
+  rebuildWithOrg(
+    'growth_links',
+    `growth_links (
+      id TEXT NOT NULL,
+      organization_id TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      target_flow_id TEXT,
+      initial_tag TEXT,
+      prefilled_text TEXT NOT NULL,
+      clicks INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id),
+      UNIQUE (organization_id, slug)
+    )`,
+    'id, organization_id, slug, target_flow_id, initial_tag, prefilled_text, clicks, created_at'
+  )
+
+  // 14) v4 — (4.E) payment_webhook_events.organization_id: vinculación explícita
+  //     evento↔organización (auditable; los eventos legacy quedan con NULL —
+  //     no se inventa atribución). (rollback: ALTER TABLE payment_webhook_events DROP COLUMN organization_id;)
+  if (!tableColumns(db, 'payment_webhook_events').includes('organization_id')) {
+    db.exec('ALTER TABLE payment_webhook_events ADD COLUMN organization_id TEXT')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_payment_webhook_events_org ON payment_webhook_events(organization_id)')
+  }
+
+  // 13) v4 — TERCERA REPARACIÓN (4.C): JOURNAL DE EFECTOS EXTERNOS + PAYLOADS
+  //  - inbound_effect_journal: cada efecto externo (envío de mensaje, acción
+  //    CRM) de un evento inbound queda registrado PENDING→DONE de forma
+  //    DURADERA. Un reingreso (crash/lease vencido) sólo ejecuta efectos
+  //    PENDING: un mensaje ya enviado JAMÁS se reenvía por un fallo posterior.
+  //    (rollback: DROP TABLE inbound_effect_journal;)
+  //  - idempotency_event_payloads: payload original del evento para que la
+  //    reconciliación de claves UNCERTAIN pueda re-ejecutar el ciclo completo
+  //    reutilizando el journal.
+  //    (rollback: DROP TABLE idempotency_event_payloads;)
+  //  - El estado UNCERTAIN de idempotency_keys es un VALOR nuevo de la columna
+  //    status existente (sin cambio de esquema; documentado en MIGRACIONES).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS inbound_effect_journal (
+      key TEXT NOT NULL,
+      effect_key TEXT NOT NULL,
+      effect_type TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PENDING', -- 'PENDING' | 'DONE'
+      result_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (key, effect_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_effect_journal_status ON inbound_effect_journal(key, status);
+
+    CREATE TABLE IF NOT EXISTS idempotency_event_payloads (
+      key TEXT PRIMARY KEY,
+      payload_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+  `)
 
   return db
 }

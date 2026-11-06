@@ -212,6 +212,91 @@ export function readBody(req: import('node:http').IncomingMessage, maxBytes: num
   })
 }
 
+// ============================================================================
+// SESIÓN DE STUDIO POR COOKIE HttpOnly (tercera reparación 4.F — espejo de ULTRA)
+//
+// Causa raíz corregida: el Studio de Capa 2A guardaba el secreto administrativo
+// en sessionStorage — cualquier XSS lo leía. Ahora el navegador canjea el
+// secreto UNA vez por una cookie de sesión:
+//   - HttpOnly → invisible para JavaScript (un XSS NO puede exfiltrarla);
+//   - SameSite=Strict → no viaja en navegaciones cruzadas;
+//   - corta vida (1 h) y token HMAC stateless ligado al secreto vigente:
+//     rotar el secreto revoca todas las sesiones al instante.
+// ============================================================================
+
+export const STUDIO_SESSION_COOKIE = 'wp_2a_studio_session'
+export const STUDIO_SESSION_TTL_SECONDS = 3600
+
+function studioSessionToken(secret: string, issuedAtMs: number): string {
+  return createHmac('sha256', secret).update(`2a.${issuedAtMs}`).digest('base64url')
+}
+
+/** Emite el valor de la cookie de sesión del Studio (índice único = 0). */
+export function issueStudioSession(secret: string, nowMs: number = Date.now()): string {
+  const token = `0.${nowMs}.${studioSessionToken(secret, nowMs)}`
+  return `${STUDIO_SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${STUDIO_SESSION_TTL_SECONDS}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`
+}
+
+/** Verifica la cookie de sesión contra el secreto vigente (rotación ⇒ revocación total). */
+export function resolveStudioSession(cookieHeader: string | undefined, expectedSecret: string | undefined, nowMs: number = Date.now()): boolean {
+  if (!cookieHeader || !expectedSecret) return null as unknown as boolean
+  const cookies = cookieHeader.split(';').map((c) => c.trim())
+  const raw = cookies.find((c) => c.startsWith(`${STUDIO_SESSION_COOKIE}=`))
+  if (!raw) return false
+  const token = raw.slice(STUDIO_SESSION_COOKIE.length + 1)
+  const parts = token.split('.')
+  if (parts.length !== 3) return false
+  const [, iatStr, sig] = parts
+  const iat = Number.parseInt(iatStr, 10)
+  if (!Number.isFinite(iat)) return false
+  if (nowMs - iat > STUDIO_SESSION_TTL_SECONDS * 1000) return false
+  const expected = studioSessionToken(expectedSecret, iat)
+  const a = Buffer.from(sig)
+  const b = Buffer.from(expected)
+  if (a.length !== b.length) return false
+  return timingSafeEqual(a, b)
+}
+
+/**
+ * RateLimiter por cubo (ventana fija en memoria) para endpoints públicos
+ * (tercera reparación 4.F): mitiga abuso de /api/inbound, /api/payments/webhook
+ * y /ref/:slug. Clave = identificador (p. ej. IP o IP+ruta). En memoria por
+ * proceso: suficiente para contener rachas; el límite duro de red se hace en
+ * infraestructura (proxy) cuando existe.
+ */
+export class RateLimiter {
+  private buckets = new Map<string, { count: number; resetAt: number }>()
+  private maxPerWindow: number
+  private windowMs: number
+  private maxBuckets: number
+
+  constructor(maxPerWindow: number, windowMs: number = 60_000, maxBuckets: number = 10_000) {
+    this.maxPerWindow = maxPerWindow
+    this.windowMs = windowMs
+    this.maxBuckets = maxBuckets
+  }
+
+  /** Devuelve true si la petición está PERMITIDA. */
+  public allow(key: string, now: number = Date.now()): boolean {
+    if (this.buckets.size > this.maxBuckets) {
+      // Limpieza de seguridad si el mapa crece demasiado (abuso de claves falsas)
+      for (const [k, b] of this.buckets) if (b.resetAt <= now) this.buckets.delete(k)
+      if (this.buckets.size > this.maxBuckets) this.buckets.clear()
+    }
+    const bucket = this.buckets.get(key)
+    if (!bucket || bucket.resetAt <= now) {
+      this.buckets.set(key, { count: 1, resetAt: now + this.windowMs })
+      return true
+    }
+    bucket.count++
+    return bucket.count <= this.maxPerWindow
+  }
+
+  public get size(): number {
+    return this.buckets.size
+  }
+}
+
 /**
  * Guard de entorno fail-fast para producción.
  * Devuelve la lista de problemas (variables ausentes o débiles). NUNCA incluye valores.

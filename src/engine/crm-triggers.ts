@@ -90,9 +90,12 @@ export class CrmTriggerListener {
     }
 
     if (rule.action === 'start_flow' && rule.targetFlowId) {
+      // (tercera reparación 4.B) El flujo debe existir EN LA ORGANIZACIÓN del
+      // evento: nunca se arranca un flujo global/de otra org por coincidencia de id.
+      const flowInOrg = this.flowEngine.getFlow(event.orgId, rule.targetFlowId)
       return {
-        triggered: true,
-        action: `start_flow:${rule.targetFlowId}`,
+        triggered: Boolean(flowInOrg),
+        action: flowInOrg ? `start_flow:${rule.targetFlowId}` : `start_flow_unavailable_in_org:${rule.targetFlowId}`,
       }
     }
 

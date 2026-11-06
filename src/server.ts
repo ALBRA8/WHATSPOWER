@@ -16,6 +16,9 @@ import {
   checkWebhookSecurity,
   readBody,
   DurableReplayCache,
+  RateLimiter,
+  issueStudioSession,
+  resolveStudioSession,
   productionConfigProblems,
 } from './security.ts'
 
@@ -105,15 +108,64 @@ export function createAgenticServer(options?: {
   const inboundReplay = new DurableReplayCache(replayPath)
   const paymentsReplay = new DurableReplayCache(replayPath)
 
+  // Rate limiting de endpoints públicos (tercera reparación 4.F)
+  const inboundRate = new RateLimiter(120, 60_000)
+  const paymentsRate = new RateLimiter(60, 60_000)
+  const refRate = new RateLimiter(300, 60_000)
+  const studioLoginRate = new RateLimiter(10, 60_000)
+  /** Extrae la IP del cliente (sin confiar ciegamente en X-Forwarded-For: se usa solo
+   *  como clave de rate-limit, jamás como decisión de autorización). */
+  function clientKey(req: IncomingMessage): string {
+    const fwd = req.headers['x-forwarded-for']
+    return (typeof fwd === 'string' ? fwd.split(',')[0].trim() : '') || req.socket.remoteAddress || 'unknown'
+  }
+  /** Org obligatoria desde el header X-Org-Id (nunca del body — no se infiere de datos no confiables). */
+  function requireOrgHeader(req: IncomingMessage): string | null {
+    const orgId = String(req.headers['x-org-id'] || '').trim()
+    return orgId && /^[a-zA-Z0-9_-]{1,64}$/.test(orgId) ? orgId : null
+  }
+
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
+
+    // Canje de sesión del Studio (4.F): el operador envía el secreto UNA vez;
+    // el backend responde con cookie HttpOnly de corta vida. El secreto de larga
+    // vida JAMÁS vuelve al navegador (antes vivía en sessionStorage: un XSS lo leía).
+    if (req.method === 'POST' && url.pathname === '/studio/login') {
+      if (!studioLoginRate.allow(`studiologin:${clientKey(req)}`)) {
+        res.writeHead(429, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Demasiados intentos. Inténtalo más tarde.' }))
+        return
+      }
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      let secret = ''
+      try { secret = String(JSON.parse(rb.body).secret || '') } catch {}
+      const internalSecret = process.env.INTERNAL_API_SECRET
+      if (!internalSecret || !isAuthorizedBearer(secret ? `Bearer ${secret}` : undefined, internalSecret)) {
+        console.warn(`[Seguridad 2A ALERTA] Studio login fallido (IP: ${req.socket.remoteAddress})`)
+        res.writeHead(401, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Credencial administrativa inválida' }))
+        return
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Set-Cookie': issueStudioSession(internalSecret),
+      })
+      res.end(JSON.stringify({ ok: true, sessionTtlSeconds: 3600 }))
+      return
+    }
 
     // ==========================================================
     // PUERTA DE AUTENTICACIÓN (orden de cierre 2026-11-06)
     // Toda ruta /api/* es administrativa y exige Bearer INTERNAL_API_SECRET
-    // (comparación timing-safe), SALVO: /api/health (público),
-    // /api/inbound (protegida por HMAC+timestamp+replay propio) y
-    // /api/payments/webhook (protegida por HMAC de la pasarela).
+    // (comparación timing-safe) O cookie de sesión del Studio (HttpOnly),
+    // SALVO: /api/health (público), /api/inbound (protegida por HMAC+timestamp+
+    // replay propio) y /api/payments/webhook (protegida por HMAC de la pasarela).
     // Fail-closed: sin secret configurado responde 503, nunca acepta.
     // ==========================================================
     const isPublicApiPath = url.pathname === '/api/health'
@@ -126,7 +178,9 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify({ error: 'Service Unavailable: INTERNAL_API_SECRET no configurado (fail-closed)' }))
         return
       }
-      if (!isAuthorizedBearer(req.headers['authorization'], internalSecret)) {
+      const bearerOk = isAuthorizedBearer(req.headers['authorization'], internalSecret)
+      const sessionOk = resolveStudioSession(req.headers.cookie as string | undefined, internalSecret)
+      if (!bearerOk && !sessionOk) {
         console.warn(`[Seguridad 2A ALERTA] Acceso administrativo no autorizado: ${req.method} ${url.pathname} (IP: ${req.socket.remoteAddress})`)
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
@@ -142,14 +196,17 @@ export function createAgenticServer(options?: {
     // ============================================================
     if (url.pathname === '/qr/data') {
       // STRICT: el QR (permite secuestrar la sesión WhatsApp) JAMÁS sale a anónimos.
-      // GET /qr sirve solo el shell sin datos; la clave va por sessionStorage → Bearer.
+      // GET /qr sirve solo el shell sin datos; la sesión se canjea por cookie HttpOnly.
       const internalSecret = process.env.INTERNAL_API_SECRET
       if (!internalSecret) {
         res.writeHead(503, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Service Unavailable: INTERNAL_API_SECRET no configurado (fail-closed)' }))
         return
       }
-      if (!isAuthorizedBearer(req.headers['authorization'], internalSecret)) {
+      // La puerta de QR también acepta la cookie de sesión del Studio (4.F)
+      const bearerOk = isAuthorizedBearer(req.headers['authorization'], internalSecret || '')
+      const sessionOk = resolveStudioSession(req.headers.cookie as string | undefined, internalSecret)
+      if (!bearerOk && !sessionOk) {
         console.warn(`[Seguridad 2A ALERTA] Acceso a QR sin autenticación: ${req.method} ${url.pathname} (IP: ${req.socket.remoteAddress})`)
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized: el QR exige autenticación administrativa (Bearer)' }))
@@ -164,15 +221,28 @@ export function createAgenticServer(options?: {
       return
     }
 
-    // API REST de Flujos
+    // API REST de Flujos — organización OBLIGATORIA en el header X-Org-Id (4.B):
+    // el listado, la creación y la ejecución operan exclusivamente dentro de ESA org.
     if (req.method === 'GET' && url.pathname === '/api/flows') {
-      const flows = router.getFlowEngine().listFlows()
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const flows = router.getFlowEngine().listFlows(orgId)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(flows))
       return
     }
 
     if (req.method === 'POST' && url.pathname === '/api/flows') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
       const rb = await readBody(req)
       if (!rb.ok) {
         res.writeHead(413, { 'Content-Type': 'application/json' })
@@ -181,9 +251,20 @@ export function createAgenticServer(options?: {
       }
       try {
         const flow = JSON.parse(rb.body)
-        router.getFlowEngine().saveFlow(flow)
+        if (!flow?.id || typeof flow.id !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'flow.id es obligatorio' }))
+          return
+        }
+        // La org SIEMPRE del header autenticado; un orgId del body contradictorio se rechaza.
+        if (flow.orgId && flow.orgId !== orgId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'orgId del body no coincide con X-Org-Id (la organización no se infiere de datos no confiables)' }))
+          return
+        }
+        router.getFlowEngine().saveFlow(orgId, flow)
         res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ ok: true, id: flow.id }))
+        res.end(JSON.stringify({ ok: true, id: flow.id, organizationId: orgId }))
       } catch (e: any) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: e.message }))
@@ -274,11 +355,16 @@ export function createAgenticServer(options?: {
   </div>
 
   <script>
-    let KEY = sessionStorage.getItem('wp_api_key') || sessionStorage.getItem('qr_key') || '';
+    // (tercera reparación 4.F) La clave se canjea UNA vez por cookie HttpOnly
+    // (/studio/login); jamás se guarda en sessionStorage (antes un XSS podía leerla
+    // y robar la sesión de WhatsApp a través del QR).
+    async function fetchQR() {
+      return fetch('/qr/data', { credentials: 'same-origin' });
+    }
     async function updateQR() {
       try {
-        const res = await fetch('/qr/data', { headers: { 'Authorization': 'Bearer ' + KEY } });
-        if (res.status === 401) { sessionStorage.removeItem('wp_api_key'); sessionStorage.removeItem('qr_key'); location.reload(); return; }
+        const res = await fetchQR();
+        if (res.status === 401) { location.reload(); return; }
         if (!res.ok) return;
         const data = await res.json();
         const container = document.getElementById('qrContainer');
@@ -305,17 +391,14 @@ export function createAgenticServer(options?: {
       setInterval(updateQR, 1500);
     }
     (async function init() {
-      if (KEY) {
-        const probe = await fetch('/qr/data', { headers: { 'Authorization': 'Bearer ' + KEY } });
-        if (probe.ok) { startViewer(); return; }
-        sessionStorage.removeItem('wp_api_key'); sessionStorage.removeItem('qr_key'); KEY = '';
-      }
+      const probe = await fetchQR();
+      if (probe.ok) { startViewer(); return; }
       document.getElementById('btn').addEventListener('click', async () => {
         const k = document.getElementById('key').value;
         const err = document.getElementById('gateErr');
-        const probe = await fetch('/qr/data', { headers: { 'Authorization': 'Bearer ' + k } });
-        if (probe.ok) { KEY = k; sessionStorage.setItem('wp_api_key', k); startViewer(); }
-        else { err.style.display = 'block'; err.textContent = 'Clave inválida (' + probe.status + ')'; }
+        const loginRes = await fetch('/studio/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret: k }) });
+        if (loginRes.ok) { startViewer(); }
+        else { err.style.display = 'block'; err.textContent = 'Clave inválida (' + loginRes.status + ')'; }
       });
     })();
   </script>
@@ -366,7 +449,9 @@ export function createAgenticServer(options?: {
       }
       const lock = router.getLockManager().getLock(phone, orgId)
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ phone, locked: Boolean(lock), lock }))
+      // (contrato v2) La respuesta CONFIRMA la organización consultada: el cliente
+      // (Capa 2B) debe verificar este eco y rechazar respuestas sin/mismatch.
+      res.end(JSON.stringify({ phone, locked: Boolean(lock), lock, organizationId: orgId }))
       return
     }
 
@@ -383,16 +468,16 @@ export function createAgenticServer(options?: {
       }
       const suppressed = router.getSuppressionStore().isSuppressed(orgId, phone)
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ phone, suppressed }))
+      // (contrato v2) Eco de organización para verificación del cliente (5.A)
+      res.end(JSON.stringify({ phone, suppressed, organizationId: orgId }))
       return
     }
 
     // 3.2 Registro Administrativo de Supresión (POST /api/internal/suppression/:phone)
     if (req.method === 'POST' && url.pathname.startsWith('/api/internal/suppression/')) {
-      const authHeader = req.headers['authorization']
-      // FAIL-CLOSED (rotación 2026-10-27): sin secret configurado se rechaza siempre
+      // FAIL-CLOSED + comparación timing-safe (4.F): sin secret configurado se rechaza siempre
       const internalSecret = process.env.INTERNAL_API_SECRET
-      if (!internalSecret || !authHeader || authHeader !== `Bearer ${internalSecret}`) {
+      if (!isAuthorizedBearer(req.headers['authorization'], internalSecret || '')) {
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
         return
@@ -407,38 +492,39 @@ export function createAgenticServer(options?: {
         return
       }
 
-      let body = ''
-      req.on('data', (chunk) => (body += chunk))
-      req.on('end', () => {
-        let reason = 'Baja administrativa / CRM'
-        try {
-          if (body) {
-            const parsed = JSON.parse(body)
-            if (parsed.reason) reason = parsed.reason
-          }
-        } catch {}
-
-        const orgId = String(req.headers['x-org-id'] || '')
-        if (!orgId) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
-          return
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      let reason = 'Baja administrativa / CRM'
+      try {
+        if (rb.body) {
+          const parsed = JSON.parse(rb.body)
+          if (parsed.reason) reason = String(parsed.reason).slice(0, 200)
         }
-        router.getSuppressionStore().addSuppression(orgId, phone, reason)
-        console.log(`[Seguridad 2A AUDIT] Registro de supresión para: ${phone} (Motivo: "${reason}", IP: ${req.socket.remoteAddress}, Time: ${new Date().toISOString()})`)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ phone, suppressed: true, reason }))
-      })
+      } catch {}
+
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      router.getSuppressionStore().addSuppression(orgId, phone, reason)
+      console.log(`[Seguridad 2A AUDIT] Registro de supresión para: ${phone.slice(0, 4)}***${phone.slice(-2)} (org: ${orgId}, Motivo: "${reason}", IP: ${req.socket.remoteAddress}, Time: ${new Date().toISOString()})`)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ phone, suppressed: true, reason, organizationId: orgId }))
       return
     }
 
     // 3.3 Eliminación Administrativa de Supresión (DELETE /api/internal/suppression/:phone)
     if (req.method === 'DELETE' && url.pathname.startsWith('/api/internal/suppression/')) {
-      const authHeader = req.headers['authorization']
-      // FAIL-CLOSED (rotación 2026-10-27): sin secret configurado se rechaza siempre
+      // FAIL-CLOSED + comparación timing-safe (4.F)
       const internalSecret = process.env.INTERNAL_API_SECRET
-      if (!internalSecret || !authHeader || authHeader !== `Bearer ${internalSecret}`) {
-        console.warn(`[Seguridad 2A ALERTA] Intento no autorizado de eliminar baja en: ${url.pathname} (IP: ${req.socket.remoteAddress}, Auth: ${authHeader ? 'Inválida' : 'Ausente'})`)
+      if (!isAuthorizedBearer(req.headers['authorization'], internalSecret || '')) {
+        console.warn(`[Seguridad 2A ALERTA] Intento no autorizado de eliminar baja en: ${url.pathname} (IP: ${req.socket.remoteAddress}, Auth: ${req.headers['authorization'] ? 'Inválida' : 'Ausente'})`)
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
         return
@@ -461,9 +547,9 @@ export function createAgenticServer(options?: {
       }
       const wasSuppressed = router.getSuppressionStore().isSuppressed(orgId, phone)
       router.getSuppressionStore().removeSuppression(orgId, phone)
-      console.log(`[Seguridad 2A AUDIT] Eliminación autorizada de supresión para: ${phone} (Estaba suprimido: ${wasSuppressed}, IP: ${req.socket.remoteAddress}, Time: ${new Date().toISOString()})`)
+      console.log(`[Seguridad 2A AUDIT] Eliminación autorizada de supresión para: ${phone.slice(0, 4)}***${phone.slice(-2)} (org: ${orgId}, Estaba suprimido: ${wasSuppressed}, IP: ${req.socket.remoteAddress}, Time: ${new Date().toISOString()})`)
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ phone, suppressed: false, removed: true, wasSuppressed }))
+      res.end(JSON.stringify({ phone, suppressed: false, removed: true, wasSuppressed, organizationId: orgId }))
       return
     }
 
@@ -482,11 +568,67 @@ export function createAgenticServer(options?: {
       return
     }
 
+    // 4.bis Reconciliación de eventos UNCERTAIN (tercera reparación 4.C):
+    // POST /api/internal/idempotency/reconcile — body {key} | {all: true}.
+    // JAMÁS es un reintento ciego: re-ejecuta el ciclo reutilizando el journal
+    // (efectos DONE se saltan; ningún mensaje ya enviado se reenvía).
+    if (req.method === 'POST' && url.pathname === '/api/internal/idempotency/reconcile') {
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const body = JSON.parse(rb.body || '{}') as { key?: string; all?: boolean }
+        if (body.key && typeof body.key === 'string') {
+          const result = await router.reconcileEvent(body.key)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, key: body.key, result }))
+          return
+        }
+        if (body.all === true) {
+          const pending = router.listUncertainEvents(25)
+          const outcomes: Array<{ key: string; ok: boolean; error?: string }> = []
+          for (const ev of pending) {
+            try {
+              await router.reconcileEvent(ev.key)
+              outcomes.push({ key: ev.key, ok: true })
+            } catch (e: any) {
+              outcomes.push({ key: ev.key, ok: false, error: String(e?.message || e) })
+            }
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, reconciled: outcomes.filter((o) => o.ok).length, outcomes }))
+          return
+        }
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Body requerido: {key} o {all:true} (lista previa vía GET .../uncertain)' }))
+      } catch (e: any) {
+        res.writeHead(409, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: String(e?.message || e) }))
+      }
+      return
+    }
+
+    // 4.ter Listado de eventos UNCERTAIN pendientes (GET /api/internal/idempotency/uncertain)
+    if (req.method === 'GET' && url.pathname === '/api/internal/idempotency/uncertain') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ uncertain: router.listUncertainEvents(100) }))
+      return
+    }
+
     // 5. Inbound Webhook (POST /api/inbound)
     // Endurecido (orden de cierre): firma HMAC OBLIGATORIA siempre + timestamp OBLIGATORIO
     // en ventana ±5min + caché anti-replay + comparación timing-safe. Sin excepción en dev:
     // el puente del CRM ya firma (X-Signature-SHA256 + X-Timestamp).
     if (req.method === 'POST' && url.pathname === '/api/inbound') {
+      // Rate limiting (4.F): ventana por IP
+      if (!inboundRate.allow(`inbound:${clientKey(req)}`)) {
+        res.writeHead(429, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Demasiadas peticiones (rate limit)' }))
+        return
+      }
       const rb = await readBody(req)
       if (!rb.ok) {
         res.writeHead(413, { 'Content-Type': 'application/json' })
@@ -530,14 +672,26 @@ export function createAgenticServer(options?: {
     // EXTENSIONES: EQUIPO, CANNED, GROWTH, PAGOS
     // ==========================================
 
-    // 1. Team & Round-Robin
+    // 1. Team & Round-Robin — agentes POR ORGANIZACIÓN (4.A)
     if (req.method === 'GET' && url.pathname === '/api/team/agents') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify(teamManager.getActiveAgents()))
+      res.end(JSON.stringify(teamManager.getActiveAgents(orgId)))
       return
     }
 
     if (req.method === 'POST' && url.pathname === '/api/team/agents') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
       const rb = await readBody(req)
       if (!rb.ok) {
         res.writeHead(413, { 'Content-Type': 'application/json' })
@@ -546,7 +700,7 @@ export function createAgenticServer(options?: {
       }
       try {
         const data = JSON.parse(rb.body)
-        const agent = teamManager.registerAgent(data)
+        const agent = teamManager.registerAgent(orgId, data)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(agent))
       } catch (e: any) {
@@ -564,10 +718,12 @@ export function createAgenticServer(options?: {
         return
       }
       try {
-        const { phone, strategy, orgId } = JSON.parse(rb.body)
-        if (!orgId || typeof orgId !== 'string') {
+        const { phone, strategy } = JSON.parse(rb.body)
+        // (4.A) La organización viene del HEADER autenticado; el body NO decide la org.
+        const orgId = requireOrgHeader(req)
+        if (!orgId) {
           res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'orgId es obligatorio (aislamiento multi-organización)' }))
+          res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
           return
         }
         const agent = strategy === 'least_loaded'
@@ -582,14 +738,26 @@ export function createAgenticServer(options?: {
       return
     }
 
-    // 2. Canned Responses (/canned)
+    // 2. Canned Responses (/canned) — POR ORGANIZACIÓN (4.A)
     if (req.method === 'GET' && url.pathname === '/api/canned') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify(cannedManager.listAll()))
+      res.end(JSON.stringify(cannedManager.listAll(orgId)))
       return
     }
 
     if (req.method === 'POST' && url.pathname === '/api/canned') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
       const rb = await readBody(req)
       if (!rb.ok) {
         res.writeHead(413, { 'Content-Type': 'application/json' })
@@ -597,7 +765,7 @@ export function createAgenticServer(options?: {
         return
       }
       try {
-        const item = cannedManager.createResponse(JSON.parse(rb.body))
+        const item = cannedManager.createResponse(orgId, JSON.parse(rb.body))
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(item))
       } catch (e: any) {
@@ -610,6 +778,11 @@ export function createAgenticServer(options?: {
     // 3. Growth Links & Ref URLs (/ref/:slug)
     if (req.method === 'GET' && url.pathname.startsWith('/ref/')) {
       const slug = url.pathname.replace('/ref/', '')
+      if (!refRate.allow(`ref:${clientKey(req)}`)) {
+        res.writeHead(429, { 'Content-Type': 'text/plain' })
+        res.end('Demasiadas peticiones')
+        return
+      }
       const redirectUrl = growthManager.registerClick(slug)
       if (redirectUrl) {
         res.writeHead(302, { Location: redirectUrl })
@@ -622,6 +795,12 @@ export function createAgenticServer(options?: {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/growth/links') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
       const rb = await readBody(req)
       if (!rb.ok) {
         res.writeHead(413, { 'Content-Type': 'application/json' })
@@ -629,7 +808,7 @@ export function createAgenticServer(options?: {
         return
       }
       try {
-        const link = growthManager.createGrowthLink(JSON.parse(rb.body))
+        const link = growthManager.createGrowthLink(orgId, JSON.parse(rb.body))
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(link))
       } catch (e: any) {
@@ -687,6 +866,12 @@ export function createAgenticServer(options?: {
     // Webhook de la pasarela de pagos: exige HMAC propio (PAYMENTS_WEBHOOK_SECRET) +
     // timestamp + anti-replay. Fail-closed: sin secret configurado, 503.
     if (req.method === 'POST' && url.pathname === '/api/payments/webhook') {
+      // Rate limiting (4.F)
+      if (!paymentsRate.allow(`pay:${clientKey(req)}`)) {
+        res.writeHead(429, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Demasiadas peticiones (rate limit)' }))
+        return
+      }
       const rb = await readBody(req)
       if (!rb.ok) {
         res.writeHead(413, { 'Content-Type': 'application/json' })
@@ -708,7 +893,7 @@ export function createAgenticServer(options?: {
       }
       try {
         // Contrato v2 de pagos (reparación integral 2026-11-06): eventId único,
-        // validación de amount/currency/reference y máquina de estados legal.
+        // validación de amount/currency/org/reference y máquina de estados legal.
         const payload = JSON.parse(rb.body)
         const result = paymentManager.handlePaymentWebhook({
           eventId: payload.eventId,
@@ -717,6 +902,7 @@ export function createAgenticServer(options?: {
           amount: payload.amount,
           currency: payload.currency,
           reference: payload.reference,
+          orgId: payload.orgId,
         })
         if (!result.ok) {
           const statusByCode: Record<string, number> = {
