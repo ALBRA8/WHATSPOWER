@@ -214,7 +214,7 @@ describe('WH: endurecimiento de webhooks', () => {
         // Crear transacción real vía API administrativa
         const createRes = await fetch(`${base}/api/payments/create-link`, {
           method: 'POST',
-          headers: { ...AUTH_JSON },
+          headers: { ...AUTH_JSON, 'X-Org-Id': 'org_test' },
           body: JSON.stringify({ orgId: 'org_test', contactPhone: '573000001199', amount: 90000, currency: 'COP', description: 'Plan WH-06' }),
         })
         assert.ok(createRes.status < 300, 'create-link debe funcionar con credencial válida')

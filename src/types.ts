@@ -58,7 +58,19 @@ export interface CrmActionResult {
 }
 
 export interface TransportSender {
-  sendMessage(to: string, text: string, correlationId: string): Promise<{ ok: boolean; messageId?: string; error?: string }>
+  /**
+   * CUARTA FASE CORRECTIVA (idempotencia externa): `idempotencyKey` es una clave
+   * DETERMINISTA del sistema (`wpfx_<hash(evento,efecto)>`) que el transporte
+   * transmite al proveedor/daemon. Si el daemon la honra (dedup por clave), la
+   * ventana "proveedor aceptó + crash antes de DONE" queda cerrada de extremo a
+   * extremo; si no, el sistema sigue siendo at-least-once con reconciliación.
+   * Contrato de fallos:
+   *  - No-aceptación DEFINITIVA (el proveedor NO recibió el mensaje):
+   *    devolver { ok:false, error:'PREFLIGHT: ...' } — reintento seguro.
+   *  - Resultado DESCONOCIDO (conexión muerta a mitad): LANZAR
+   *    TransportAmbiguousError — exige reconciliación, jamás reenvío ciego.
+   */
+  sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string): Promise<{ ok: boolean; messageId?: string; error?: string }>
 }
 
 export interface CrmClientInterface {

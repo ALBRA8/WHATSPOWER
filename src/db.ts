@@ -603,8 +603,9 @@ export function createDatabase(dbPath?: string): DatabaseSync {
       key TEXT NOT NULL,
       effect_key TEXT NOT NULL,
       effect_type TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'PENDING', -- 'PENDING' | 'DONE'
+      status TEXT NOT NULL DEFAULT 'PENDING', -- 'PENDING' | 'IN_FLIGHT' | 'DONE' (cuarta fase)
       result_json TEXT,
+      attempt_at INTEGER,                     -- cuarta fase: cuándo se invocó al proveedor
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (key, effect_key)
@@ -617,6 +618,18 @@ export function createDatabase(dbPath?: string): DatabaseSync {
       created_at INTEGER NOT NULL
     );
   `)
+
+  // 15) v5 — CUARTA FASE CORRECTIVA: inbound_effect_journal.attempt_at
+  //     Momento en que se INVOCÓ al proveedor (transición PENDING→IN_FLIGHT).
+  //     Cierra la ventana "proveedor aceptó + crash antes de DONE": el estado
+  //     intermedio IN_FLIGHT es duradero y su reingreso exige resolución
+  //     explícita (jamás reenvío a ciegas). Migración ADITIVA (columna NULL en
+  //     filas legacy: se interpreta como efecto nunca intentado).
+  //     (rollback: SQLite < 3.35 no soporta DROP COLUMN; para revertir:
+  //     reconstruir la tabla sin la columna — ver docs/MIGRACIONES.md §W-v5.)
+  if (!tableColumns(db, 'inbound_effect_journal').includes('attempt_at')) {
+    db.exec('ALTER TABLE inbound_effect_journal ADD COLUMN attempt_at INTEGER')
+  }
 
   return db
 }

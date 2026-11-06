@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import type { InboundEvent, InboundContact, ExecutionResult, TransportSender, CrmClientInterface } from '../types.ts'
+import { TransportAmbiguousError } from '../adapters/transport.ts'
 import { LockManager } from '../state/lock-manager.ts'
 import { SuppressionStore } from '../suppression/suppression-store.ts'
 import { evaluateDeterministicRules } from './rules.ts'
@@ -19,6 +20,28 @@ const LEASE_RENEWAL_INTERVAL_MS = Number(process.env.LEASE_RENEWAL_INTERVAL_MS |
 class LeaseLostError extends Error {
   constructor() {
     super('LEASE_LOST: otro proceso tomó posesión del evento (lease vencido y re-adquirido); abortando para evitar efectos duplicados')
+  }
+}
+
+/**
+ * CUARTA FASE CORRECTIVA: un efecto con resultado DESCONOCIDO (quedó IN_FLIGHT
+ * por un crash tras la aceptación del proveedor, o UNCERTAIN por ambigüedad)
+ * JAMÁS se re-ejecuta automáticamente: exige resolución explícita del operador.
+ */
+export class EffectUnresolvedError extends Error {
+  constructor(effectKeys: string[]) {
+    super(`EFFECT_UNRESOLVED: efectos con resultado desconocido (${effectKeys.join(', ')}) — el proveedor pudo aceptarlos; resuélvalos con POST /api/internal/idempotency/effects/resolve antes de reintentar o reconciliar`)
+  }
+}
+
+/**
+ * CUARTA FASE CORRECTIVA: el proveedor NO aceptó el envío (ok:false definitivo,
+ * PREFLIGHT). El efecto vuelve a PENDING (reintento seguro); el evento falla
+ * limpio — jamás se registra un envío no realizado como completado.
+ */
+export class EffectNotCompletedError extends Error {
+  constructor(effectKey: string, detail: string) {
+    super(`SEND_NOT_COMPLETED: el proveedor NO aceptó el envío (${effectKey}): ${detail}`)
   }
 }
 
@@ -125,10 +148,20 @@ export class ConversationRouter {
         // Perdimos la posesión: NO tocamos la fila (el nuevo dueño gestiona su ciclo)
         throw err
       }
-      // Fallo de la ejecución: si ya hay efectos externos COMPLETADOS, la clave
-      // queda UNCERTAIN (prohibido el reintento ciego); si no hay ninguno,
-      // FAILED permite el reintento limpio de la pasarela/remitente.
+      // Fallo de la ejecución: si ya hay efectos externos COMPLETADOS o EN VUELO
+      // (resultado desconocido), la clave queda UNCERTAIN (prohibido el reintento
+      // ciego); si no hay ninguno, FAILED permite el reintento limpio.
       this.deferIdempotency(idemKey)
+      if (err instanceof EffectUnresolvedError) {
+        // CUARTA FASE: la re-entrega de un evento con efectos sin resolver NO
+        // lanza — responde el mismo contrato que una reserva UNCERTAIN.
+        return {
+          handled: false,
+          actionTaken: 'uncertain_needs_reconciliation',
+          error: err.message,
+          correlationId,
+        }
+      }
       throw err
     } finally {
       heartbeat.stop()
@@ -197,12 +230,19 @@ export class ConversationRouter {
   }
 
   /**
-   * Ejecuta un efecto externo con JOURNAL duradero (4.C):
+   * Ejecuta un efecto externo con JOURNAL duradero (4.C, endurecido en cuarta fase):
    *  - DONE → se salta (jamás se repite un mensaje/escritura ya realizada) y se
    *    devuelve el resultado registrado.
-   *  - PENDING nuevo → ejecuta fn; al éxito marca DONE con el resultado.
-   *  - Si fn lanza, el efecto queda PENDING (la reconciliación sólo re-ejecuta
-   *    los pendientes).
+   *  - IN_FLIGHT / UNCERTAIN (resultado DESCONOCIDO de un intento anterior) →
+   *    EffectUnresolvedError: JAMÁS se re-ejecuta automáticamente (ventana de
+   *    duplicación cerrada); exige resolución explícita por efecto.
+   *  - PENDING nuevo → se marca IN_FLIGHT ANTES de llamar al proveedor y DONE
+   *    apenas termina; si el proceso muere entre ambos puntos, el reingreso ve
+   *    IN_FLIGHT y NO reenvía (ésta era la ventana de duplicación).
+   *  - Envío no aceptado (ok:false definitivo, PREFLIGHT) → vuelve a PENDING y
+   *    el evento falla limpio (nunca un envío no realizado marcado DONE).
+   *  - Error ambiguo (TransportAmbiguousError) → el efecto queda IN_FLIGHT y el
+   *    evento UNCERTAIN (resultado externo desconocido ⇒ reconciliación).
    */
   private async journaledEffect<T>(
     idemKey: string,
@@ -219,17 +259,67 @@ export class ConversationRouter {
     if (existing && existing.status === 'DONE') {
       return (existing.result_json ? JSON.parse(existing.result_json) : undefined) as T
     }
+    if (existing && (existing.status === 'IN_FLIGHT' || existing.status === 'UNCERTAIN')) {
+      // CUARTA FASE: el proveedor PUDO aceptar este efecto en un intento anterior
+      // (crash antes de DONE / ambigüedad). Re-ejecutarlo duplicaría el efecto.
+      throw new EffectUnresolvedError([`${effectKey}:${existing.status}`])
+    }
     this.db.prepare(`
       INSERT INTO inbound_effect_journal (key, effect_key, effect_type, status, result_json, created_at, updated_at)
       VALUES (?, ?, ?, 'PENDING', NULL, ?, ?)
       ON CONFLICT(key, effect_key) DO NOTHING
     `).run(idemKey, effectKey, effectType, now, now)
-    const result = await fn()
+    // Marca el INTENTO antes de invocar al proveedor (transición atómica
+    // PENDING → IN_FLIGHT): si el proceso muere durante fn(), el journal queda
+    // en el estado exacto post-crash y el reingreso NUNCA re-envía a ciegas.
     this.db.prepare(`
-      UPDATE inbound_effect_journal SET status = 'DONE', result_json = ?, updated_at = ?
-      WHERE key = ? AND effect_key = ?
-    `).run(JSON.stringify(result ?? null), Math.floor(Date.now() / 1000), idemKey, effectKey)
-    return result
+      UPDATE inbound_effect_journal SET status = 'IN_FLIGHT', attempt_at = ?, updated_at = ?
+      WHERE key = ? AND effect_key = ? AND status = 'PENDING'
+    `).run(now, now, idemKey, effectKey)
+    try {
+      const result = await fn()
+      if (effectType === 'send_message') {
+        const r = result as { ok?: boolean; error?: string } | null | undefined
+        if (r && r.ok === false) {
+          // No-aceptación DEFINITIVA: el mensaje NO salió. El efecto vuelve a
+          // PENDING (reintento seguro) y el evento falla limpio — corregido el
+          // defecto de registrar un envío no realizado como DONE (pérdida).
+          this.db.prepare(`
+            UPDATE inbound_effect_journal SET status = 'PENDING', attempt_at = NULL, updated_at = ?
+            WHERE key = ? AND effect_key = ? AND status = 'IN_FLIGHT'
+          `).run(Math.floor(Date.now() / 1000), idemKey, effectKey)
+          throw new EffectNotCompletedError(effectKey, String(r.error || 'sin detalle'))
+        }
+      }
+      this.db.prepare(`
+        UPDATE inbound_effect_journal SET status = 'DONE', result_json = ?, updated_at = ?
+        WHERE key = ? AND effect_key = ?
+      `).run(JSON.stringify(result ?? null), Math.floor(Date.now() / 1000), idemKey, effectKey)
+      return result
+    } catch (err) {
+      if (err instanceof EffectNotCompletedError || err instanceof EffectUnresolvedError) throw err
+      if (err instanceof LeaseLostError) {
+        // Perdió la posesión ANTES de llamar al proveedor: el efecto no inició —
+        // vuelve a PENDING para el nuevo dueño.
+        this.db.prepare(`
+          UPDATE inbound_effect_journal SET status = 'PENDING', attempt_at = NULL, updated_at = ?
+          WHERE key = ? AND effect_key = ? AND status = 'IN_FLIGHT'
+        `).run(Math.floor(Date.now() / 1000), idemKey, effectKey)
+        throw err
+      }
+      if (err instanceof TransportAmbiguousError) {
+        // Resultado EXTERNO DESCONOCIDO: el efecto queda IN_FLIGHT y el evento
+        // UNCERTAIN — la reconciliación exige resolución explícita.
+        throw err
+      }
+      // Error local DEFINITIVO (validación, rechazo sincrónico sin contacto con
+      // el proveedor): vuelve a PENDING — semántica de fase 3 conservada.
+      this.db.prepare(`
+        UPDATE inbound_effect_journal SET status = 'PENDING', attempt_at = NULL, updated_at = ?
+        WHERE key = ? AND effect_key = ? AND status = 'IN_FLIGHT'
+      `).run(Math.floor(Date.now() / 1000), idemKey, effectKey)
+      throw err
+    }
   }
 
   /** Huella estable para claves de efecto (evita claves kilométricas con contenido variable). */
@@ -246,12 +336,13 @@ export class ConversationRouter {
   }
 
   /**
-   * Marca la reserva tras un fallo: FAILED si no hubo efectos externos
-   * completados (reintento limpio permitido); UNCERTAIN si ya hubo al menos un
-   * efecto externo DONE (reintento ciego PROHIBIDO hasta reconciliación).
+   * Marca la reserva tras un fallo: FAILED si no hubo efectos externos con
+   * efectos externos realizados o EN VUELO (reintento limpio permitido);
+   * UNCERTAIN si ya hubo al menos un efecto DONE/IN_FLIGHT/UNCERTAIN (reintento
+   * ciego PROHIBIDO hasta reconciliación y resolución de efectos).
    */
   private deferIdempotency(idemKey: string): void {
-    const done = this.db.prepare("SELECT COUNT(*) AS n FROM inbound_effect_journal WHERE key = ? AND status = 'DONE'").get(idemKey) as { n: number }
+    const done = this.db.prepare("SELECT COUNT(*) AS n FROM inbound_effect_journal WHERE key = ? AND status IN ('DONE', 'IN_FLIGHT', 'UNCERTAIN')").get(idemKey) as { n: number }
     const target = done.n > 0 ? 'UNCERTAIN' : 'FAILED'
     this.db.prepare("UPDATE idempotency_keys SET status = ? WHERE key = ? AND status = 'PROCESSING'").run(target, idemKey)
   }
@@ -270,10 +361,22 @@ export class ConversationRouter {
       this.completeIdempotency(idemKey, result)
       return result
     }
-    /** Envío externo journaleado: un mensaje ya enviado NO se reenvía nunca (4.C). */
+    // CUARTA FASE: un efecto con resultado DESCONOCIDO de un intento anterior
+    // (crash tras aceptación del proveedor / ambigüedad) BLOQUEA todo el ciclo
+    // antes de tocar locks o enviar nada: exige resolución explícita.
+    const unresolved = this.db.prepare(
+      "SELECT effect_key, status FROM inbound_effect_journal WHERE key = ? AND status IN ('IN_FLIGHT', 'UNCERTAIN') ORDER BY effect_key"
+    ).all(idemKey) as Array<{ effect_key: string; status: string }>
+    if (unresolved.length > 0) {
+      throw new EffectUnresolvedError(unresolved.map((u) => `${u.effect_key}:${u.status}`))
+    }
+
+    /** Envío externo journaleado: un mensaje ya enviado NO se reenvía nunca (4.C).
+     * CUARTA FASE: transmite la clave de idempotencia EXTERNA determinista
+     * (wpfx_hash(evento, efecto)) para que el daemon pueda deduplicar. */
     const send = (effectKey: string, text: string) =>
       this.journaledEffect(idemKey, heartbeat, `send:${effectKey}`, 'send_message', () =>
-        this.transport.sendMessage(phone, text, correlationId)
+        this.transport.sendMessage(phone, text, correlationId, `wpfx_${this.effectHash(idemKey, `send:${effectKey}`)}`)
       )
     /** Acción CRM journaleada. */
     const crmEffect = <T>(effectKey: string, fn: () => Promise<T>) =>
@@ -490,15 +593,66 @@ export class ConversationRouter {
   }
 
   // ===========================================================================
-  // RECONCILIACIÓN DE EVENTOS UNCERTAIN (tercera reparación 4.C)
+  // RECONCILIACIÓN DE EVENTOS UNCERTAIN (tercera reparación 4.C; resolutión
+  // por efecto añadida en la cuarta fase correctiva)
   // ===========================================================================
 
-  /** Lista eventos con resultado incierto (para operación/auditoría). */
-  listUncertainEvents(limit: number = 50): Array<{ key: string; createdAt: number; leaseExpiresAt: number }> {
+  /** Lista eventos con resultado incierto (para operación/auditoría), con sus
+   * efectos sin resolver (IN_FLIGHT/UNCERTAIN) que exigen decisión del operador. */
+  listUncertainEvents(limit: number = 50): Array<{ key: string; createdAt: number; leaseExpiresAt: number; unresolvedEffects: Array<{ effectKey: string; effectType: string; status: string; attemptedAt: number | null }> }> {
     const rows = this.db.prepare(
-      "SELECT key, created_at, lease_expires_at FROM idempotency_keys WHERE status = 'UNCERTAIN' ORDER BY created_at ASC LIMIT ?"
+      "SELECT key, created_at, lease_expires_at FROM idempotency_keys WHERE status IN ('UNCERTAIN') ORDER BY created_at ASC LIMIT ?"
     ).all(limit) as Array<{ key: string; created_at: number; lease_expires_at: number }>
-    return rows.map((r) => ({ key: r.key, createdAt: r.created_at, leaseExpiresAt: r.lease_expires_at }))
+    return rows.map((r) => {
+      const fx = this.db.prepare(
+        "SELECT effect_key, effect_type, status, attempt_at FROM inbound_effect_journal WHERE key = ? AND status IN ('IN_FLIGHT', 'UNCERTAIN') ORDER BY effect_key"
+      ).all(r.key) as Array<{ effect_key: string; effect_type: string; status: string; attempt_at: number | null }>
+      return {
+        key: r.key,
+        createdAt: r.created_at,
+        leaseExpiresAt: r.lease_expires_at,
+        unresolvedEffects: fx.map((f) => ({ effectKey: f.effect_key, effectType: f.effect_type, status: f.status, attemptedAt: f.attempt_at })),
+      }
+    })
+  }
+
+  /**
+   * CUARTA FASE: resolución EXPLÍCITA de un efecto con resultado desconocido.
+   *  - 'delivered': el operador CONFIRMA el efecto externo (visto en el daemon/
+   *    proveedor) → DONE con marca de reconciliación; jamás se re-ejecuta.
+   *  - 'not_delivered': el operador CONFIRMA que NO ocurrió → PENDiente
+   *    re-ejecutable por reconciliación/reintento.
+   * Solo aplica a efectos IN_FLIGHT o UNCERTAIN (jamás a DONE/PENDING).
+   */
+  resolveEffect(idemKey: string, effectKey: string, resolution: 'delivered' | 'not_delivered', note?: string): { ok: boolean; effectKey: string; status: string } {
+    const now = Math.floor(Date.now() / 1000)
+    const row = this.db.prepare('SELECT status, effect_type FROM inbound_effect_journal WHERE key = ? AND effect_key = ?').get(idemKey, effectKey) as
+      | { status: string; effect_type: string } | undefined
+    if (!row) throw new Error(`EFFECT_NOT_FOUND: ${idemKey}/${effectKey}`)
+    if (row.status !== 'IN_FLIGHT' && row.status !== 'UNCERTAIN') {
+      throw new Error(`EFFECT_NOT_RESOLVABLE: el efecto ${effectKey} está ${row.status} (solo IN_FLIGHT/UNCERTAIN requieren resolución)`)
+    }
+    if (resolution === 'delivered') {
+      this.db.prepare(`
+        UPDATE inbound_effect_journal SET status = 'DONE', result_json = ?, updated_at = ?
+        WHERE key = ? AND effect_key = ?
+      `).run(JSON.stringify({ reconciled: true, resolution: 'delivered', note: note || null }), now, idemKey, effectKey)
+      console.warn(`[Auditoría 2A] efecto RESUELTO delivered key=${idemKey} effect=${effectKey} tipo=${row.effect_type} (sin datos sensibles)`)
+      return { ok: true, effectKey, status: 'DONE' }
+    }
+    this.db.prepare(`
+      UPDATE inbound_effect_journal SET status = 'PENDING', attempt_at = NULL, result_json = NULL, updated_at = ?
+      WHERE key = ? AND effect_key = ?
+    `).run(now, idemKey, effectKey)
+    console.warn(`[Auditoría 2A] efecto RESUELTO not_delivered key=${idemKey} effect=${effectKey} tipo=${row.effect_type} (sin datos sensibles)`)
+    return { ok: true, effectKey, status: 'PENDING' }
+  }
+
+  /** Efectos sin resolver de una clave (usado por la puerta de reconciliación). */
+  private listUnresolvedEffects(idemKey: string): Array<{ effect_key: string; status: string }> {
+    return this.db.prepare(
+      "SELECT effect_key, status FROM inbound_effect_journal WHERE key = ? AND status IN ('IN_FLIGHT', 'UNCERTAIN') ORDER BY effect_key"
+    ).all(idemKey) as Array<{ effect_key: string; status: string }>
   }
 
   /**
@@ -510,6 +664,13 @@ export class ConversationRouter {
    */
   async reconcileEvent(idemKey: string): Promise<ExecutionResult | null> {
     const now = Math.floor(Date.now() / 1000)
+    // CUARTA FASE (fail-closed): con efectos de resultado DESCONOCIDO, la
+    // reconciliación está BLOQUEADA — el operador debe resolver cada efecto
+    // (delivered/not_delivered) ANTES; jamás se re-ejecuta a ciegas.
+    const unresolved = this.listUnresolvedEffects(idemKey)
+    if (unresolved.length > 0) {
+      throw new Error(`RECONCILE_BLOCKED_UNRESOLVED_EFFECTS: resuelva primero ${unresolved.map((u) => `${u.effect_key}:${u.status}`).join(', ')} vía POST /api/internal/idempotency/effects/resolve`)
+    }
     const claim = this.db.prepare(`
       UPDATE idempotency_keys SET status = 'PROCESSING', response_json = NULL, lease_expires_at = ?
       WHERE key = ? AND status = 'UNCERTAIN'

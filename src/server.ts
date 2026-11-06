@@ -125,6 +125,87 @@ export function createAgenticServer(options?: {
     return orgId && /^[a-zA-Z0-9_-]{1,64}$/.test(orgId) ? orgId : null
   }
 
+  // ==========================================================================
+  // CUARTA FASE CORRECTIVA — IDENTIDAD POR ORGANIZACIÓN (INTERNAL_API_KEYS)
+  // El secreto global identifica el SERVICIO; una clave dedicada identifica a
+  // UNA organización: `INTERNAL_API_KEYS = {"orgId":"clave>=24"}`.
+  //  - Clave dedicada → la identidad de la organización VIENE DE LA CLAVE; el
+  //    X-Org-Id debe coincidir (si no: 403). La org no se infiere del body ni
+  //    de datos no confiables.
+  //  - Secreto global para una org que YA TIENE clave dedicada → 403
+  //    ORG_HAS_DEDICATED_KEY (refuerzo: esas orgs exigen su clave).
+  //  - Secreto global para orgs SIN clave dedicada → compatible (documentado).
+  // ==========================================================================
+  function parseInternalApiKeys(): Record<string, string> {
+    try {
+      const raw = JSON.parse(process.env.INTERNAL_API_KEYS || '{}') as Record<string, string>
+      const out: Record<string, string> = {}
+      for (const [org, key] of Object.entries(raw)) {
+        if (typeof key === 'string' && key.length >= 24 && /^[a-zA-Z0-9_-]{1,64}$/.test(org)) out[org] = key
+      }
+      return out
+    } catch {
+      return {}
+    }
+  }
+
+  type InternalIdentity = { kind: 'org' | 'service' | 'session'; orgId?: string }
+
+  /**
+   * Resuelve la identidad del llamante (timing-safe) a partir del Bearer.
+   *  - Clave dedicada (INTERNAL_API_KEYS) → { kind:'org', orgId: la de la clave };
+   *    el X-Org-Id, si viene, debe coincidir (403 si no).
+   *  - Secreto global → { kind:'service' }; si la org pedida tiene clave
+   *    dedicada → 403 ORG_HAS_DEDICATED_KEY (refuerzo).
+   *  - Sin Bearer válido pero con cookie de sesión del Studio → { kind:'session' }.
+   *  - Nada de lo anterior → null (401 por parte de la puerta).
+   */
+  function resolveInternalIdentity(authHeader: string | undefined, xOrgId: string | null, sharedSecret: string, sessionOk: boolean): InternalIdentity | null {
+    const token = String(authHeader || '').replace(/^Bearer\s+/i, '').trim()
+    if (token) {
+      const dedicated = parseInternalApiKeys()
+      const byKey = (Object.entries(dedicated) as Array<[string, string]>).find(([, k]) => isAuthorizedBearer(`Bearer ${token}`, k))
+      if (byKey) {
+        const [keyOrg] = byKey
+        if (xOrgId && xOrgId !== keyOrg) {
+          throw new Error('ORG_KEY_MISMATCH: la clave presentada pertenece a otra organización')
+        }
+        return { kind: 'org', orgId: keyOrg }
+      }
+      if (isAuthorizedBearer(`Bearer ${token}`, sharedSecret)) {
+        if (xOrgId && dedicated[xOrgId]) {
+          throw new Error('ORG_HAS_DEDICATED_KEY: esta organización exige su clave dedicada (el secreto global ya no la autoriza)')
+        }
+        return { kind: 'service' }
+      }
+      return null
+    }
+    return sessionOk ? { kind: 'session' } : null
+  }
+
+  /** 403 con código semántico (jamás expone claves). */
+  function denyIdentity(res: ServerResponse, code: string): void {
+    console.warn(`[Seguridad 2A ALERTA] identidad/organización rechazada: ${code}`)
+    res.writeHead(403, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: code }))
+  }
+
+  /**
+   * Verifica que la identidad del req permite operar SOBRE orgId.
+   *  - identidad org → SOLO su propia org.
+   *  - identidad service → cualquier org SIN clave dedicada (con clave → 403).
+   *  - orgId nulo → true (el endpoint exige el header y responde 400).
+   */
+  function identityAllowsOrg(req: IncomingMessage, orgId: string | null, res?: ServerResponse): boolean {
+    const identity = (req as IncomingMessage & { internalIdentity?: InternalIdentity }).internalIdentity
+    if (!identity || identity.kind !== 'org' || !orgId) return true // service o sin org en esta petición
+    if (identity.orgId !== orgId) {
+      if (res) denyIdentity(res, 'ORG_KEY_MISMATCH: la clave presentada pertenece a otra organización')
+      return false
+    }
+    return true
+  }
+
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
 
@@ -178,9 +259,26 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify({ error: 'Service Unavailable: INTERNAL_API_SECRET no configurado (fail-closed)' }))
         return
       }
-      const bearerOk = isAuthorizedBearer(req.headers['authorization'], internalSecret)
+      const bearerSharedOk = isAuthorizedBearer(req.headers['authorization'], internalSecret)
       const sessionOk = resolveStudioSession(req.headers.cookie as string | undefined, internalSecret)
-      if (!bearerOk && !sessionOk) {
+      if (bearerSharedOk || sessionOk || parseInternalApiKeys() && String(req.headers['authorization'] || '').startsWith('Bearer ')) {
+        // CUARTA FASE: la identidad (org dedicada / servicio / sesión del Studio)
+        // se resuelve UNA vez aquí; el vínculo con X-Org-Id se verifica y queda
+        // adjunta para que cada endpoint valide su org contra la identidad.
+        try {
+          const identity = resolveInternalIdentity(req.headers['authorization'], requireOrgHeader(req), internalSecret, sessionOk)
+          if (!identity) {
+            console.warn(`[Seguridad 2A ALERTA] Acceso administrativo no autorizado: ${req.method} ${url.pathname} (IP: ${req.socket.remoteAddress})`)
+            res.writeHead(401, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
+            return
+          }
+          ;(req as IncomingMessage & { internalIdentity?: InternalIdentity }).internalIdentity = identity
+        } catch (e: any) {
+          denyIdentity(res, String(e?.message || 'ORG_IDENTITY_REJECTED'))
+          return
+        }
+      } else {
         console.warn(`[Seguridad 2A ALERTA] Acceso administrativo no autorizado: ${req.method} ${url.pathname} (IP: ${req.socket.remoteAddress})`)
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized: Missing or invalid internal secret' }))
@@ -618,6 +716,47 @@ export function createAgenticServer(options?: {
       return
     }
 
+    // 4.quáter CUARTA FASE — resolución EXPLÍCITA de un efecto con resultado
+    // desconocido: { key, effectKey, resolution: 'delivered'|'not_delivered', note? }.
+    // JAMÁS es un reintento: declara qué pasó realmente (auditable, sin datos sensibles).
+    if (req.method === 'POST' && url.pathname === '/api/internal/idempotency/effects/resolve') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      if (!identityAllowsOrg(req, orgId, res)) return
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const body = JSON.parse(rb.body || '{}') as { key?: string; effectKey?: string; resolution?: string; note?: string }
+        if (!body.key || !body.effectKey || (body.resolution !== 'delivered' && body.resolution !== 'not_delivered')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Body requerido: { key, effectKey, resolution: "delivered"|"not_delivered", note? }' }))
+          return
+        }
+        if (!body.key.startsWith(`${orgId}::`)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'ORG_MISMATCH: la clave pertenece a otra organización' }))
+          return
+        }
+        const outcome = router.resolveEffect(body.key, body.effectKey, body.resolution, typeof body.note === 'string' ? body.note.slice(0, 200) : undefined)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ...outcome, ok: true }))
+      } catch (e: any) {
+        const msg = String(e?.message || e)
+        const status = msg.includes('EFFECT_NOT_FOUND') ? 404 : 409
+        res.writeHead(status, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: msg }))
+      }
+      return
+    }
+
     // 5. Inbound Webhook (POST /api/inbound)
     // Endurecido (orden de cierre): firma HMAC OBLIGATORIA siempre + timestamp OBLIGATORIO
     // en ventana ±5min + caché anti-replay + comparación timing-safe. Sin excepción en dev:
@@ -840,6 +979,16 @@ export function createAgenticServer(options?: {
 
     // 5. Payment Links & Webhooks
     if (req.method === 'POST' && url.pathname === '/api/payments/create-link') {
+      // CUARTA FASE (fail-closed): la organización llega por HEADER y se valida
+      // contra la identidad (clave dedicada) y contra el body — la org ya no se
+      // toma del body sin verificación.
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido: los pagos pertenecen a una organización (header obligatorio)' }))
+        return
+      }
+      if (!identityAllowsOrg(req, orgId, res)) return
       const rb = await readBody(req)
       if (!rb.ok) {
         res.writeHead(413, { 'Content-Type': 'application/json' })
@@ -851,6 +1000,12 @@ export function createAgenticServer(options?: {
         if (!parsed.orgId || typeof parsed.orgId !== 'string') {
           res.writeHead(400, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({ error: 'orgId es obligatorio: los pagos pertenecen a una organización' }))
+          return
+        }
+        if (parsed.orgId !== orgId) {
+          console.warn(`[Seguridad 2A ALERTA] create-link con org del body distinta del header`)
+          res.writeHead(403, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'ORG_MISMATCH: el orgId del body debe coincidir con X-Org-Id' }))
           return
         }
         const tx = paymentManager.createPaymentLink(parsed)

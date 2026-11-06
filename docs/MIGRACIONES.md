@@ -42,6 +42,26 @@ DROP TABLE flows_v4new;"
 # (las filas de orgs reales creadas con la v4 se conservan en flows_v4new;.exportar antes si se necesitan)
 ```
 
+## W-v5 (CUARTA FASE CORRECTIVA) — attempt_at en el journal de efectos
+
+- `inbound_effect_journal.attempt_at` (columna nueva, INTEGER, nullable,
+  migración ADITIVA: `ALTER TABLE ... ADD COLUMN attempt_at INTEGER`).
+  Registra el momento de la transición PENDING→IN_FLIGHT (invocación al
+  proveedor). El estado intermedio `'IN_FLIGHT'` de `status` (valor nuevo de la
+  columna existente, sin cambio de esquema) cierra la ventana "el proveedor
+  aceptó y el proceso murió antes de DONE": el reingreso ve IN_FLIGHT y exige
+  resolución explícita (POST /api/internal/idempotency/effects/resolve),
+  jamás reenvía a ciegas. Filas legacy con attempt_at NULL = efecto nunca
+  intentado (seguro).
+- Rollback exacto:
+
+```bash
+sqlite3 db/operational.db "ALTER TABLE inbound_effect_journal DROP COLUMN attempt_at;"
+# El estado IN_FLIGHT desaparece al revertir el código (solo existe con la v5);
+# si quedaran filas IN_FLIGHT al revertir, tratarlas como PENDING manualmente:
+sqlite3 db/operational.db "UPDATE inbound_effect_journal SET status='PENDING' WHERE status='IN_FLIGHT';"
+```
+
 ## W-v4 — Journal de efectos externos + payloads de reconciliación (4.C)
 
 - `inbound_effect_journal(key, effect_key, effect_type, status, result_json,
