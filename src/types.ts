@@ -53,6 +53,8 @@ export interface CrmActionResult {
   data?: Record<string, unknown>
   clientId?: string
   error?: string
+  /** (segunda reparación §3.B) Organización que el CRM confirma haber aplicado. */
+  orgId?: string
 }
 
 export interface TransportSender {

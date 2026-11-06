@@ -60,12 +60,24 @@ export function createAgenticServer(options?: {
   })()
   // CRM Actions Bridge: cliente HTTP real hacia CRM-ALBRA cuando hay API key configurada;
   // en producción sin CRM_API_KEY se falla al arranque (prohibido el Mock silencioso).
+  // (segunda reparación §3.B) Credenciales POR ORGANIZACIÓN: CRM_API_KEYS es un
+  // JSON {orgId: "albra_..."}; CRM_API_KEY sigue soportada para una sola org.
+  const crmApiKeysByOrg: Record<string, string> = (() => {
+    try {
+      const raw = process.env.CRM_API_KEYS
+      if (!raw) return {}
+      const parsed = JSON.parse(raw)
+      return parsed && typeof parsed === 'object' ? parsed : {}
+    } catch {
+      throw new Error('CRM_API_KEYS mal formada: debe ser JSON {orgId: "albra_..."}')
+    }
+  })()
   const crm = options?.crm
-    ?? (process.env.CRM_API_KEY
-      ? new HttpCrmClient(process.env.CRM_BASE_URL || 'http://localhost:3000', process.env.CRM_API_KEY)
+    ?? ((process.env.CRM_API_KEY || Object.keys(crmApiKeysByOrg).length > 0)
+      ? new HttpCrmClient(process.env.CRM_BASE_URL || 'http://localhost:3000', process.env.CRM_API_KEY || '', crmApiKeysByOrg)
       : (isProduction
-        ? (() => { throw new Error('CRM_API_KEY no configurada: en producción el puente CRM no puede usar MockCrmClient silenciosamente (configura CRM_API_KEY)') })()
-        : (console.warn('[Capa 2A AVISO] CRM en modo Mock — SOLO desarrollo. Configura CRM_API_KEY para el puente real.'), new MockCrmClient())))
+        ? (() => { throw new Error('CRM_API_KEY no configurada: en producción el puente CRM no puede usar MockCrmClient silenciosamente (configura CRM_API_KEY o CRM_API_KEYS)') })()
+        : (console.warn('[Capa 2A AVISO] CRM en modo Mock — SOLO desarrollo. Configura CRM_API_KEY/CRM_API_KEYS para el puente real.'), new MockCrmClient())))
   // Secret dual: AGENTIC_2A_WEBHOOK_SECRET (documentado en README) tiene prioridad sobre WEBHOOK_SECRET (legacy).
   // FAIL-CLOSED (rotación 2026-10-27): eliminado fallback hardcodeado del webhookSecret
   // (un valor publicado en el repo permitía forjar firmas). Sin secret configurado, verifyHmac rechaza todo.
@@ -187,8 +199,13 @@ export function createAgenticServer(options?: {
         return
       }
       try {
-        const { phone, messageText, name } = JSON.parse(rb.body)
-        const stepRes = await router.getFlowEngine().evaluateStep(phone, messageText, { name })
+        const { phone, messageText, name, orgId } = JSON.parse(rb.body)
+        if (!orgId || typeof orgId !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'orgId es obligatorio (aislamiento multi-organización)' }))
+          return
+        }
+        const stepRes = await router.getFlowEngine().evaluateStep(orgId, phone, messageText, { name })
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(stepRes))
       } catch (e: any) {
@@ -339,7 +356,15 @@ export function createAgenticServer(options?: {
     // 2. Consulta de Locks para Capa 2B (GET /api/internal/locks/:phone)
     if (req.method === 'GET' && url.pathname.startsWith('/api/internal/locks/')) {
       const phone = decodeURIComponent(url.pathname.replace('/api/internal/locks/', ''))
-      const lock = router.getLockManager().getLock(phone)
+      // (segunda reparación §3.A) El lock es POR organización: la org viaja en
+      // x-org-id (fail-closed si falta).
+      const orgId = String(req.headers['x-org-id'] || '')
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const lock = router.getLockManager().getLock(phone, orgId)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ phone, locked: Boolean(lock), lock }))
       return
@@ -350,7 +375,13 @@ export function createAgenticServer(options?: {
       const rawPhone = decodeURIComponent(url.pathname.replace('/api/internal/suppression/', ''))
       const digits = rawPhone.replace(/\D/g, '')
       const phone = (digits.length === 10 && digits.startsWith('3')) ? `57${digits}` : digits
-      const suppressed = router.getSuppressionStore().isSuppressed(phone)
+      const orgId = String(req.headers['x-org-id'] || '')
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const suppressed = router.getSuppressionStore().isSuppressed(orgId, phone)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ phone, suppressed }))
       return
@@ -387,7 +418,13 @@ export function createAgenticServer(options?: {
           }
         } catch {}
 
-        router.getSuppressionStore().addSuppression(phone, reason)
+        const orgId = String(req.headers['x-org-id'] || '')
+        if (!orgId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+          return
+        }
+        router.getSuppressionStore().addSuppression(orgId, phone, reason)
         console.log(`[Seguridad 2A AUDIT] Registro de supresión para: ${phone} (Motivo: "${reason}", IP: ${req.socket.remoteAddress}, Time: ${new Date().toISOString()})`)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ phone, suppressed: true, reason }))
@@ -416,8 +453,14 @@ export function createAgenticServer(options?: {
         return
       }
 
-      const wasSuppressed = router.getSuppressionStore().isSuppressed(phone)
-      router.getSuppressionStore().removeSuppression(phone)
+      const orgId = String(req.headers['x-org-id'] || '')
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const wasSuppressed = router.getSuppressionStore().isSuppressed(orgId, phone)
+      router.getSuppressionStore().removeSuppression(orgId, phone)
       console.log(`[Seguridad 2A AUDIT] Eliminación autorizada de supresión para: ${phone} (Estaba suprimido: ${wasSuppressed}, IP: ${req.socket.remoteAddress}, Time: ${new Date().toISOString()})`)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ phone, suppressed: false, removed: true, wasSuppressed }))
@@ -427,7 +470,13 @@ export function createAgenticServer(options?: {
     // 4. Liberación de Lock (POST /api/internal/locks/:phone/release)
     if (req.method === 'POST' && url.pathname.endsWith('/release') && url.pathname.startsWith('/api/internal/locks/')) {
       const phone = decodeURIComponent(url.pathname.replace('/api/internal/locks/', '').replace('/release', ''))
-      router.getLockManager().releaseLock(phone)
+      const orgId = String(req.headers['x-org-id'] || '')
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      router.getLockManager().releaseLock(phone, orgId)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ phone, released: true }))
       return
@@ -515,10 +564,15 @@ export function createAgenticServer(options?: {
         return
       }
       try {
-        const { phone, strategy } = JSON.parse(rb.body)
+        const { phone, strategy, orgId } = JSON.parse(rb.body)
+        if (!orgId || typeof orgId !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'orgId es obligatorio (aislamiento multi-organización)' }))
+          return
+        }
         const agent = strategy === 'least_loaded'
-          ? teamManager.assignLeastLoaded(phone)
-          : teamManager.assignRoundRobin(phone)
+          ? teamManager.assignLeastLoaded(orgId, phone)
+          : teamManager.assignRoundRobin(orgId, phone)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ assignedAgent: agent }))
       } catch (e: any) {
@@ -614,7 +668,13 @@ export function createAgenticServer(options?: {
         return
       }
       try {
-        const tx = paymentManager.createPaymentLink(JSON.parse(rb.body))
+        const parsed = JSON.parse(rb.body)
+        if (!parsed.orgId || typeof parsed.orgId !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'orgId es obligatorio: los pagos pertenecen a una organización' }))
+          return
+        }
+        const tx = paymentManager.createPaymentLink(parsed)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(tx))
       } catch (e: any) {

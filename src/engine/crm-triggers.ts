@@ -2,6 +2,8 @@ import type { DatabaseSync } from 'node:sqlite'
 import type { FlowEngine } from './flow-engine.ts'
 
 export interface StageChangeEvent {
+  /** (segunda reparación §3.A) Organización propietaria del pipeline — obligatoria. */
+  orgId: string
   clientId: string
   clientPhone: string
   clientName?: string
@@ -76,9 +78,9 @@ export class CrmTriggerListener {
       // Encolar mensaje o registrarlo en inbox
       const now = Math.floor(Date.now() / 1000)
       this.db.prepare(`
-        INSERT INTO inbox_messages (id, contact_phone, direction, text, created_at)
-        VALUES (?, ?, 'outbound', ?, ?)
-      `).run(`msg_trig_${Date.now()}`, event.clientPhone, text, now)
+        INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, created_at)
+        VALUES (?, ?, ?, 'outbound', ?, ?)
+      `).run(`msg_trig_${Date.now()}`, event.orgId, event.clientPhone, text, now)
 
       return {
         triggered: true,

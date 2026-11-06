@@ -34,7 +34,7 @@ test('SUITE: WhatsPower Studio HTTP API & Web Interface', async () => {
     const resSim = await fetch('http://localhost:3015/api/flows/simulate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...AUTH },
-      body: JSON.stringify({ phone: '+573009991122', messageText: 'precio', name: 'Simulada' })
+      body: JSON.stringify({ orgId: 'org_test', phone: '+573009991122', messageText: 'precio', name: 'Simulada' })
     })
     assert.strictEqual(resSim.status, 200)
     const simData = await resSim.json()

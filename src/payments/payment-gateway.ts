@@ -2,6 +2,7 @@ import type { DatabaseSync } from 'node:sqlite'
 import { randomUUID } from 'node:crypto'
 
 export interface CreatePaymentOptions {
+  orgId: string
   contactPhone: string
   amount: number
   currency?: string
@@ -11,6 +12,7 @@ export interface CreatePaymentOptions {
 
 export interface PaymentTransaction {
   id: string
+  orgId: string
   contactPhone: string
   amount: number
   currency: string
@@ -26,7 +28,7 @@ export interface PaymentTransaction {
  * Evento de webhook de pasarela (contrato v2 — reparación integral 2026-11-06):
  *  - eventId: identificador ÚNICO del evento de la pasarela (idempotencia durable).
  *  - amount/currency/reference: validación contra la transacción si la pasarela
- *    los envía (mismatch → rechazo sin cambio de estado).
+ *    los envía (mismatch → rechazo SIN consumir el eventId).
  */
 export interface PaymentWebhookEvent {
   eventId: string
@@ -48,6 +50,17 @@ const LEGAL_TRANSITIONS: Record<string, string[]> = {
   REJECTED: [],
 }
 
+/**
+ * PaymentGatewayManager — pagos VINCULADOS A ORGANIZACIÓN (segunda reparación).
+ * §3.D garantizado:
+ *  - El eventId SOLO se registra DENTRO de la MISMA transacción atómica que
+ *    aplica la transición de estado: un crash jamás deja un evento registrado
+ *    sin su transición (ni viceversa).
+ *  - Un evento INVÁLIDO (importe/moneda/referencia incorrectos) se rechaza ANTES
+ *    de registrar el eventId: NO consume la clave que necesita el evento válido
+ *    corregido que la pasarela reenvíe después.
+ *  - Máquina de estados legal + auditoría de cada intento.
+ */
 export class PaymentGatewayManager {
   private db: DatabaseSync
 
@@ -57,6 +70,9 @@ export class PaymentGatewayManager {
 
   createPaymentLink(opts: CreatePaymentOptions): PaymentTransaction {
     // (reparación integral) Validación server-side antes de tocar la BD:
+    if (!opts.orgId || typeof opts.orgId !== 'string') {
+      throw new Error('VALIDATION: orgId es obligatorio (los pagos pertenecen a una organización)')
+    }
     const amount = Number(opts.amount)
     if (!Number.isFinite(amount) || amount <= 0) {
       throw new Error('VALIDATION: amount debe ser un número positivo')
@@ -91,14 +107,15 @@ export class PaymentGatewayManager {
     }
 
     this.db.prepare(`
-      INSERT INTO payment_transactions (id, contact_phone, amount, currency, description, gateway, payment_link, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
-    `).run(id, opts.contactPhone, opts.amount, currency, opts.description, gateway, paymentLink, now, now)
+      INSERT INTO payment_transactions (id, organization_id, contact_phone, amount, currency, description, gateway, payment_link, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+    `).run(id, opts.orgId, opts.contactPhone, opts.amount, currency, opts.description, gateway, paymentLink, now, now)
 
     this.audit(id, null, 'PENDING', 'PAYMENT_LINK_CREATED', null)
 
     return {
       id,
+      orgId: opts.orgId,
       contactPhone: opts.contactPhone,
       amount: opts.amount,
       currency,
@@ -111,11 +128,14 @@ export class PaymentGatewayManager {
     }
   }
 
-  getTransaction(id: string): PaymentTransaction | null {
-    const row = this.db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(id) as any
+  getTransaction(id: string, orgId?: string): PaymentTransaction | null {
+    const row = (orgId
+      ? this.db.prepare('SELECT * FROM payment_transactions WHERE id = ? AND organization_id = ?').get(id, orgId)
+      : this.db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(id)) as any
     if (!row) return null
     return {
       id: row.id,
+      orgId: row.organization_id,
       contactPhone: row.contact_phone,
       amount: row.amount,
       currency: row.currency,
@@ -136,43 +156,31 @@ export class PaymentGatewayManager {
   }
 
   /**
-   * Procesa un evento de webhook de pasarela con contrato duro (reparación integral):
-   *  - Idempotencia DURABLE por eventId (payment_webhook_events UNIQUE) — repele
-   *    re-entregas y sobrevive reinicios; eventos repetidos no re-ejecutan efectos.
-   *  - Validación amount/currency/reference contra la transacción (mismatch → rechazo).
-   *  - Máquina de estados legal (solo PENDING→APPROVED|REJECTED; terminales inmutables).
-   *  - Auditoría de cada intento y cada transición.
+   * Procesa un evento de webhook de pasarela (segunda reparación §3.D):
+   *
+   *  1. Validación estructural del evento.
+   *  2. La transacción debe existir (y pertenecer a la org cuando se indica).
+   *  3. Validación de amount/currency/reference — un mismatch se rechaza SIN
+   *     registrar el eventId: la clave queda libre para el evento válido.
+   *  4. Transición legal verificada contra el estado actual.
+   *  5. UNA transacción atómica (BEGIN IMMEDIATE) registra el evento Y aplica la
+   *     transición (UPDATE condicional status='PENDING'): crash-safe y a prueba
+   *     de carreras entre réplicas. Re-entrega del mismo evento → idempotente.
    */
-  handlePaymentWebhook(event: PaymentWebhookEvent): PaymentWebhookResult {
+  handlePaymentWebhook(event: PaymentWebhookEvent, orgId?: string): PaymentWebhookResult {
     if (!event || typeof event.transactionId !== 'string' || !event.transactionId
       || (event.status !== 'APPROVED' && event.status !== 'REJECTED')
       || typeof event.eventId !== 'string' || !event.eventId) {
       return { ok: false, code: 'INVALID_EVENT', message: 'El evento exige eventId, transactionId y status APPROVED|REJECTED' }
     }
 
-    const tx = this.getTransaction(event.transactionId)
+    const tx = this.getTransaction(event.transactionId, orgId)
     if (!tx) {
       this.audit(null, null, 'UNKNOWN', 'WEBHOOK_TXN_NOT_FOUND', event.eventId)
       return { ok: false, code: 'TXN_NOT_FOUND', message: 'Transacción no encontrada' }
     }
 
-    // Idempotencia durable por eventId: re-entrega del MISMO evento → éxito sin efectos.
-    try {
-      this.db.prepare(`
-        INSERT INTO payment_webhook_events (event_id, transaction_id, status, payload_json, created_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(event.eventId, event.transactionId, event.status, JSON.stringify(event), Math.floor(Date.now() / 1000))
-    } catch {
-      const seen = this.db.prepare('SELECT transaction_id, status FROM payment_webhook_events WHERE event_id = ?').get(event.eventId) as any
-      const sameEvent = seen && seen.transaction_id === event.transactionId && seen.status === event.status
-      this.audit(event.transactionId, tx.status, tx.status, sameEvent ? 'WEBHOOK_DUPLICATE_IGNORED' : 'WEBHOOK_EVENT_ID_COLLISION', event.eventId)
-      if (sameEvent) {
-        return { ok: true, transaction: tx, idempotent: true }
-      }
-      return { ok: false, code: 'INVALID_EVENT', message: 'eventId ya registrado para otra transacción/estado (posible fraude)' }
-    }
-
-    // Validación de monto/moneda/referencia contra la transacción almacenada
+    // --- Validación de importe/moneda/referencia ANTES de consumir el eventId ---
     if (event.amount !== undefined && Number(event.amount) !== tx.amount) {
       this.audit(tx.id, tx.status, tx.status, 'WEBHOOK_AMOUNT_MISMATCH', event.eventId)
       return { ok: false, code: 'VALIDATION_MISMATCH', message: `amount ${event.amount} no coincide con la transacción (${tx.amount})` }
@@ -186,19 +194,51 @@ export class PaymentGatewayManager {
       return { ok: false, code: 'VALIDATION_MISMATCH', message: 'reference no corresponde a esta transacción' }
     }
 
-    // Máquina de estados legal
+    // --- Re-entrega legítima (lectura previa, sin consumir nada): si el MISMO
+    // eventId ya fue aplicado a ESTA transacción con ESTE estado, responder
+    // idempotente sin re-efectos (antes de evaluar la máquina de estados, pues
+    // el evento ya se aplicó y el estado actual es terminal).
+    const seen = this.db.prepare('SELECT transaction_id, status FROM payment_webhook_events WHERE event_id = ?').get(event.eventId) as any
+    if (seen) {
+      const sameEvent = seen.transaction_id === event.transactionId && seen.status === event.status
+      this.audit(tx.id, tx.status, tx.status, sameEvent ? 'WEBHOOK_DUPLICATE_IGNORED' : 'WEBHOOK_EVENT_ID_COLLISION', event.eventId)
+      if (sameEvent) {
+        return { ok: true, transaction: tx, idempotent: true }
+      }
+      return { ok: false, code: 'INVALID_EVENT', message: 'eventId ya registrado para otra transacción/estado (posible fraude)' }
+    }
+
+    // --- Transición legal verificada contra el estado vigente ---
     const allowed = LEGAL_TRANSITIONS[tx.status] || []
     if (!allowed.includes(event.status)) {
       this.audit(tx.id, tx.status, tx.status, `WEBHOOK_ILLEGAL_TRANSITION_TO_${event.status}`, event.eventId)
       return { ok: false, code: 'ILLEGAL_TRANSITION', message: `transición ${tx.status} → ${event.status} no permitida (estado terminal o ilegal)` }
     }
 
-    // (reparación integral) Transición ATÓMICA: transacción explícita + verificación
-    // de changes. Si otra réplica ganó la carrera, se relee el estado y se responde 409
-    // (la traza de dinero jamás miente).
+    // --- ATOMICO: registrar evento + transición en UNA transacción ---
     const now = Math.floor(Date.now() / 1000)
     this.db.exec('BEGIN IMMEDIATE')
     try {
+      // Idempotencia durable por eventId (UNIQUE). Si ya existía:
+      //  - misma transacción y estado → re-entrega legítima → éxito sin efectos.
+      //  - otra transacción/estado → posible fraude → rechazo.
+      try {
+        this.db.prepare(`
+          INSERT INTO payment_webhook_events (event_id, transaction_id, status, payload_json, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(event.eventId, event.transactionId, event.status, JSON.stringify(event), now)
+      } catch {
+        this.db.exec('ROLLBACK')
+        const seen = this.db.prepare('SELECT transaction_id, status FROM payment_webhook_events WHERE event_id = ?').get(event.eventId) as any
+        const sameEvent = seen && seen.transaction_id === event.transactionId && seen.status === event.status
+        const current = this.getTransaction(event.transactionId, orgId)!
+        this.audit(tx.id, current.status, current.status, sameEvent ? 'WEBHOOK_DUPLICATE_IGNORED' : 'WEBHOOK_EVENT_ID_COLLISION', event.eventId)
+        if (sameEvent) {
+          return { ok: true, transaction: current, idempotent: true }
+        }
+        return { ok: false, code: 'INVALID_EVENT', message: 'eventId ya registrado para otra transacción/estado (posible fraude)' }
+      }
+
       const upd = this.db.prepare(`
         UPDATE payment_transactions
         SET status = ?, updated_at = ?
@@ -206,8 +246,10 @@ export class PaymentGatewayManager {
       `).run(event.status, now, event.transactionId)
 
       if (Number(upd.changes) !== 1) {
+        // Otra réplica ganó la carrera: el evento NO queda registrado (rollback
+        // completo) — la pasarela puede reintentar y verá el estado real.
         this.db.exec('ROLLBACK')
-        const current = this.getTransaction(event.transactionId)!
+        const current = this.getTransaction(event.transactionId, orgId)!
         this.audit(tx.id, tx.status, current.status, 'WEBHOOK_RACE_LOST', event.eventId)
         return { ok: false, code: 'ILLEGAL_TRANSITION', message: `transición ${tx.status} → ${event.status} no aplicada (estado actual: ${current.status})` }
       }
@@ -215,11 +257,11 @@ export class PaymentGatewayManager {
       this.audit(tx.id, 'PENDING', event.status, `WEBHOOK_TRANSITION_TO_${event.status}`, event.eventId)
 
       if (event.status === 'APPROVED') {
-        // Etiquetar contacto como CLIENTE_PAGADO
+        // Etiquetar contacto como CLIENTE_PAGADO (en la org del pago)
         this.db.prepare(`
-          INSERT OR REPLACE INTO contact_tags (contact_phone, tag_name, created_at)
-          VALUES (?, 'CLIENTE_PAGADO', ?)
-        `).run(tx.contactPhone, now)
+          INSERT OR REPLACE INTO contact_tags (organization_id, contact_phone, tag_name, created_at)
+          VALUES (?, ?, 'CLIENTE_PAGADO', ?)
+        `).run(tx.orgId, tx.contactPhone, now)
       }
 
       this.db.exec('COMMIT')
@@ -228,7 +270,7 @@ export class PaymentGatewayManager {
       throw e
     }
 
-    return { ok: true, transaction: this.getTransaction(event.transactionId)! }
+    return { ok: true, transaction: this.getTransaction(event.transactionId, orgId)! }
   }
 
   /** Eventos de webhook procesados (trazabilidad de idempotencia). */

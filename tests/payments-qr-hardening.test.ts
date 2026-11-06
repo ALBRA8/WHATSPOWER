@@ -41,6 +41,7 @@ const signP = (ts: string, body: string, secret: string = PAY_SECRET) =>
 
 async function createTx(built: ReturnType<typeof boot>, amount = 150000, currency = 'COP') {
   const tx = built.paymentManager.createPaymentLink({
+    orgId: 'org_pay_test',
     contactPhone: '573000001234',
     amount,
     currency,

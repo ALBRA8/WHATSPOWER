@@ -215,7 +215,7 @@ describe('WH: endurecimiento de webhooks', () => {
         const createRes = await fetch(`${base}/api/payments/create-link`, {
           method: 'POST',
           headers: { ...AUTH_JSON },
-          body: JSON.stringify({ contactPhone: '573000001199', amount: 90000, currency: 'COP', description: 'Plan WH-06' }),
+          body: JSON.stringify({ orgId: 'org_test', contactPhone: '573000001199', amount: 90000, currency: 'COP', description: 'Plan WH-06' }),
         })
         assert.ok(createRes.status < 300, 'create-link debe funcionar con credencial válida')
         const created = await createRes.json() as any

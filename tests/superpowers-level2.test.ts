@@ -15,28 +15,28 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
     assert.strictEqual(active.length, 3)
 
     // Asignación 1 -> ag_1
-    const a1 = teamManager.assignRoundRobin('573001110001')
+    const a1 = teamManager.assignRoundRobin('org_test', '573001110001')
     assert.strictEqual(a1?.id, 'ag_1')
 
     // Asignación 2 -> ag_2
-    const a2 = teamManager.assignRoundRobin('573001110002')
+    const a2 = teamManager.assignRoundRobin('org_test', '573001110002')
     assert.strictEqual(a2?.id, 'ag_2')
 
     // Asignación 3 -> ag_3
-    const a3 = teamManager.assignRoundRobin('573001110003')
+    const a3 = teamManager.assignRoundRobin('org_test', '573001110003')
     assert.strictEqual(a3?.id, 'ag_3')
 
     // Asignación 4 (Vuelve a empezar Round-Robin) -> ag_1
-    const a4 = teamManager.assignRoundRobin('573001110004')
+    const a4 = teamManager.assignRoundRobin('org_test', '573001110004')
     assert.strictEqual(a4?.id, 'ag_1')
 
     // Contacto ya asignado devuelve el mismo asesor asignado (Sticky Assignment)
-    const a1Repeat = teamManager.assignRoundRobin('573001110001')
+    const a1Repeat = teamManager.assignRoundRobin('org_test', '573001110001')
     assert.strictEqual(a1Repeat?.id, 'ag_1')
 
     // Resolver conversación
-    teamManager.resolveAssignment('573001110001')
-    const checkResolved = teamManager.getAssignment('573001110001')
+    teamManager.resolveAssignment('org_test', '573001110001')
+    const checkResolved = teamManager.getAssignment('org_test', '573001110001')
     assert.strictEqual(checkResolved?.status, 'RESOLVED')
   })
 
@@ -93,6 +93,7 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
     const { crmTriggers, db } = createAgenticServer({ dbPath: ':memory:' })
 
     const res = await crmTriggers.handleStageChange({
+      orgId: 'org_test',
       clientId: 'cl_100',
       clientPhone: '573005556677',
       clientName: 'Mariana Gómez',
@@ -117,6 +118,7 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
     const { paymentManager, db } = createAgenticServer({ dbPath: ':memory:' })
 
     const tx = paymentManager.createPaymentLink({
+      orgId: 'org_test',
       contactPhone: '573009998877',
       amount: 250000,
       currency: 'COP',
@@ -135,7 +137,7 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
     assert.strictEqual(approvedTx?.status, 'APPROVED')
 
     // Confirmar que el contacto fue etiquetado como CLIENTE_PAGADO
-    const tagRow = db.prepare('SELECT * FROM contact_tags WHERE contact_phone = ? AND tag_name = ?').get('573009998877', 'CLIENTE_PAGADO')
+    const tagRow = db.prepare('SELECT * FROM contact_tags WHERE organization_id = ? AND contact_phone = ? AND tag_name = ?').get('org_test', '573009998877', 'CLIENTE_PAGADO')
     assert.ok(tagRow, 'El contacto debe tener la etiqueta CLIENTE_PAGADO')
   })
 })

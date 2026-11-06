@@ -196,5 +196,248 @@ export function createDatabase(dbPath?: string): DatabaseSync {
     CREATE INDEX IF NOT EXISTS idx_payment_audit_txn ON payment_audit(transaction_id);
   `)
 
+  // ============================================================
+  // v3 — AISLAMIENTO MULTI-ORG POR CLAVE COMPUESTA (segunda reparación 2026-11-06)
+  // Causa raíz corregida: el teléfono era la clave primaria GLOBAL en varias
+  // tablas — el mismo número en dos organizaciones compartía locks, sesiones,
+  // variables, etiquetas, campos y supresiones.
+  //
+  // Cada tabla de contacto se reconstruye con organization_id DENTRO de la
+  // clave primaria. Filas legacy (previas a v3) se atribuyen a '__legacy__',
+  // un espacio que NINGUNA organización real puede consultar (los orgId reales
+  // son identificadores de la plataforma) — no se inventa atribución.
+  //
+  // Rollback exacto en docs/MIGRACIONES.md (secciones por tabla).
+  // ============================================================
+  const LEGACY_ORG = '__legacy__'
+
+  function tableColumns(db: DatabaseSync, table: string): string[] {
+    return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((r) => r.name)
+  }
+  function tablePk(db: DatabaseSync, table: string): string[] {
+    return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string; pk: number }>)
+      .filter((r) => r.pk > 0)
+      .sort((a, b) => a.pk - b.pk)
+      .map((r) => r.name)
+  }
+  function columnExists(db: DatabaseSync, table: string, col: string): boolean {
+    return tableColumns(db, table).includes(col)
+  }
+
+  // 1) conversation_locks — PK pasa de (contact_phone) a (organization_id, contact_phone).
+  //    (la columna organization_id ya existía; la PK global era el fallo)
+  if (!tablePk(db, 'conversation_locks').includes('organization_id')) {
+    db.exec(`
+      ALTER TABLE conversation_locks RENAME TO conversation_locks_v2old;
+      CREATE TABLE conversation_locks (
+        contact_phone TEXT NOT NULL,
+        organization_id TEXT NOT NULL,
+        current_state TEXT NOT NULL,
+        locked_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        correlation_id TEXT NOT NULL,
+        PRIMARY KEY (organization_id, contact_phone)
+      );
+      INSERT INTO conversation_locks (contact_phone, organization_id, current_state, locked_at, expires_at, correlation_id)
+        SELECT contact_phone, organization_id, current_state, locked_at, expires_at, correlation_id FROM conversation_locks_v2old;
+      DROP TABLE conversation_locks_v2old;
+    `)
+  }
+
+  // 2) suppression_list — org-scoped: la baja de una org no silencia a la otra.
+  if (!columnExists(db, 'suppression_list', 'organization_id')) {
+    db.exec(`
+      ALTER TABLE suppression_list RENAME TO suppression_list_v2old;
+      CREATE TABLE suppression_list (
+        organization_id TEXT NOT NULL,
+        phone TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (organization_id, phone)
+      );
+      INSERT INTO suppression_list (organization_id, phone, reason, created_at)
+        SELECT '${LEGACY_ORG}', phone, reason, created_at FROM suppression_list_v2old;
+      DROP TABLE suppression_list_v2old;
+    `)
+  }
+
+  // 3) session_variables — variables de sesión por (org, contacto, clave).
+  if (!columnExists(db, 'session_variables', 'organization_id')) {
+    db.exec(`
+      ALTER TABLE session_variables RENAME TO session_variables_v2old;
+      CREATE TABLE session_variables (
+        organization_id TEXT NOT NULL,
+        contact_phone TEXT NOT NULL,
+        var_key TEXT NOT NULL,
+        var_value TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (organization_id, contact_phone, var_key)
+      );
+      INSERT INTO session_variables (organization_id, contact_phone, var_key, var_value, updated_at)
+        SELECT '${LEGACY_ORG}', contact_phone, var_key, var_value, updated_at FROM session_variables_v2old;
+      DROP TABLE session_variables_v2old;
+    `)
+  }
+
+  // 4) flow_sessions — una sesión de flujo activa POR (org, contacto).
+  if (!columnExists(db, 'flow_sessions', 'organization_id')) {
+    db.exec(`
+      ALTER TABLE flow_sessions RENAME TO flow_sessions_v2old;
+      CREATE TABLE flow_sessions (
+        organization_id TEXT NOT NULL,
+        contact_phone TEXT NOT NULL,
+        flow_id TEXT NOT NULL,
+        current_node_id TEXT NOT NULL,
+        waiting_for_input INTEGER NOT NULL DEFAULT 1,
+        context_json TEXT NOT NULL,
+        last_activity INTEGER NOT NULL,
+        PRIMARY KEY (organization_id, contact_phone)
+      );
+      INSERT INTO flow_sessions (organization_id, contact_phone, flow_id, current_node_id, waiting_for_input, context_json, last_activity)
+        SELECT '${LEGACY_ORG}', contact_phone, flow_id, current_node_id, waiting_for_input, context_json, last_activity FROM flow_sessions_v2old;
+      DROP TABLE flow_sessions_v2old;
+    `)
+  }
+
+  // 5) contact_tags — etiquetas por (org, contacto, etiqueta).
+  if (!columnExists(db, 'contact_tags', 'organization_id')) {
+    db.exec(`
+      ALTER TABLE contact_tags RENAME TO contact_tags_v2old;
+      CREATE TABLE contact_tags (
+        organization_id TEXT NOT NULL,
+        contact_phone TEXT NOT NULL,
+        tag_name TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (organization_id, contact_phone, tag_name)
+      );
+      INSERT INTO contact_tags (organization_id, contact_phone, tag_name, created_at)
+        SELECT '${LEGACY_ORG}', contact_phone, tag_name, created_at FROM contact_tags_v2old;
+      DROP TABLE contact_tags_v2old;
+    `)
+  }
+
+  // 6) contact_custom_fields — campos personalizados por (org, contacto, clave).
+  if (!columnExists(db, 'contact_custom_fields', 'organization_id')) {
+    db.exec(`
+      ALTER TABLE contact_custom_fields RENAME TO contact_custom_fields_v2old;
+      CREATE TABLE contact_custom_fields (
+        organization_id TEXT NOT NULL,
+        contact_phone TEXT NOT NULL,
+        field_key TEXT NOT NULL,
+        field_value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (organization_id, contact_phone, field_key)
+      );
+      INSERT INTO contact_custom_fields (organization_id, contact_phone, field_key, field_value, updated_at)
+        SELECT '${LEGACY_ORG}', contact_phone, field_key, field_value, updated_at FROM contact_custom_fields_v2old;
+      DROP TABLE contact_custom_fields_v2old;
+    `)
+  }
+
+  // 7) sequence_enrollments — inscripciones con org (índice de barrido por org).
+  if (!columnExists(db, 'sequence_enrollments', 'organization_id')) {
+    db.exec(`
+      ALTER TABLE sequence_enrollments RENAME TO sequence_enrollments_v2old;
+      CREATE TABLE sequence_enrollments (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        sequence_id TEXT NOT NULL,
+        contact_phone TEXT NOT NULL,
+        current_step INTEGER NOT NULL DEFAULT 1,
+        next_run_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ACTIVE',
+        UNIQUE (organization_id, sequence_id, contact_phone)
+      );
+      INSERT INTO sequence_enrollments (id, organization_id, sequence_id, contact_phone, current_step, next_run_at, status)
+        SELECT id, '${LEGACY_ORG}', sequence_id, contact_phone, current_step, next_run_at, status FROM sequence_enrollments_v2old;
+      DROP TABLE sequence_enrollments_v2old;
+      CREATE INDEX IF NOT EXISTS idx_sequence_enrollments_org_phone ON sequence_enrollments(organization_id, contact_phone);
+      CREATE INDEX IF NOT EXISTS idx_sequence_enrollments_next_run ON sequence_enrollments(status, next_run_at);
+    `)
+  }
+
+  // 8) inbox_messages — historial con org.
+  if (!columnExists(db, 'inbox_messages', 'organization_id')) {
+    db.exec(`
+      ALTER TABLE inbox_messages RENAME TO inbox_messages_v2old;
+      CREATE TABLE inbox_messages (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        contact_phone TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        text TEXT NOT NULL,
+        media_url TEXT,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, media_url, created_at)
+        SELECT id, '${LEGACY_ORG}', contact_phone, direction, text, media_url, created_at FROM inbox_messages_v2old;
+      DROP TABLE inbox_messages_v2old;
+      CREATE INDEX IF NOT EXISTS idx_inbox_messages_org_phone ON inbox_messages(organization_id, contact_phone, created_at);
+    `)
+  }
+
+  // 9) agent_assignments — asignación de agente POR (org, contacto).
+  if (!columnExists(db, 'agent_assignments', 'organization_id')) {
+    db.exec(`
+      ALTER TABLE agent_assignments RENAME TO agent_assignments_v2old;
+      CREATE TABLE agent_assignments (
+        organization_id TEXT NOT NULL,
+        contact_phone TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        assigned_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'OPEN',
+        PRIMARY KEY (organization_id, contact_phone)
+      );
+      INSERT INTO agent_assignments (organization_id, contact_phone, agent_id, assigned_at, status)
+        SELECT '${LEGACY_ORG}', contact_phone, agent_id, assigned_at, status FROM agent_assignments_v2old;
+      DROP TABLE agent_assignments_v2old;
+    `)
+  }
+
+  // 10) payment_transactions — pagos con organización (vinculación evento→pago→org).
+  if (!columnExists(db, 'payment_transactions', 'organization_id')) {
+    db.exec(`
+      ALTER TABLE payment_transactions RENAME TO payment_transactions_v2old;
+      CREATE TABLE payment_transactions (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        contact_phone TEXT NOT NULL,
+        amount REAL NOT NULL,
+        currency TEXT NOT NULL DEFAULT 'COP',
+        description TEXT NOT NULL,
+        gateway TEXT NOT NULL,
+        external_id TEXT,
+        payment_link TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO payment_transactions (id, organization_id, contact_phone, amount, currency, description, gateway, external_id, payment_link, status, created_at, updated_at)
+        SELECT id, '${LEGACY_ORG}', contact_phone, amount, currency, description, gateway, external_id, payment_link, status, created_at, updated_at FROM payment_transactions_v2old;
+      DROP TABLE payment_transactions_v2old;
+      CREATE INDEX IF NOT EXISTS idx_payment_transactions_org ON payment_transactions(organization_id, created_at);
+    `)
+  }
+
+  // 11) idempotency_keys — RESERVA ATÓMICA de eventos inbound (segunda reparación §3.C):
+  //      status PROCESSING → COMPLETED | FAILED, con lease para recuperación de
+  //      procesos interrumpidos. La clave ya era org-scoped (`org::eventId`).
+  if (!columnExists(db, 'idempotency_keys', 'status')) {
+    db.exec(`
+      ALTER TABLE idempotency_keys RENAME TO idempotency_keys_v2old;
+      CREATE TABLE idempotency_keys (
+        key TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'COMPLETED', -- 'PROCESSING' | 'COMPLETED' | 'FAILED'
+        response_json TEXT,
+        created_at INTEGER NOT NULL,
+        lease_expires_at INTEGER NOT NULL
+      );
+      INSERT INTO idempotency_keys (key, status, response_json, created_at, lease_expires_at)
+        SELECT key, 'COMPLETED', response_json, processed_at, processed_at FROM idempotency_keys_v2old;
+      DROP TABLE idempotency_keys_v2old;
+      CREATE INDEX IF NOT EXISTS idx_idempotency_lease ON idempotency_keys(status, lease_expires_at);
+    `)
+  }
+
   return db
 }

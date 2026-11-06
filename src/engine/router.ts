@@ -5,6 +5,10 @@ import { SuppressionStore } from '../suppression/suppression-store.ts'
 import { evaluateDeterministicRules } from './rules.ts'
 import { FlowEngine } from './flow-engine.ts'
 
+/** Lease de reserva de idempotencia: si un proceso muere a mitad, su reserva
+ * expira y un evento de re-entrega puede tomar posesión (recuperación controlada). */
+const IDEMPOTENCY_LEASE_SECONDS = 120
+
 export class ConversationRouter {
   db: DatabaseSync
   transport: TransportSender
@@ -51,22 +55,104 @@ export class ConversationRouter {
     // orgs distintas NO colisiona — la clave incluye la organización emisora.
     const idemKey = `${orgId}::${eventId}`
 
-    // 1. DEDUPLICACIÓN E IDEMPOTENCIA
-    const cached = this.db.prepare('SELECT response_json FROM idempotency_keys WHERE key = ?').get(idemKey) as { response_json: string } | undefined
-    if (cached) {
+    // 1. RESERVA ATÓMICA DE IDEMPOTENCIA (segunda reparación §3.C)
+    // Causa raíz corregida: antes se CONSULTABA la clave, se ejecutaban efectos
+    // externos (mensajes/CRM) y la clave se guardaba AL FINAL — dos eventos
+    // concurrentes pasaban el SELECT y duplicaban efectos.
+    // Ahora: el INSERT de la reserva es la operación atómica. Solo UNA llamada
+    // obtiene 'RESERVED'; las demás reciben el resultado persistido
+    // (COMPLETED) o 'IN_FLIGHT' sin ejecutar NINGÚN efecto externo.
+    const reservation = this.reserveIdempotency(idemKey)
+    if (reservation.startsWith('COMPLETED:')) {
       try {
-        const parsed = JSON.parse(cached.response_json) as ExecutionResult
+        const parsed = JSON.parse(reservation.slice('COMPLETED:'.length)) as ExecutionResult
         return { ...parsed, actionTaken: 'deduplicated' }
       } catch {
-        // Fallback si el json estuviera corrupto
+        // JSON corrupto en la respuesta persistida: tratar como en vuelo (no duplicar efectos)
+        return { handled: false, actionTaken: 'in_flight', error: 'Evento ya procesado', correlationId }
       }
+    }
+    if (reservation === 'IN_FLIGHT') {
+      return {
+        handled: false,
+        actionTaken: 'in_flight',
+        error: 'Evento idéntico en procesamiento por otra operación (reserva atómica activa)',
+        correlationId,
+      }
+    }
+    // reservation === 'RESERVED': esta llamada es la ÚNICA ejecutora.
+    try {
+      return await this.runInboundEffects(event, idemKey, correlationId)
+    } catch (err) {
+      // Fallo de la ejecución: liberar la reserva en estado FAILED para permitir
+      // el reintento de la pasarela/remitente (la clave NO queda consumida).
+      this.failIdempotency(idemKey)
+      throw err
+    }
+  }
+
+  /**
+   * Reserva ATÓMICA de la clave de idempotencia (segunda reparación §3.C).
+   *  - INSERT único: si gana, 'RESERVED' (esta llamada ejecuta los efectos).
+   *  - Si la clave ya estaba COMPLETED, devuelve su resultado persistido.
+   *  - PROCESSING con lease vivo → 'IN_FLIGHT' (otro proceso está ejecutando).
+   *  - PROCESSING con lease VENCIDO (proceso interrumpido) → toma de posesión
+   *    atómica por UPDATE condicional → 'RESERVED'.
+   *  - FAILED (intento anterior falló) → toma de posesión → 'RESERVED'
+   *    (un evento inválido NO consume la clave de uno válido posterior).
+   */
+  private reserveIdempotency(idemKey: string): 'RESERVED' | 'IN_FLIGHT' | `COMPLETED:${string}` {
+    const now = Math.floor(Date.now() / 1000)
+    const lease = now + IDEMPOTENCY_LEASE_SECONDS
+    try {
+      this.db.prepare(`
+        INSERT INTO idempotency_keys (key, status, response_json, created_at, lease_expires_at)
+        VALUES (?, 'PROCESSING', NULL, ?, ?)
+      `).run(idemKey, now, lease)
+      return 'RESERVED'
+    } catch {
+      const row = this.db.prepare('SELECT status, response_json, lease_expires_at FROM idempotency_keys WHERE key = ?').get(idemKey) as
+        | { status: string; response_json: string | null; lease_expires_at: number }
+        | undefined
+      if (!row) return 'IN_FLIGHT'
+      if (row.status === 'COMPLETED') return `COMPLETED:${row.response_json ?? ''}`
+      if (row.status === 'PROCESSING' && row.lease_expires_at > now) return 'IN_FLIGHT'
+      // PROCESSING vencido (crash) o FAILED (intento fallido): toma de posesión atómica
+      const takeover = this.db.prepare(`
+        UPDATE idempotency_keys SET status = 'PROCESSING', response_json = NULL, lease_expires_at = ?, created_at = ?
+        WHERE key = ? AND (status = 'FAILED' OR (status = 'PROCESSING' AND lease_expires_at <= ?))
+      `).run(lease, now, idemKey, now)
+      return Number(takeover.changes) === 1 ? 'RESERVED' : 'IN_FLIGHT'
+    }
+  }
+
+  /** Persiste el resultado final del evento (estado COMPLETED, legible por réplicas). */
+  private completeIdempotency(idemKey: string, result: ExecutionResult): void {
+    this.db.prepare(`
+      UPDATE idempotency_keys SET status = 'COMPLETED', response_json = ?, lease_expires_at = (SELECT created_at FROM idempotency_keys WHERE key = ?)
+      WHERE key = ? AND status = 'PROCESSING'
+    `).run(JSON.stringify(result), idemKey, idemKey)
+  }
+
+  /** Marca la reserva como FALLIDA: la clave queda reutilizable por un reintento. */
+  private failIdempotency(idemKey: string): void {
+    this.db.prepare("UPDATE idempotency_keys SET status = 'FAILED' WHERE key = ? AND status = 'PROCESSING'").run(idemKey)
+  }
+
+  /** Ejecuta los efectos del inbound (SOLO se invoca con reserva atómica ganada). */
+  private async runInboundEffects(event: InboundEvent, idemKey: string, correlationId: string): Promise<ExecutionResult> {
+    const { orgId, contact, message } = event
+    const phone = contact.phone
+    const complete = (result: ExecutionResult): ExecutionResult => {
+      this.completeIdempotency(idemKey, result)
+      return result
     }
 
     // 2. VERIFICACIÓN DE BAJA / SUPRESIÓN
     // Si el contacto solicita baja explícita en este mensaje
     if (this.suppressionStore.isOptOutKeyword(message.text)) {
-      this.suppressionStore.addSuppression(phone, 'Solicitud voluntaria de baja')
-      this.lockManager.releaseLock(phone)
+      this.suppressionStore.addSuppression(orgId, phone, 'Solicitud voluntaria de baja')
+      this.lockManager.releaseLock(phone, orgId)
 
       const farewell = '🚫 Has sido dado de baja correctamente. No volverás a recibir mensajes automáticos de nuestra parte.'
       await this.transport.sendMessage(phone, farewell, correlationId)
@@ -75,44 +161,38 @@ export class ConversationRouter {
         await this.crm.addNote(orgId, contact.clientId, '🚫 [Baja Voluntaria]: El cliente solicitó no recibir más comunicaciones.', correlationId)
       }
 
-      const result: ExecutionResult = {
+      return complete({
         handled: true,
         actionTaken: 'suppression_opt_out',
         replyText: farewell,
         crmSynced: Boolean(contact.clientId),
         correlationId,
-      }
-      this.saveIdempotency(idemKey, result)
-      return result
+      })
     }
 
     // Si ya estaba en la lista de supresión, se descarta en silencio
-    if (this.suppressionStore.isSuppressed(phone)) {
-      const result: ExecutionResult = {
+    if (this.suppressionStore.isSuppressed(orgId, phone)) {
+      return complete({
         handled: false,
         actionTaken: 'ignored',
         error: 'Contacto suprimido por política de baja',
         correlationId,
-      }
-      this.saveIdempotency(idemKey, result)
-      return result
+      })
     }
 
     // 3. ADQUISICIÓN ATÓMICA DE LOCK
     const lockAcquisition = this.lockManager.acquireLock(phone, orgId, correlationId)
     if (!lockAcquisition.acquired) {
-      const result: ExecutionResult = {
+      return complete({
         handled: false,
         actionTaken: 'locked_busy',
         error: lockAcquisition.reason || 'Contacto ocupado en otra conversación',
         correlationId,
-      }
-      this.saveIdempotency(idemKey, result)
-      return result
+      })
     }
 
     // 4. EVALUACIÓN DE FLUJOS VISUALES (FLOW ENGINE ESTILO MANYCHAT)
-    const flowStep = await this.flowEngine.evaluateStep(phone, message.text, contact)
+    const flowStep = await this.flowEngine.evaluateStep(orgId, phone, message.text, contact)
     if (flowStep.handled) {
       let crmSynced = false
 
@@ -155,28 +235,24 @@ export class ConversationRouter {
             correlationId
           )
         }
-        const result: ExecutionResult = {
+        return complete({
           handled: true,
           actionTaken: 'handoff_human',
           replyText: lastReplyText,
           crmSynced,
           correlationId,
           flowId: flowStep.flowId,
-        }
-        this.saveIdempotency(idemKey, result)
-        return result
+        })
       }
 
-      const result: ExecutionResult = {
+      return complete({
         handled: true,
         actionTaken: 'visual_flow_execution',
         replyText: lastReplyText,
         crmSynced,
         correlationId,
         flowId: flowStep.flowId,
-      }
-      this.saveIdempotency(idemKey, result)
-      return result
+      })
     }
 
     // 5. EVALUACIÓN DETERMINISTA DE REGLAS (FALLBACK)
@@ -195,15 +271,13 @@ export class ConversationRouter {
         crmSynced = crmRes.ok
       }
 
-      const result: ExecutionResult = {
+      return complete({
         handled: true,
         actionTaken: 'handoff_human',
         replyText: reply,
         crmSynced,
         correlationId,
-      }
-      this.saveIdempotency(idemKey, result)
-      return result
+      })
     }
 
     // Caso B: Regla determinista de palabra clave (Precios / Catálogo)
@@ -211,15 +285,13 @@ export class ConversationRouter {
       const reply = ruleMatch.responseTemplate
       await this.transport.sendMessage(phone, reply, correlationId)
 
-      const result: ExecutionResult = {
+      return complete({
         handled: true,
         actionTaken: 'keyword_rule',
         replyText: reply,
         crmSynced: false,
         correlationId,
-      }
-      this.saveIdempotency(idemKey, result)
-      return result
+      })
     }
 
     // Caso C: Lead nuevo sin cliente registrado en ALBRA
@@ -231,30 +303,26 @@ export class ConversationRouter {
       const welcome = `👋 ¡Hola! Gracias por comunicarte con nosotros. Hemos registrado tu consulta. ¿En qué podemos ayudarte hoy? Escribe "PRECIO" para conocer nuestros planes o "ASESOR" para hablar con alguien del equipo.`
       await this.transport.sendMessage(phone, welcome, correlationId)
 
-      const result: ExecutionResult = {
+      return complete({
         handled: true,
         actionTaken: 'new_lead_welcome',
         replyText: welcome,
         crmSynced: crmRes.ok,
         correlationId,
-      }
-      this.saveIdempotency(idemKey, result)
-      return result
+      })
     }
 
     // Caso D: Mensaje genérico de cliente ya existente
     const genericHelp = '👋 Hemos recibido tu mensaje. Para ver nuestro catálogo escribe "CATALOGO", para precios escribe "PRECIO", o si prefieres hablar con un asesor escribe "ASESOR".'
     await this.transport.sendMessage(phone, genericHelp, correlationId)
 
-    const result: ExecutionResult = {
+    return complete({
       handled: true,
       actionTaken: 'keyword_rule',
       replyText: genericHelp,
       crmSynced: true,
       correlationId,
-    }
-    this.saveIdempotency(idemKey, result)
-    return result
+    })
   }
 
   private async ensureClient(orgId: string, contact: InboundContact, correlationId: string): Promise<string | undefined> {
@@ -266,10 +334,5 @@ export class ConversationRouter {
       return res.clientId
     }
     return undefined
-  }
-
-  private saveIdempotency(key: string, result: ExecutionResult): void {
-    const now = Math.floor(Date.now() / 1000)
-    this.db.prepare('INSERT OR REPLACE INTO idempotency_keys (key, processed_at, response_json) VALUES (?, ?, ?)').run(key, now, JSON.stringify(result))
   }
 }
