@@ -174,6 +174,33 @@ export function renderStudioHtml(): string {
   </div>
 
   <script>
+  // ============================================================
+  // (reparación integral) Puerta de clave + Bearer automático:
+  // toda llamada /api/ lleva Authorization: Bearer desde sessionStorage.
+  // La clave JAMÁS va en la URL. Sin clave, la API responde 401 fail-closed.
+  // ============================================================
+  (function () {
+    const _fetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      try {
+        const u = typeof input === 'string' ? input : (input && input.url) || '';
+        if (u.includes('/api/') && !u.includes('/api/health')) {
+          init = init || {};
+          init.headers = Object.assign({}, init.headers || {}, { 'Authorization': 'Bearer ' + (sessionStorage.getItem('wp_api_key') || '') });
+        }
+      } catch (e) {}
+      return _fetch(input, init);
+    };
+    window.addEventListener('DOMContentLoaded', function () {
+      if (!sessionStorage.getItem('wp_api_key')) {
+        const k = window.prompt('Introduce el secreto administrativo (viaja como header Bearer, jamás en la URL ni en logs):');
+        if (k) sessionStorage.setItem('wp_api_key', k);
+        else document.body.innerHTML = '<p style="font-family:system-ui;padding:24px">Se requiere el secreto administrativo para usar el studio.</p>';
+      }
+    });
+  })();
+  </script>
+  <script>
     let currentFlow = null;
     let flowsList = [];
 

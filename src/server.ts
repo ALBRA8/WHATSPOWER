@@ -128,43 +128,17 @@ export function createAgenticServer(options?: {
     // secuestrar la sesión: exige Bearer INTERNAL_API_SECRET. La página /qr sin
     // clave muestra un pedido de clave en cliente (la clave nunca va en URL).
     // ============================================================
-    if (url.pathname === '/qr' || url.pathname === '/qr/data') {
+    if (url.pathname === '/qr/data') {
+      // STRICT: el QR (permite secuestrar la sesión WhatsApp) JAMÁS sale a anónimos.
+      // GET /qr sirve solo el shell sin datos; la clave va por sessionStorage → Bearer.
       const internalSecret = process.env.INTERNAL_API_SECRET
       if (!internalSecret) {
-        res.writeHead(503, { 'Content-Type': url.pathname === '/qr' ? 'text/html; charset=utf-8' : 'application/json' })
-        res.end(url.pathname === '/qr'
-          ? '<!DOCTYPE html><html lang="es"><body style="font-family:system-ui;background:#0f172a;color:#f8fafc;display:grid;place-items:center;height:100vh"><p>Service Unavailable: INTERNAL_API_SECRET no configurado (fail-closed)</p></body></html>'
-          : JSON.stringify({ error: 'Service Unavailable: INTERNAL_API_SECRET no configurado' }))
+        res.writeHead(503, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Service Unavailable: INTERNAL_API_SECRET no configurado (fail-closed)' }))
         return
       }
       if (!isAuthorizedBearer(req.headers['authorization'], internalSecret)) {
         console.warn(`[Seguridad 2A ALERTA] Acceso a QR sin autenticación: ${req.method} ${url.pathname} (IP: ${req.socket.remoteAddress})`)
-        if (url.pathname === '/qr') {
-          res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' })
-          res.end(`<!DOCTYPE html>
-<html lang="es">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>QR protegido — CRM ALBRA</title></head>
-<body style="font-family:system-ui;background:#0f172a;color:#f8fafc;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0">
-  <div style="background:#1e293b;padding:32px;border-radius:16px;max-width:420px;text-align:center;border:1px solid #334155">
-    <h1 style="font-size:18px;margin-top:0;color:#38bdf8">Vista de QR protegida</h1>
-    <p style="font-size:13px;color:#94a3b8">Introduce el secreto administrativo (INTERNAL_API_SECRET). Se envía como header Bearer, jamás en la URL ni en logs.</p>
-    <input id="k" type="password" placeholder="Secreto administrativo" style="width:100%;padding:10px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#f8fafc;box-sizing:border-box" />
-    <button onclick="go()" style="margin-top:12px;padding:10px 18px;border-radius:8px;border:0;background:#0284c7;color:#fff;font-weight:600;cursor:pointer">Ver QR</button>
-    <p id="err" style="color:#f87171;font-size:13px;display:none"></p>
-  </div>
-<script>
-async function go(){
-  const k=document.getElementById('k').value;
-  const err=document.getElementById('err');
-  const res=await fetch('/qr/data',{headers:{'Authorization':'Bearer '+k}});
-  if(res.ok){sessionStorage.setItem('qr_key',k);window.__QR_KEY=k;document.write('<p style="color:#6ee7b7;font-family:system-ui">Clave aceptada. Recarga el visor principal con la clave activa.</p>');}
-  else{err.style.display='block';err.textContent='Clave inválida ('+res.status+')';}
-}
-</script>
-</body>
-</html>`)
-          return
-        }
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized: el QR exige autenticación administrativa (Bearer)' }))
         return
@@ -283,11 +257,11 @@ async function go(){
   </div>
 
   <script>
-    let KEY = sessionStorage.getItem('qr_key') || '';
+    let KEY = sessionStorage.getItem('wp_api_key') || sessionStorage.getItem('qr_key') || '';
     async function updateQR() {
       try {
         const res = await fetch('/qr/data', { headers: { 'Authorization': 'Bearer ' + KEY } });
-        if (res.status === 401) { sessionStorage.removeItem('qr_key'); location.reload(); return; }
+        if (res.status === 401) { sessionStorage.removeItem('wp_api_key'); sessionStorage.removeItem('qr_key'); location.reload(); return; }
         if (!res.ok) return;
         const data = await res.json();
         const container = document.getElementById('qrContainer');
@@ -317,13 +291,13 @@ async function go(){
       if (KEY) {
         const probe = await fetch('/qr/data', { headers: { 'Authorization': 'Bearer ' + KEY } });
         if (probe.ok) { startViewer(); return; }
-        sessionStorage.removeItem('qr_key'); KEY = '';
+        sessionStorage.removeItem('wp_api_key'); sessionStorage.removeItem('qr_key'); KEY = '';
       }
       document.getElementById('btn').addEventListener('click', async () => {
         const k = document.getElementById('key').value;
         const err = document.getElementById('gateErr');
         const probe = await fetch('/qr/data', { headers: { 'Authorization': 'Bearer ' + k } });
-        if (probe.ok) { KEY = k; sessionStorage.setItem('qr_key', k); startViewer(); }
+        if (probe.ok) { KEY = k; sessionStorage.setItem('wp_api_key', k); startViewer(); }
         else { err.style.display = 'block'; err.textContent = 'Clave inválida (' + probe.status + ')'; }
       });
     })();
@@ -736,7 +710,7 @@ if (process.argv[1]?.includes('server.ts')) {
   }
   const PORT = Number(process.env.PORT || 3003)
   const { server } = createAgenticServer()
-  server.listen(PORT, () => {
+  server.listen(PORT, process.env.HOST || '127.0.0.1', () => {
     console.log(`[Capa 2A] Servidor Agéntico escuchando en http://localhost:${PORT}`)
   })
 }

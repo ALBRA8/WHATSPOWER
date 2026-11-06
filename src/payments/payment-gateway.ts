@@ -56,6 +56,17 @@ export class PaymentGatewayManager {
   }
 
   createPaymentLink(opts: CreatePaymentOptions): PaymentTransaction {
+    // (reparación integral) Validación server-side antes de tocar la BD:
+    const amount = Number(opts.amount)
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new Error('VALIDATION: amount debe ser un número positivo')
+    }
+    if (opts.currency && !/^[A-Za-z]{3}$/.test(String(opts.currency))) {
+      throw new Error('VALIDATION: currency debe ser un código ISO-4217 de 3 letras')
+    }
+    if (!opts.contactPhone || String(opts.contactPhone).replace(/\D/g, '').length < 7) {
+      throw new Error('VALIDATION: contactPhone inválido')
+    }
     const id = `tx_${randomUUID().substring(0, 8)}`
     const now = Math.floor(Date.now() / 1000)
     const currency = opts.currency || 'COP'
@@ -182,21 +193,39 @@ export class PaymentGatewayManager {
       return { ok: false, code: 'ILLEGAL_TRANSITION', message: `transición ${tx.status} → ${event.status} no permitida (estado terminal o ilegal)` }
     }
 
+    // (reparación integral) Transición ATÓMICA: transacción explícita + verificación
+    // de changes. Si otra réplica ganó la carrera, se relee el estado y se responde 409
+    // (la traza de dinero jamás miente).
     const now = Math.floor(Date.now() / 1000)
-    this.db.prepare(`
-      UPDATE payment_transactions
-      SET status = ?, updated_at = ?
-      WHERE id = ? AND status = 'PENDING'
-    `).run(event.status, now, event.transactionId)
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const upd = this.db.prepare(`
+        UPDATE payment_transactions
+        SET status = ?, updated_at = ?
+        WHERE id = ? AND status = 'PENDING'
+      `).run(event.status, now, event.transactionId)
 
-    this.audit(tx.id, 'PENDING', event.status, `WEBHOOK_TRANSITION_TO_${event.status}`, event.eventId)
+      if (Number(upd.changes) !== 1) {
+        this.db.exec('ROLLBACK')
+        const current = this.getTransaction(event.transactionId)!
+        this.audit(tx.id, tx.status, current.status, 'WEBHOOK_RACE_LOST', event.eventId)
+        return { ok: false, code: 'ILLEGAL_TRANSITION', message: `transición ${tx.status} → ${event.status} no aplicada (estado actual: ${current.status})` }
+      }
 
-    if (event.status === 'APPROVED') {
-      // Etiquetar contacto como CLIENTE_PAGADO
-      this.db.prepare(`
-        INSERT OR REPLACE INTO contact_tags (contact_phone, tag_name, created_at)
-        VALUES (?, 'CLIENTE_PAGADO', ?)
-      `).run(tx.contactPhone, now)
+      this.audit(tx.id, 'PENDING', event.status, `WEBHOOK_TRANSITION_TO_${event.status}`, event.eventId)
+
+      if (event.status === 'APPROVED') {
+        // Etiquetar contacto como CLIENTE_PAGADO
+        this.db.prepare(`
+          INSERT OR REPLACE INTO contact_tags (contact_phone, tag_name, created_at)
+          VALUES (?, 'CLIENTE_PAGADO', ?)
+        `).run(tx.contactPhone, now)
+      }
+
+      this.db.exec('COMMIT')
+    } catch (e) {
+      try { this.db.exec('ROLLBACK') } catch {}
+      throw e
     }
 
     return { ok: true, transaction: this.getTransaction(event.transactionId)! }
