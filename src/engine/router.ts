@@ -22,6 +22,30 @@ class LeaseLostError extends Error {
   }
 }
 
+/**
+ * B2 — Resultado AMBIGUO del transporte (5xx/timeout/conexión cortada/respuesta
+ * ilegible): el mensaje PUDO haberse aceptado por el daemon antes del fallo.
+ * El efecto de envío queda PENDING en el journal y la clave de idempotencia
+ * UNCERTAIN: prohibido el reintento ciego; exige reconciliación explícita.
+ */
+export class AmbiguousDispatchError extends Error {
+  constructor(reason: string) {
+    super(`AMBIGUOUS_DISPATCH: resultado incierto del transporte (${reason}); el mensaje pudo haberse enviado — requiere reconciliación, no reintento ciego`)
+  }
+}
+
+/**
+ * B2 — Rechazo DEFINITIVO con evidencia fiable de NO aceptación
+ * (4xx a nivel API antes del despacho, o guard local). El efecto se marca
+ * REJECTED en el journal y la clave queda FAILED: el reintento limpio está
+ * permitido porque hay certeza de que el mensaje NO salió.
+ */
+export class TransportRejectedError extends Error {
+  constructor(reason: string) {
+    super(`TRANSPORT_REJECTED: envío no aceptado por el transporte (${reason}); evidencia fiable de no aceptación`)
+  }
+}
+
 export interface InboundProcessingMeta {
   idemKey: string
 }
@@ -247,12 +271,15 @@ export class ConversationRouter {
 
   /**
    * Marca la reserva tras un fallo: FAILED si no hubo efectos externos
-   * completados (reintento limpio permitido); UNCERTAIN si ya hubo al menos un
-   * efecto externo DONE (reintento ciego PROHIBIDO hasta reconciliación).
+   * completados NI envíos en estado ambiguo (reintento limpio permitido);
+   * UNCERTAIN si ya hubo al menos un efecto externo DONE o si queda algún
+   * envío PENDING (B2: un envío ambiguo pudo llegar al daemon aunque esta
+   * ejecución no lo sepa — reintento ciego PROHIBIDO hasta reconciliación).
    */
   private deferIdempotency(idemKey: string): void {
     const done = this.db.prepare("SELECT COUNT(*) AS n FROM inbound_effect_journal WHERE key = ? AND status = 'DONE'").get(idemKey) as { n: number }
-    const target = done.n > 0 ? 'UNCERTAIN' : 'FAILED'
+    const pendingSends = this.db.prepare("SELECT COUNT(*) AS n FROM inbound_effect_journal WHERE key = ? AND status = 'PENDING' AND effect_type = 'send_message'").get(idemKey) as { n: number }
+    const target = done.n > 0 || pendingSends.n > 0 ? 'UNCERTAIN' : 'FAILED'
     this.db.prepare("UPDATE idempotency_keys SET status = ? WHERE key = ? AND status = 'PROCESSING'").run(target, idemKey)
   }
 
@@ -270,11 +297,37 @@ export class ConversationRouter {
       this.completeIdempotency(idemKey, result)
       return result
     }
-    /** Envío externo journaleado: un mensaje ya enviado NO se reenvía nunca (4.C). */
+    /** Envío externo journaleado: un mensaje ya enviado NO se reenvía nunca (4.C).
+     * B2: el resultado del transporte se CLASIFICA — ambiguo (5xx/timeout/red/
+     * respuesta ilegible) lanza AmbiguousDispatchError (efecto PENDING + clave
+     * UNCERTAIN, sin reintentos ciegos); rechazo definitivo (4xx) lanza
+     * TransportRejectedError y marca el efecto REJECTED (evidencia fiable de
+     * no aceptación → reintento limpio permitido). Un resultado sin clasificar
+     * y fallido se asume ambiguo (fail-safe: nunca se tratará un posible envío
+     * como rechazo definitivo). */
     const send = (effectKey: string, text: string) =>
-      this.journaledEffect(idemKey, heartbeat, `send:${effectKey}`, 'send_message', () =>
-        this.transport.sendMessage(phone, text, correlationId)
-      )
+      this.journaledEffect(idemKey, heartbeat, `send:${effectKey}`, 'send_message', async () => {
+        let res: Awaited<ReturnType<typeof this.transport.sendMessage>>
+        try {
+          res = await this.transport.sendMessage(phone, text, correlationId)
+        } catch (err) {
+          // Un throw del transporte (red cortada a mitad) NO prueba que el daemon
+          // no aceptara: ambiguo, jamás rechazo definitivo.
+          throw new AmbiguousDispatchError(err instanceof Error ? err.message : String(err))
+        }
+        if (!res.ok) {
+          if (res.outcome === 'REJECTED') {
+            // Evidencia fiable de no aceptación: el efecto queda REJECTED
+            // (terminal) para no forzar UNCERTAIN ni bloquear el reintento limpio.
+            this.db.prepare(
+              "UPDATE inbound_effect_journal SET status = 'REJECTED', result_json = ?, updated_at = ? WHERE key = ? AND effect_key = ? AND status = 'PENDING'"
+            ).run(JSON.stringify(res), Math.floor(Date.now() / 1000), idemKey, `send:${effectKey}`)
+            throw new TransportRejectedError(res.error || 'rechazo sin detalle')
+          }
+          throw new AmbiguousDispatchError(res.error || 'fallo sin clasificación del transporte')
+        }
+        return res
+      })
     /** Acción CRM journaleada. */
     const crmEffect = <T>(effectKey: string, fn: () => Promise<T>) =>
       this.journaledEffect(idemKey, heartbeat, `crm:${effectKey}`, 'crm_action', fn)

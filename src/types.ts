@@ -57,8 +57,26 @@ export interface CrmActionResult {
   orgId?: string
 }
 
+/**
+ * B2 — Clasificación del resultado de un envío externo.
+ *  - 'SENT': el daemon/devolución confirma aceptación del mensaje.
+ *  - 'REJECTED': evidencia FABLE de NO aceptación (rechazo a nivel de API
+ *    antes del despacho: 400/401/403/404/413/422/429).
+ *  - 'UNCERTAIN': resultado AMBIGUO — 5xx, 408/425, timeout, conexión cortada
+ *    o respuesta ilegible: el mensaje PUDO haberse aceptado antes del fallo.
+ */
+export type DispatchOutcome = 'SENT' | 'REJECTED' | 'UNCERTAIN'
+
+export interface TransportSendResult {
+  ok: boolean
+  messageId?: string
+  error?: string
+  /** B2: clasificación del resultado. Si falta con ok=false se asume UNCERTAIN (fail-safe). */
+  outcome?: DispatchOutcome
+}
+
 export interface TransportSender {
-  sendMessage(to: string, text: string, correlationId: string): Promise<{ ok: boolean; messageId?: string; error?: string }>
+  sendMessage(to: string, text: string, correlationId: string): Promise<TransportSendResult>
 }
 
 export interface CrmClientInterface {
