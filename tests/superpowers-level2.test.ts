@@ -129,7 +129,9 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
     assert.ok(tx.paymentLink.includes('amount-in-cents=25000000'))
 
     // Simular webhook de aprobación de pago
-    const approvedTx = paymentManager.handlePaymentWebhook(tx.id, 'APPROVED')
+    const approved = paymentManager.handlePaymentWebhook({ eventId: 'evt_sp2_approve_1', transactionId: tx.id, status: 'APPROVED' })
+    assert.ok(approved.ok, 'webhook legal PENDING→APPROVED debe aceptarse')
+    const approvedTx = approved.ok ? approved.transaction : null
     assert.strictEqual(approvedTx?.status, 'APPROVED')
 
     // Confirmar que el contacto fue etiquetado como CLIENTE_PAGADO

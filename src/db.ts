@@ -166,5 +166,35 @@ export function createDatabase(dbPath?: string): DatabaseSync {
     );
   `)
 
+  // ============================================================
+  // Migraciones aditivas y REVERSIBLES (reparación integral 2026-11-06)
+  // Documentación y rollback exacto en docs/MIGRACIONES.md.
+  //  - payment_webhook_events → idempotencia DURABLE de webhooks de pasarela
+  //    (rollback: DROP TABLE payment_webhook_events;)
+  //  - payment_audit → pista de auditoría de pagos
+  //    (rollback: DROP TABLE payment_audit;)
+  // ============================================================
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS payment_webhook_events (
+      event_id TEXT PRIMARY KEY,
+      transaction_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      payload_json TEXT,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_audit (
+      id TEXT PRIMARY KEY,
+      transaction_id TEXT,
+      from_status TEXT,
+      to_status TEXT,
+      action TEXT NOT NULL,
+      event_id TEXT,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_payment_audit_txn ON payment_audit(transaction_id);
+  `)
+
   return db
 }

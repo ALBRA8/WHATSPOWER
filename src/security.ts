@@ -7,6 +7,12 @@
  *  - Los mensajes de error NUNCA revelan valores de secretos.
  */
 import { createHmac, timingSafeEqual } from 'node:crypto'
+import { DatabaseSync, StatementSync } from 'node:sqlite'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { mkdirSync } from 'node:fs'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 /**
  * Comparación en tiempo constante de dos cadenas.
@@ -33,6 +39,62 @@ export function isAuthorizedBearer(authHeader: string | undefined, expectedSecre
 
 /** Ventana de tolerancia de timestamp para webhooks (±5 minutos). */
 export const TIMESTAMP_WINDOW_MS = 300_000
+
+/**
+ * DurableReplayCache — anti-replay persistente (reparación integral 2026-11-06).
+ * SQLite (node:sqlite): sobrevive reinicios y sirve réplicas que compartan archivo.
+ * La inserción atómica por PRIMARY KEY cierra la carrera entre réplicas.
+ * Fail-fast en constructor; ':memory:' para tests.
+ */
+export class DurableReplayCache {
+  private db: DatabaseSync
+  private insertStmt: StatementSync
+  private touchStmt: StatementSync
+  private getStmt: StatementSync
+  private pruneStmt: StatementSync
+
+  constructor(path?: string) {
+    const target = path ?? process.env.REPLAY_DB_PATH ?? join(__dirname, '..', 'db', 'replay-cache.db')
+    if (target !== ':memory:') mkdirSync(dirname(target), { recursive: true })
+    this.db = new DatabaseSync(target)
+    this.db.exec(`
+      PRAGMA journal_mode=WAL;
+      CREATE TABLE IF NOT EXISTS replay_seen (
+        fingerprint TEXT PRIMARY KEY,
+        expires_at INTEGER NOT NULL
+      );
+    `)
+    this.insertStmt = this.db.prepare('INSERT INTO replay_seen (fingerprint, expires_at) VALUES (?, ?)')
+    this.touchStmt = this.db.prepare('INSERT OR REPLACE INTO replay_seen (fingerprint, expires_at) VALUES (?, ?)')
+    this.getStmt = this.db.prepare('SELECT expires_at FROM replay_seen WHERE fingerprint = ?')
+    this.pruneStmt = this.db.prepare('DELETE FROM replay_seen WHERE expires_at < ?')
+  }
+
+  public register(fingerprint: string, ttlMs: number = TIMESTAMP_WINDOW_MS * 2): boolean {
+    const now = Date.now()
+    const expiresAt = now + ttlMs
+    try {
+      this.insertStmt.run(fingerprint, expiresAt)
+      return true
+    } catch {
+      const row = this.getStmt.get(fingerprint) as { expires_at: number } | undefined
+      if (row && row.expires_at > now) return false
+      this.touchStmt.run(fingerprint, expiresAt)
+      return true
+    } finally {
+      this.pruneStmt.run(now)
+    }
+  }
+
+  public get size(): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM replay_seen').get() as { n: number }
+    return row.n
+  }
+
+  public close(): void {
+    this.db.close()
+  }
+}
 
 /** Caché anti-replay en memoria: huellas de peticiones ya vistas y su expiración. */
 export class ReplayCache {
@@ -63,22 +125,43 @@ export interface HmacCheckResult {
 }
 
 /**
- * Verificación dura de webhook: firma HMAC-SHA256 obligatoria + timestamp obligatorio
- * dentro de ventana + caché anti-replay. Comparaciones timing-safe.
+ * Firma canonical v2 (reparación integral 2026-11-06): HMAC-SHA256 sobre
+ * `${orgId}.${timestamp}.${rawBody}` (orgId vacío cuando no aplica).
+ * El timestamp y la organización quedan LIGADOS a la firma: no pueden
+ * sustituirse sin romperla (cierra el replay con timestamp fresco de la v1).
+ */
+export function signWebhookPayload(timestamp: string | number, rawBody: string, secret: string, org: string = ''): string {
+  const canonical = `${org ? org + '.' : ''}${String(timestamp)}.${rawBody}`
+  return createHmac('sha256', secret).update(canonical).digest('hex')
+}
+
+/** Expande "actual|previo" en lista de secretos válidos (rotación sin interrupción). */
+export function expandSecretEntry(entry: string): string[] {
+  return entry.split('|').map((s) => s.trim()).filter(Boolean)
+}
+
+/**
+ * Verificación dura de webhook v2: firma HMAC-SHA256 obligatoria (ligada a
+ * timestamp y organización) + timestamp dentro de ventana + caché anti-replay.
+ * Comparaciones timing-safe; acepta varios secretos (rotación "actual|previo").
  *
  * Formato esperado:
- *   x-signature-sha256: <hex hmac sha256 del body crudo>
+ *   x-signature-sha256: hex(HMAC-SHA256(secreto, `${orgId}.${timestamp}.${rawBody}`))
  *   x-timestamp: <epoch ms>
  */
 export function checkWebhookSecurity(
   rawBody: string,
   signature: string | undefined,
   timestamp: string | undefined,
-  secret: string | undefined,
-  replay: ReplayCache,
+  secrets: string | string[] | undefined,
+  replay: ReplayCache | DurableReplayCache,
   now: number = Date.now(),
+  org: string = '',
 ): HmacCheckResult {
-  if (!secret) {
+  const secretList = (Array.isArray(secrets) ? secrets : [secrets])
+    .flatMap((s) => (typeof s === 'string' ? expandSecretEntry(s) : []))
+    .filter(Boolean)
+  if (secretList.length === 0) {
     return { ok: false, status: 503, error: 'Service Unavailable: secreto de webhook no configurado' }
   }
   if (!signature || !timestamp) {
@@ -88,11 +171,18 @@ export function checkWebhookSecurity(
   if (!Number.isFinite(reqTime) || Math.abs(now - reqTime) > TIMESTAMP_WINDOW_MS) {
     return { ok: false, status: 401, error: 'Timestamp expirado o fuera de ventana de tolerancia (replay protection)' }
   }
-  const expected = createHmac('sha256', secret).update(rawBody).digest('hex')
-  if (!safeEqual(expected, signature)) {
+  let matched: string | null = null
+  for (const secret of secretList) {
+    const expected = signWebhookPayload(timestamp, rawBody, secret, org)
+    if (safeEqual(expected, signature)) {
+      matched = expected
+      break
+    }
+  }
+  if (!matched) {
     return { ok: false, status: 401, error: 'Firma HMAC inválida' }
   }
-  if (!replay.register(`${reqTime}:${expected}`)) {
+  if (!replay.register(`${org}\u0000${reqTime}:${matched}`)) {
     return { ok: false, status: 401, error: 'Petición duplicada (replay detectado)' }
   }
   return { ok: true, status: 200 }
