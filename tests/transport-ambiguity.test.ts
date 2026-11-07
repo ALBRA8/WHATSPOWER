@@ -15,8 +15,10 @@
  *  T-B2-03  Envío ambiguo (502) con router real: la clave queda UNCERTAIN,
  *           el reingreso del mismo evento NO reintenta a ciegas
  *           ('uncertain_needs_reconciliation') y NO re-invoca al transporte.
- *  T-B2-04  Reconciliación explícita tras ambigüedad: re-ejecuta SOLO el envío
- *           pendiente, exactamente UNA vez; clave → COMPLETED.
+ *  T-B2-04  Reconciliación tras ambigüedad: SIN confirmación NO reenvía
+ *           (el 502 pudo ser aceptación) — devuelve evidencia y la clave
+ *           sigue UNCERTAIN; sólo con confirmResend explícita hay UN reenvío
+ *           y la clave → COMPLETED (modelo at-least-once, sin exactly-once).
  *  T-B2-05  Rechazo DEFINITIVO (400): clave FAILED (no UNCERTAIN), efecto
  *           REJECTED, y el reintento limpio re-ejecuta el envío una vez.
  *  T-B2-06  Fallo SIN clasificar (ok:false sin outcome) → se asume ambiguo
@@ -210,9 +212,9 @@ test('T-B2-03: 502 tras posible aceptación → clave UNCERTAIN; el reingreso NO
 })
 
 // ---------------------------------------------------------------------------
-// T-B2-04: reconciliación explícita tras ambigüedad → exactamente un envío
+// T-B2-04: reconciliación tras ambigüedad → con evidencia y sin reenvío automático
 // ---------------------------------------------------------------------------
-test('T-B2-04: reconciliar tras ambigüedad re-ejecuta SOLO el envío pendiente, una vez', async () => {
+test('T-B2-04: reconciliar tras ambigüedad NO reenvía sin confirmación; con confirmResend hay UN solo reenvío', async () => {
   const transport = new ScriptedTransport([AMBIGUOUS_502, SENT_OK(2)])
   const crm = new RecordingCrm()
   const { db, router } = bootRouter(transport, crm)
@@ -222,16 +224,34 @@ test('T-B2-04: reconciliar tras ambigüedad re-ejecuta SOLO el envío pendiente,
   await assert.rejects(() => router.processInbound(ev), /AMBIGUOUS_DISPATCH/)
   assert.equal(transport.dispatched.length, 0, 'un 502 sin confirmación no registra despacho confirmado')
 
-  // Reconciliación EXPLÍCITA (nunca automática): el transporte ya responde bien.
-  const result = await router.reconcileEvent('org_x::evt_b2_2')
-  assert.ok(result)
-  assert.equal(result?.handled, true)
+  // Reconciliación EXPLÍCITA sin confirmación de no llegada: el 502 pudo ser
+  // una aceptación perdida — reenviar sería una DUPLICACIÓN potencial.
+  // Debe fallar de forma segura: sin reenvío, evidencia y clave UNCERTAIN.
+  const report = await router.reconcileEvent('org_x::evt_b2_2')
+  assert.ok(report)
+  assert.equal(report?.resolved, false, 'sin confirmación no puede afirmarse la entrega')
+  assert.equal(report?.requiresManualResolution, true)
+  assert.equal(transport.calls, 1, 'la reconciliación sin confirmResend JAMÁS re-invoca al transporte')
+  assert.equal(keyStatus(db, 'org_x::evt_b2_2'), 'UNCERTAIN')
+  assert.equal(report?.uncertainSends.length, 1, 'la evidencia del envío incierto queda disponible')
+
+  // Reingreso mientras tanto: sigue bloqueado, sin efectos.
+  const res = await router.processInbound(ev)
+  assert.equal(res.actionTaken, 'uncertain_needs_reconciliation')
+  assert.equal(transport.calls, 1)
+
+  // Resolución CON evidencia (el operador verificó externamente la no llegada):
+  // confirmResend autoriza EXACTAMENTE UN reenvío; la clave completa.
+  const report2 = await router.reconcileEvent('org_x::evt_b2_2', { confirmResend: true })
+  assert.ok(report2)
+  assert.equal(report2?.resolved, true)
+  assert.equal(report2?.resendAuthorized, true)
   assert.equal(transport.dispatched.length, 1, 'el mensaje se envía EXACTAMENTE una vez en total')
   assert.equal(keyStatus(db, 'org_x::evt_b2_2'), 'COMPLETED')
 
   // Un reingreso posterior tras completar la reconciliación es deduplicado.
-  const res = await router.processInbound(ev)
-  assert.equal(res.actionTaken, 'deduplicated')
+  const res3 = await router.processInbound(ev)
+  assert.equal(res3.actionTaken, 'deduplicated')
   assert.equal(transport.dispatched.length, 1)
 })
 

@@ -586,10 +586,14 @@ export function createAgenticServer(options?: {
       return
     }
 
-    // 4.bis Reconciliación de eventos UNCERTAIN (tercera reparación 4.C):
-    // POST /api/internal/idempotency/reconcile — body {key} | {all: true}.
+    // 4.bis Reconciliación de eventos UNCERTAIN (tercera reparación 4.C + B2 fase final):
+    // POST /api/internal/idempotency/reconcile — body {key} | {all: true} | {confirmResend: true}.
     // JAMÁS es un reintento ciego: re-ejecuta el ciclo reutilizando el journal
-    // (efectos DONE se saltan; ningún mensaje ya enviado se reenvía).
+    // (efectos DONE se saltan; ningún mensaje ya enviado se reenvía) y el
+    // registro durable de envíos bloquea todo re-despacho de claves
+    // IN_FLIGHT/SENT/UNCERTAIN. Sólo `confirmResend: true` — afirmación
+    // EXPLÍCITA del operador con evidencia externa de no llegada — autoriza UN
+    // reenvío por envío incierto (la entrega sigue siendo at-least-once).
     if (req.method === 'POST' && url.pathname === '/api/internal/idempotency/reconcile') {
       const rb = await readBody(req)
       if (!rb.ok) {
@@ -598,20 +602,21 @@ export function createAgenticServer(options?: {
         return
       }
       try {
-        const body = JSON.parse(rb.body || '{}') as { key?: string; all?: boolean }
+        const body = JSON.parse(rb.body || '{}') as { key?: string; all?: boolean; confirmResend?: boolean }
+        const confirmResend = body.confirmResend === true
         if (body.key && typeof body.key === 'string') {
-          const result = await router.reconcileEvent(body.key)
+          const report = await router.reconcileEvent(body.key, { confirmResend })
           res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ ok: true, key: body.key, result }))
+          res.end(JSON.stringify({ ok: true, key: body.key, result: report }))
           return
         }
         if (body.all === true) {
           const pending = router.listUncertainEvents(25)
-          const outcomes: Array<{ key: string; ok: boolean; error?: string }> = []
+          const outcomes: Array<{ key: string; ok: boolean; requiresManualResolution?: boolean; error?: string }> = []
           for (const ev of pending) {
             try {
-              await router.reconcileEvent(ev.key)
-              outcomes.push({ key: ev.key, ok: true })
+              const report = await router.reconcileEvent(ev.key, { confirmResend })
+              outcomes.push({ key: ev.key, ok: Boolean(report?.resolved), requiresManualResolution: report?.requiresManualResolution })
             } catch (e: any) {
               outcomes.push({ key: ev.key, ok: false, error: String(e?.message || e) })
             }
@@ -621,7 +626,7 @@ export function createAgenticServer(options?: {
           return
         }
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Body requerido: {key} o {all:true} (lista previa vía GET .../uncertain)' }))
+        res.end(JSON.stringify({ error: 'Body requerido: {key} o {all:true} (lista previa vía GET .../uncertain); confirmResend:true sólo con evidencia externa de no llegada' }))
       } catch (e: any) {
         res.writeHead(409, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: String(e?.message || e) }))
@@ -630,9 +635,15 @@ export function createAgenticServer(options?: {
     }
 
     // 4.ter Listado de eventos UNCERTAIN pendientes (GET /api/internal/idempotency/uncertain)
+    // B2: incluye la EVIDENCIA durable de los envíos (registro daemon_send_idempotency)
+    // para que la resolución sea documentada, no a ciegas.
     if (req.method === 'GET' && url.pathname === '/api/internal/idempotency/uncertain') {
+      const uncertain = router.listUncertainEvents(100).map((u) => ({
+        ...u,
+        evidence: router.describeUncertainEvent(u.key),
+      }))
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ uncertain: router.listUncertainEvents(100) }))
+      res.end(JSON.stringify({ uncertain }))
       return
     }
 

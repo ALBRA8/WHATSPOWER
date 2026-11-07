@@ -1,9 +1,57 @@
 # MIGRACIONES — Reparación Integral 2026-11-06 (WHATSPOWER)
 
 Rama: `fix/tercera-reparacion-integral` · Base: `fix/segunda-reparacion-integral` @ `f3f6136`
+Fase B2 (final): rama `fix/b2-uncertain-b3-org-identity`
 
 Todas las migraciones son **aditivas y reversibles**. No se modifica ni borra
 ninguna columna/tabla existente.
+
+## W-v5 (B2 FASE FINAL) — Idempotencia durable de envíos externos por organización
+
+**Causa raíz corregida:** el daemon Baileys de Capa 1 (repo CRM-ALBRA) NO
+consume ni persiste `idempotencyKey` / `X-Correlation-Id`. Si aceptaba un
+mensaje y la respuesta se perdía antes de confirmar DONE, el journal podía
+re-ejecutar el efecto PENDING al vencer el lease → duplicado real (un daemon
+sin deduplicación reenvía).
+
+**Tabla nueva** `daemon_send_idempotency` (registro durable de intentos, este
+servicio es el ejecutor del despacho):
+
+```
+organization_id TEXT NOT NULL,
+idempotency_key TEXT NOT NULL,          -- `${correlationId}#${effecto}`
+status TEXT NOT NULL,                   -- 'IN_FLIGHT'|'SENT'|'UNCERTAIN'|'REJECTED'
+to_phone, message_text, correlation_id, daemon_message_id,
+attempt_token, attempt_count, resend_authorized_at,
+created_at, updated_at,
+PRIMARY KEY (organization_id, idempotency_key)   -- restricción única exigida por B2
++ INDEX idx_send_idem_org_corr(organization_id, correlation_id)
+```
+
+Comportamiento nuevo (ver `tests/b2-send-idempotency.test.ts`):
+
+1. El intento se registra ANTES de llamar a Baileys (`IN_FLIGHT`).
+2. Clave repetida en `IN_FLIGHT`/`SENT`/`UNCERTAIN` → se devuelve su estado y
+   NO se reenvía (sólo `REJECTED` previo permite reintento limpio).
+3. Tras caída/lease vencido, los efectos PENDING del journal pasan a
+   `UNCERTAIN` (journal y registro de envíos) y JAMÁS se re-ejecutan
+   automáticamente: exigen reconciliación con evidencia
+   (`GET /api/internal/idempotency/uncertain` ahora incluye `evidence`).
+4. `POST /api/internal/idempotency/reconcile` acepta `confirmResend: true` —
+   afirmación EXPLÍCITA del operador (con verificación externa de no llegada)
+   que autoriza UN reenvío auditado por envío incierto. La entrega sigue siendo
+   **at-least-once**: NO hay garantía exactly-once del daemon ni del proveedor.
+5. `TransportSender.sendMessage` incorpora `idempotencyKey?` (por mensaje);
+   el transporte HTTP lo envía en `X-Idempotency-Key` + cuerpo.
+
+**Rollback exacto:**
+
+```bash
+sqlite3 db/operational.db "DROP TABLE IF EXISTS daemon_send_idempotency;
+DROP INDEX IF EXISTS idx_send_idem_org_corr;"
+# y revertir el commit del contrato (el 4º parámetro de sendMessage es opcional:
+# el código previo sigue funcionando sin él)
+```
 
 ## W-v4 (TERCERA REPARACIÓN) — Configuración/catálogo por organización
 

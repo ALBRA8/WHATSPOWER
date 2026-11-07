@@ -626,5 +626,41 @@ export function createDatabase(dbPath?: string): DatabaseSync {
     );
   `)
 
+  // ============================================================
+  // v5 — B2 (fase final): IDEMPOTENCIA DURABLE DE ENVÍOS EXTERNOS
+  // Causa raíz corregida: el daemon Baileys de Capa 1 (repo CRM-ALBRA) NO
+  // consume ni persiste idempotencyKey / X-Correlation-Id, así que un envío
+  // aceptado cuya respuesta se pierde era indistinguible de un no-envío y el
+  // journal podía reejecutar el efecto PENDING al vencer el lease.
+  //
+  // Este servicio (el ejecutor del despacho en Capa 2A) registra AHORA CADA
+  // intento de envío ANTES de llamar a Baileys, con restricción única
+  // (organization_id, idempotency_key): una clave repetida en estado
+  // IN_FLIGHT / SENT / UNCERTAIN devuelve su estado registrada y JAMÁS
+  // re-despacha el mensaje (reenvío sólo con autorización explícita
+  // registrada en resend_authorized_at, y sigue siendo at-least-once).
+  //
+  // Rollback exacto: DROP TABLE daemon_send_idempotency;
+  //            DROP INDEX IF EXISTS idx_send_idem_org_corr;
+  // ============================================================
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS daemon_send_idempotency (
+      organization_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'IN_FLIGHT', -- 'IN_FLIGHT' | 'SENT' | 'UNCERTAIN' | 'REJECTED'
+      to_phone TEXT NOT NULL,
+      message_text TEXT NOT NULL,
+      correlation_id TEXT NOT NULL,
+      daemon_message_id TEXT,
+      attempt_token TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 1,
+      resend_authorized_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_send_idem_org_corr ON daemon_send_idempotency(organization_id, correlation_id);
+  `)
+
   return db
 }

@@ -76,7 +76,14 @@ export interface TransportSendResult {
 }
 
 export interface TransportSender {
-  sendMessage(to: string, text: string, correlationId: string): Promise<TransportSendResult>
+  /**
+   * B2 (fase final): `idempotencyKey` es la clave de idempotencia POR MENSAJE
+   * (distinta del correlationId del evento, que puede amparar varios mensajes).
+   * Viaja al daemon en el header X-Idempotency-Key y en el cuerpo para que el
+   * receptor pueda verificarla/aplicarla. Opcional por compatibilidad: si se
+   * omite, el transporte usa correlationId (comportamiento previo).
+   */
+  sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string): Promise<TransportSendResult>
 }
 
 export interface CrmClientInterface {

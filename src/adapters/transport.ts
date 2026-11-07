@@ -4,6 +4,8 @@ export interface DispatchedLog {
   to: string
   text: string
   correlationId: string
+  /** B2 (fase final): clave de idempotencia POR MENSAJE que acompaña al despacho. */
+  idempotencyKey?: string
   timestamp: number
 }
 
@@ -20,7 +22,7 @@ export class MockTransportSender implements TransportSender {
     this.simulateFailure = value
   }
 
-  async sendMessage(to: string, text: string, correlationId: string): Promise<TransportSendResult> {
+  async sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string): Promise<TransportSendResult> {
     if (this.simulateFailure) {
       return { ok: false, error: 'Daemon de transporte no disponible (503)', outcome: 'UNCERTAIN' }
     }
@@ -30,6 +32,7 @@ export class MockTransportSender implements TransportSender {
       to,
       text,
       correlationId,
+      idempotencyKey: idempotencyKey ?? correlationId,
       timestamp: Date.now(),
     })
 
@@ -56,11 +59,18 @@ export class MockTransportSender implements TransportSender {
  *  - Guard ALLOW_REAL_DISPATCH → 'REJECTED' (bloqueo local previo al envío:
  *    evidencia fiable de que NADA salió).
  *
- * La clave de idempotencia (correlationId) viaja SIEMPRE al daemon en el
- * header X-Correlation-Id y en el cuerpo (idempotencyKey) para que el lado
- * daemon pueda verificarla/aplicarla; esto NO convierte la entrega en
+ * La clave de idempotencia viaja SIEMPRE al daemon:
+ *  - X-Correlation-Id: correlación del EVENTO (trazabilidad).
+ *  - X-Idempotency-Key + cuerpo (idempotencyKey): clave POR MENSAJE
+ *    (B2 fase final: `${correlationId}#${efecto}`) para que el lado daemon
+ *    pueda verificarla/aplicarla.
+ *
+ * IMPORTANTE (B2, requisito 7): el daemon Baileys de Capa 1 HOY NO consume ni
+ * persiste estas claves (hallazgo B2). Esto NO convierte la entrega en
  * exactly-once: mientras el proveedor no garantice deduplicación, el modelo
- * es at-least-once + reconciliación de resultados UNCERTAIN.
+ * es AT-LEAST-ONCE + registro durable previo al envío en Capa 2A
+ * (daemon_send_idempotency, única (organization_id, idempotency_key)) +
+ * reconciliación de resultados UNCERTAIN sin reenvío automático.
  */
 export class HttpAlbraTransportSender implements TransportSender {
   crmBaseUrl: string
@@ -70,7 +80,7 @@ export class HttpAlbraTransportSender implements TransportSender {
     this.internalSecret = internalSecret
   }
 
-  async sendMessage(to: string, text: string, correlationId: string): Promise<TransportSendResult> {
+  async sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string): Promise<TransportSendResult> {
     // Salvaguarda dura (orden de cierre 2026-11-06): NINGÚN envío real sale sin
     // ALLOW_REAL_DISPATCH=true, independientemente del entorno o la URL. Fail-closed.
     if (process.env.ALLOW_REAL_DISPATCH !== 'true') {
@@ -80,6 +90,7 @@ export class HttpAlbraTransportSender implements TransportSender {
         outcome: 'REJECTED',
       }
     }
+    const sendKey = idempotencyKey ?? correlationId
     let res: Response
     try {
       res = await fetch(`${this.crmBaseUrl}/api/whatsapp/daemon-proxy`, {
@@ -88,6 +99,8 @@ export class HttpAlbraTransportSender implements TransportSender {
           'Content-Type': 'application/json',
           'X-Internal-Secret': this.internalSecret,
           'X-Correlation-Id': correlationId,
+          // B2 (fase final): clave de idempotencia POR MENSAJE en header dedicado.
+          'X-Idempotency-Key': sendKey,
         },
         body: JSON.stringify({
           path: '/send',
@@ -95,7 +108,7 @@ export class HttpAlbraTransportSender implements TransportSender {
           message: text,
           // B2: la clave de idempotencia llega explícitamente al daemon
           // (además del header) para que el receptor pueda verificarla.
-          idempotencyKey: correlationId,
+          idempotencyKey: sendKey,
         }),
       })
     } catch (err: any) {

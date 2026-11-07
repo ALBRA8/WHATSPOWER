@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import type { InboundEvent, InboundContact, ExecutionResult, TransportSender, CrmClientInterface } from '../types.ts'
 import { LockManager } from '../state/lock-manager.ts'
@@ -32,6 +32,52 @@ export class AmbiguousDispatchError extends Error {
   constructor(reason: string) {
     super(`AMBIGUOUS_DISPATCH: resultado incierto del transporte (${reason}); el mensaje pudo haberse enviado — requiere reconciliación, no reintento ciego`)
   }
+}
+
+/**
+ * B2 (fase final) — Evidencia durable de un envío externo registrada ANTES de
+ * llamar a Baileys (tabla daemon_send_idempotency, única por
+ * (organization_id, idempotency_key)). El daemon Baileys de Capa 1 no consume
+ * ni persiste la clave (hallazgo B2), así que la deduplicación fiable vive
+ * AQUÍ: una clave repetida en IN_FLIGHT/SENT/UNCERTAIN devuelve su estado y
+ * NUNCA re-despacha el mensaje.
+ */
+export interface SendAttemptRecord {
+  organization_id: string
+  idempotency_key: string
+  status: 'IN_FLIGHT' | 'SENT' | 'UNCERTAIN' | 'REJECTED'
+  to_phone: string
+  message_text: string
+  correlation_id: string
+  daemon_message_id: string | null
+  attempt_count: number
+  resend_authorized_at: number | null
+  created_at: number
+  updated_at: number
+}
+
+/** Informe de reconciliación con EVIDENCIA (B2: resolución documentada, no a ciegas). */
+export interface ReconcileReport {
+  key: string
+  /** true sólo si la clave terminó COMPLETED. */
+  resolved: boolean
+  /** true si quedan efectos/envíos sin confirmar: exige decisión humana con evidencia. */
+  requiresManualResolution: boolean
+  /** Autorización explícita de reenvío aplicada en esta reconciliación. */
+  resendAuthorized: boolean
+  /** Evidencia de envíos cuyo resultado sigue desconocido (registry UNCERTAIN/IN_FLIGHT). */
+  uncertainSends: Array<{
+    idempotencyKey: string
+    status: string
+    to: string
+    textPreview: string
+    attempts: number
+    correlationId: string
+    updatedAt: number
+  }>
+  /** Efectos del journal que siguen sin confirmar (PENDING/UNCERTAIN). */
+  pendingEffects: Array<{ effectKey: string; effectType: string; status: string }>
+  note?: string
 }
 
 /**
@@ -108,7 +154,7 @@ export class ConversationRouter {
     const idemKey = `${orgId}::${eventId}`
 
     // 1. RESERVA ATÓMICA DE IDEMPOTENCIA
-    const reservation = this.reserveIdempotency(idemKey)
+    const reservation = this.reserveIdempotency(idemKey, orgId)
     if (reservation.startsWith('COMPLETED:')) {
       try {
         const parsed = JSON.parse(reservation.slice('COMPLETED:'.length)) as ExecutionResult
@@ -126,13 +172,18 @@ export class ConversationRouter {
         correlationId,
       }
     }
-    if (reservation === 'UNCERTAIN') {
+    if (reservation === 'UNCERTAIN' || reservation === 'UNCERTAIN_RECOVERED') {
       // Resultado incierto de un intento anterior (efectos externos ya realizados):
       // NO se reintenta a ciegas — exige reconciliación (reconcileEvent).
+      // UNCERTAIN_RECOVERED: la ejecución previa MURIÓ (lease vencido) dejando
+      // efectos PENDING/UNCERTAIN — el reingreso los convirtió a UNCERTAIN con
+      // evidencia (B2: jamás se re-ejecutan automáticamente tras una caída).
       return {
         handled: false,
         actionTaken: 'uncertain_needs_reconciliation',
-        error: 'El evento tiene resultado INCIERTO de un intento previo; requiere reconciliación antes de reintentar',
+        error: reservation === 'UNCERTAIN'
+          ? 'El evento tiene resultado INCIERTO de un intento previo; requiere reconciliación antes de reintentar'
+          : 'Evento interrumpido (caída o lease vencido) con efectos no confirmados: marcados UNCERTAIN con evidencia; requiere reconciliación antes de reintentar',
         correlationId,
       }
     }
@@ -164,12 +215,20 @@ export class ConversationRouter {
    *  - INSERT único: si gana, 'RESERVED'.
    *  - COMPLETED → resultado persistido.
    *  - PROCESSING con lease vivo → 'IN_FLIGHT'.
-   *  - PROCESSING con lease VENCIDO (crash) → toma de posesión atómica → 'RESERVED'.
-   *  - FAILED (sin efectos externos realizados) → toma de posesión → 'RESERVED'.
+   *  - PROCESSING con lease VENCIDO (crash) → toma de posesión atómica:
+   *      · si el journal NO tiene efectos sin confirmar → 'RESERVED' (la caída
+   *        fue previa a cualquier efecto: re-ejecución segura).
+   *      · si hay efectos PENDING/UNCERTAIN → 'UNCERTAIN_RECOVERED' (B2): los
+   *        PENDING pasan a UNCERTAIN con evidencia y JAMÁS se re-ejecutan
+   *        automáticamente tras una caída o vencimiento del lease.
+   *  - FAILED (sin efectos externos sin confirmar) → toma de posesión → 'RESERVED'.
    *  - UNCERTAIN (efectos externos ya realizados + resultado desconocido) →
    *    'UNCERTAIN': BLOQUEADO hasta reconciliación explícita.
    */
-  private reserveIdempotency(idemKey: string): 'RESERVED' | 'IN_FLIGHT' | 'UNCERTAIN' | `COMPLETED:${string}` {
+  private reserveIdempotency(
+    idemKey: string,
+    orgId: string
+  ): 'RESERVED' | 'IN_FLIGHT' | 'UNCERTAIN' | 'UNCERTAIN_RECOVERED' | `COMPLETED:${string}` {
     const now = Math.floor(Date.now() / 1000)
     const lease = now + IDEMPOTENCY_LEASE_SECONDS
     try {
@@ -187,12 +246,62 @@ export class ConversationRouter {
       if (row.status === 'UNCERTAIN') return 'UNCERTAIN'
       if (row.status === 'PROCESSING' && row.lease_expires_at > now) return 'IN_FLIGHT'
       // PROCESSING vencido (crash) o FAILED (intento fallido sin efectos): toma de posesión atómica
+      // B2: la distincción importa — FAILED implica que la ejecución previa
+      // TERMINÓ con manejo de error (los PENDING son efectos fallidos con
+      // error conocido → reintento limpio); PROCESSING vencido implica CAÍDA
+      // (los PENDING tienen resultado DESCONOCIDO → jamás se re-ejecutan).
+      const crashed = row.status === 'PROCESSING'
       const takeover = this.db.prepare(`
         UPDATE idempotency_keys SET status = 'PROCESSING', response_json = NULL, lease_expires_at = ?, created_at = ?
         WHERE key = ? AND (status = 'FAILED' OR (status = 'PROCESSING' AND lease_expires_at <= ?))
       `).run(lease, now, idemKey, now)
-      return Number(takeover.changes) === 1 ? 'RESERVED' : 'IN_FLIGHT'
+      if (Number(takeover.changes) !== 1) return 'IN_FLIGHT'
+
+      // ============================================================
+      // B2 (requisito 4) — TRAS UNA CAÍDA O VENCIMIENTO DEL LEASE los efectos
+      // PENDING del journal JAMÁS se re-ejecutan automáticamente: el efecto
+      // pudo haber llegado al daemon antes del crash (el daemon de Capa 1 no
+      // deduplica). Pasan a UNCERTAIN (con evidencia) y exigen reconciliación.
+      // Sólo una ejecución sin efectos sin confirmar (caída previa a todo
+      // efecto) se re-ejecuta de forma segura.
+      // ============================================================
+      if (crashed) {
+        const stale = this.db.prepare(
+          "SELECT effect_key, effect_type FROM inbound_effect_journal WHERE key = ? AND status IN ('PENDING','UNCERTAIN')"
+        ).all(idemKey) as Array<{ effect_key: string; effect_type: string }>
+        if (stale.length > 0) {
+          this.db.prepare(
+            "UPDATE inbound_effect_journal SET status = 'UNCERTAIN', updated_at = ? WHERE key = ? AND status = 'PENDING'"
+          ).run(now, idemKey)
+          // Envíos huérfanos IN_FLIGHT en el registro durable → UNCERTAIN
+          // (la ejecución dueña murió sin registrar resultado: estado desconocido).
+          const corr = this.resolveCorrelationId(idemKey, orgId)
+          for (const s of stale) {
+            if (s.effect_type !== 'send_message') continue
+            const effectKey = s.effect_key.startsWith('send:') ? s.effect_key.slice('send:'.length) : s.effect_key
+            this.db.prepare(`
+              UPDATE daemon_send_idempotency SET status = 'UNCERTAIN', updated_at = ?
+              WHERE organization_id = ? AND idempotency_key = ? AND status = 'IN_FLIGHT'
+            `).run(now, orgId, `${corr}#${effectKey}`)
+          }
+          this.db.prepare("UPDATE idempotency_keys SET status = 'UNCERTAIN' WHERE key = ?").run(idemKey)
+          return 'UNCERTAIN_RECOVERED'
+        }
+      }
+      return 'RESERVED'
     }
+  }
+
+  /** correlationId del evento persistido (fallback: parte del idemKey tras `org::`). */
+  private resolveCorrelationId(idemKey: string, orgId: string): string {
+    const raw = this.db.prepare('SELECT payload_json FROM idempotency_event_payloads WHERE key = ?').get(idemKey) as { payload_json: string } | undefined
+    if (raw) {
+      try {
+        const ev = JSON.parse(raw.payload_json) as InboundEvent
+        return ev.correlationId || ev.eventId
+      } catch {}
+    }
+    return idemKey.slice(orgId.length + 2)
   }
 
   /**
@@ -218,6 +327,65 @@ export class ConversationRouter {
       lost: () => lost,
       stop: () => clearInterval(timer),
     }
+  }
+
+  /**
+   * B2 (fase final) — Reclama el intento de envío en el registro durable
+   * daemon_send_idempotency, ANTES de llamar a Baileys (requisito 2).
+   *  - Sin fila previa → INSERT IN_FLIGHT (la llamada es la dueña del intento).
+   *  - Fila previa REJECTED (evidencia fiable de no aceptación) o UNCERTAIN
+   *    con autorización EXPLÍCITA de reenvío (resend_authorized_at, sólo la
+   *    establece reconcileEvent con confirmResend) → un único reintento:
+   *    IN_FLIGHT + attempt_count+1 + autorización consumida.
+   *  - Cualquier otro estado previo (IN_FLIGHT/SENT/UNCERTAIN sin autorizar) →
+   *    { owned: false, prior }: el llamador devuelve el estado SIN reenviar
+   *    (requisito 3).
+   */
+  private claimSendAttempt(
+    orgId: string,
+    sendIdemKey: string,
+    phone: string,
+    text: string,
+    correlationId: string
+  ): { owned: boolean; prior?: string; messageId?: string | null } {
+    const now = Math.floor(Date.now() / 1000)
+    try {
+      this.db.prepare(`
+        INSERT INTO daemon_send_idempotency
+          (organization_id, idempotency_key, status, to_phone, message_text, correlation_id, attempt_token, attempt_count, created_at, updated_at)
+        VALUES (?, ?, 'IN_FLIGHT', ?, ?, ?, ?, 1, ?, ?)
+      `).run(orgId, sendIdemKey, phone, text, correlationId, randomUUID(), now, now)
+      return { owned: true }
+    } catch {
+      const row = this.db.prepare(
+        'SELECT status, daemon_message_id, resend_authorized_at FROM daemon_send_idempotency WHERE organization_id = ? AND idempotency_key = ?'
+      ).get(orgId, sendIdemKey) as { status: string; daemon_message_id: string | null; resend_authorized_at: number | null } | undefined
+      if (!row) return { owned: false, prior: undefined }
+      if (row.status === 'REJECTED' || (row.status === 'UNCERTAIN' && row.resend_authorized_at != null)) {
+        const retry = this.db.prepare(`
+          UPDATE daemon_send_idempotency
+          SET status = 'IN_FLIGHT', attempt_token = ?, attempt_count = attempt_count + 1, resend_authorized_at = NULL, updated_at = ?
+          WHERE organization_id = ? AND idempotency_key = ?
+            AND (status = 'REJECTED' OR (status = 'UNCERTAIN' AND resend_authorized_at IS NOT NULL))
+        `).run(randomUUID(), now, orgId, sendIdemKey)
+        if (Number(retry.changes) === 1) return { owned: true }
+        // Otro ejecutor ganó el reintento: devolver el estado actualizado.
+        const winner = this.db.prepare(
+          'SELECT status, daemon_message_id FROM daemon_send_idempotency WHERE organization_id = ? AND idempotency_key = ?'
+        ).get(orgId, sendIdemKey) as { status: string; daemon_message_id: string | null } | undefined
+        return { owned: false, prior: winner?.status, messageId: winner?.daemon_message_id }
+      }
+      return { owned: false, prior: row.status, messageId: row.daemon_message_id }
+    }
+  }
+
+  /** Registra el resultado del intento de envío (evidencia durable). */
+  private recordSendOutcome(orgId: string, sendIdemKey: string, status: 'SENT' | 'UNCERTAIN' | 'REJECTED', daemonMessageId?: string): void {
+    this.db.prepare(`
+      UPDATE daemon_send_idempotency
+      SET status = ?, daemon_message_id = COALESCE(?, daemon_message_id), updated_at = ?
+      WHERE organization_id = ? AND idempotency_key = ?
+    `).run(status, daemonMessageId ?? null, Math.floor(Date.now() / 1000), orgId, sendIdemKey)
   }
 
   /**
@@ -273,12 +441,13 @@ export class ConversationRouter {
    * Marca la reserva tras un fallo: FAILED si no hubo efectos externos
    * completados NI envíos en estado ambiguo (reintento limpio permitido);
    * UNCERTAIN si ya hubo al menos un efecto externo DONE o si queda algún
-   * envío PENDING (B2: un envío ambiguo pudo llegar al daemon aunque esta
-   * ejecución no lo sepa — reintento ciego PROHIBIDO hasta reconciliación).
+   * envío sin confirmar (PENDING o UNCERTAIN — B2: un envío ambiguo pudo
+   * llegar al daemon aunque esta ejecución no lo sepa — reintento ciego
+   * PROHIBIDO hasta reconciliación).
    */
   private deferIdempotency(idemKey: string): void {
     const done = this.db.prepare("SELECT COUNT(*) AS n FROM inbound_effect_journal WHERE key = ? AND status = 'DONE'").get(idemKey) as { n: number }
-    const pendingSends = this.db.prepare("SELECT COUNT(*) AS n FROM inbound_effect_journal WHERE key = ? AND status = 'PENDING' AND effect_type = 'send_message'").get(idemKey) as { n: number }
+    const pendingSends = this.db.prepare("SELECT COUNT(*) AS n FROM inbound_effect_journal WHERE key = ? AND status IN ('PENDING','UNCERTAIN') AND effect_type = 'send_message'").get(idemKey) as { n: number }
     const target = done.n > 0 || pendingSends.n > 0 ? 'UNCERTAIN' : 'FAILED'
     this.db.prepare("UPDATE idempotency_keys SET status = ? WHERE key = ? AND status = 'PROCESSING'").run(target, idemKey)
   }
@@ -298,34 +467,53 @@ export class ConversationRouter {
       return result
     }
     /** Envío externo journaleado: un mensaje ya enviado NO se reenvía nunca (4.C).
-     * B2: el resultado del transporte se CLASIFICA — ambiguo (5xx/timeout/red/
-     * respuesta ilegible) lanza AmbiguousDispatchError (efecto PENDING + clave
-     * UNCERTAIN, sin reintentos ciegos); rechazo definitivo (4xx) lanza
-     * TransportRejectedError y marca el efecto REJECTED (evidencia fiable de
-     * no aceptación → reintento limpio permitido). Un resultado sin clasificar
-     * y fallido se asume ambiguo (fail-safe: nunca se tratará un posible envío
-     * como rechazo definitivo). */
+     * B2 (fase final): el envío queda registrado ANTES de llamar a Baileys en
+     * daemon_send_idempotency (única (organization_id, idempotency_key)). Una
+     * clave repetida en IN_FLIGHT/SENT/UNCERTAIN devuelve su estado registrada
+     * y NO vuelve a invocar al transporte; sólo un REJECTED previo (evidencia
+     * fiable de no aceptación) permite el reintento limpio. El resultado del
+     * transporte se CLASIFICA — ambiguo lanza AmbiguousDispatchError (efecto
+     * PENDING + clave UNCERTAIN, sin reintentos ciegos); rechazo definitivo
+     * (4xx) lanza TransportRejectedError y marca el efecto REJECTED. Un
+     * resultado sin clasificar y fallido se asume ambiguo (fail-safe). */
     const send = (effectKey: string, text: string) =>
       this.journaledEffect(idemKey, heartbeat, `send:${effectKey}`, 'send_message', async () => {
+        const sendIdemKey = `${correlationId}#${effectKey}`
+        const claim = this.claimSendAttempt(orgId, sendIdemKey, phone, text, correlationId)
+        if (!claim.owned) {
+          // Repetición de una clave ya registrada (reingreso, reconciliación o
+          // toma de posesión tras lease vencido): se devuelve el estado
+          // registrada y JAMÁS se vuelve a despachar el mensaje.
+          if (claim.prior === 'SENT') {
+            return { ok: true, messageId: claim.messageId ?? undefined, outcome: 'SENT' as const, sendDeduplicated: true }
+          }
+          throw new AmbiguousDispatchError(
+            `SEND_ALREADY_ATTEMPTED: clave de envío ${sendIdemKey} en estado ${claim.prior ?? 'DESCONOCIDO'} — estado devuelto sin reenvío (B2)`
+          )
+        }
         let res: Awaited<ReturnType<typeof this.transport.sendMessage>>
         try {
-          res = await this.transport.sendMessage(phone, text, correlationId)
+          res = await this.transport.sendMessage(phone, text, correlationId, sendIdemKey)
         } catch (err) {
           // Un throw del transporte (red cortada a mitad) NO prueba que el daemon
           // no aceptara: ambiguo, jamás rechazo definitivo.
+          this.recordSendOutcome(orgId, sendIdemKey, 'UNCERTAIN')
           throw new AmbiguousDispatchError(err instanceof Error ? err.message : String(err))
         }
         if (!res.ok) {
           if (res.outcome === 'REJECTED') {
             // Evidencia fiable de no aceptación: el efecto queda REJECTED
             // (terminal) para no forzar UNCERTAIN ni bloquear el reintento limpio.
+            this.recordSendOutcome(orgId, sendIdemKey, 'REJECTED')
             this.db.prepare(
               "UPDATE inbound_effect_journal SET status = 'REJECTED', result_json = ?, updated_at = ? WHERE key = ? AND effect_key = ? AND status = 'PENDING'"
             ).run(JSON.stringify(res), Math.floor(Date.now() / 1000), idemKey, `send:${effectKey}`)
             throw new TransportRejectedError(res.error || 'rechazo sin detalle')
           }
+          this.recordSendOutcome(orgId, sendIdemKey, 'UNCERTAIN')
           throw new AmbiguousDispatchError(res.error || 'fallo sin clasificación del transporte')
         }
+        this.recordSendOutcome(orgId, sendIdemKey, 'SENT', res.messageId)
         return res
       })
     /** Acción CRM journaleada. */
@@ -554,14 +742,58 @@ export class ConversationRouter {
     return rows.map((r) => ({ key: r.key, createdAt: r.created_at, leaseExpiresAt: r.lease_expires_at }))
   }
 
+  /** Deriva las claves de envío (registry) de un evento desde su journal. */
+  private sendIdempotencyKeysOf(idemKey: string, orgId: string): string[] {
+    const corr = this.resolveCorrelationId(idemKey, orgId)
+    const rows = this.db.prepare(
+      "SELECT effect_key FROM inbound_effect_journal WHERE key = ? AND effect_type = 'send_message'"
+    ).all(idemKey) as Array<{ effect_key: string }>
+    return rows.map((r) => `${corr}#${r.effect_key.startsWith('send:') ? r.effect_key.slice('send:'.length) : r.effect_key}`)
+  }
+
   /**
-   * Reconcilia UN evento UNCERTAIN (nunca un reintento ciego):
-   * re-ejecuta el ciclo del evento reutilizando el journal — los efectos DONE
-   * se saltan (ningún mensaje se reenvía), los PENDING se completan y la clave
-   * termina COMPLETED con su resultado. Devuelve el resultado o null si la
-   * clave no estaba UNCERTAIN.
+   * Evidencia de envíos externos de un evento (registro durable de envíos).
+   * Para auditoría y para la resolución con evidencia de claves UNCERTAIN.
    */
-  async reconcileEvent(idemKey: string): Promise<ExecutionResult | null> {
+  describeUncertainEvent(idemKey: string): {
+    sends: Array<SendAttemptRecord>
+    pendingEffects: Array<{ effectKey: string; effectType: string; status: string }>
+  } {
+    const at = idemKey.indexOf('::')
+    const orgId = at > 0 ? idemKey.slice(0, at) : ''
+    const keys = this.sendIdempotencyKeysOf(idemKey, orgId)
+    const sends: SendAttemptRecord[] = []
+    for (const k of keys) {
+      const row = this.db.prepare(
+        'SELECT * FROM daemon_send_idempotency WHERE organization_id = ? AND idempotency_key = ?'
+      ).get(orgId, k) as SendAttemptRecord | undefined
+      if (row) sends.push(row)
+    }
+    const pendingEffects = (this.db.prepare(
+      "SELECT effect_key, effect_type, status FROM inbound_effect_journal WHERE key = ? AND status IN ('PENDING','UNCERTAIN')"
+    ).all(idemKey) as Array<{ effect_key: string; effect_type: string; status: string }>).map((r) => ({
+      effectKey: r.effect_key,
+      effectType: r.effect_type,
+      status: r.status,
+    }))
+    return { sends, pendingEffects }
+  }
+
+  /**
+   * B2 (fase final) — Reconcilia UN evento UNCERTAIN con EVIDENCIA (nunca un
+   * reintento ciego). Re-ejecuta el ciclo reutilizando el journal:
+   *  - Efectos DONE se saltan (ningún mensaje ya enviado se reenvía).
+   *  - Efectos CRM PENDING se completan (acción explícita del operador).
+   *  - Envíos con resultado desconocido (registry IN_FLIGHT/UNCERTAIN) JAMÁS
+   *    se re-despachan automáticamente: la clave vuelve a UNCERTAIN y el
+   *    informe lista la evidencia (requisito 3 y 7).
+   *  - Sólo con `confirmResend: true` (afirmación EXPLÍCITA del operador, tras
+   *    verificar externamente que el mensaje NO llegó) se autoriza UN reenvío
+   *    por envío incierto; el registro queda auditado (attempt_count) y el
+   *    modelo sigue siendo at-least-once (requisito 7: sin exactly-once).
+   * Devuelve null si la clave no estaba UNCERTAIN.
+   */
+  async reconcileEvent(idemKey: string, opts: { confirmResend?: boolean } = {}): Promise<ReconcileReport | null> {
     const now = Math.floor(Date.now() / 1000)
     const claim = this.db.prepare(`
       UPDATE idempotency_keys SET status = 'PROCESSING', response_json = NULL, lease_expires_at = ?
@@ -569,6 +801,8 @@ export class ConversationRouter {
     `).run(now + IDEMPOTENCY_LEASE_SECONDS, idemKey)
     if (Number(claim.changes) !== 1) return null
 
+    const at = idemKey.indexOf('::')
+    const orgId = at > 0 ? idemKey.slice(0, at) : ''
     // Re-construye el evento original desde el journal + contexto persistido.
     // El journal guarda las huellas de los efectos; el EVENTO completo se
     // necesita para re-ejecutar: se persiste en el primer intento.
@@ -579,15 +813,60 @@ export class ConversationRouter {
       throw new Error(`RECONCILE_IMPOSSIBLE: sin payload persistido para ${idemKey} (resolución manual requerida)`)
     }
     const event = JSON.parse(raw.payload_json) as InboundEvent
+    const correlationId = event.correlationId || event.eventId
+
+    // Autorización EXPLÍCITA de reenvío (resolución con evidencia, requisito 4):
+    // marca los envíos UNCERTAIN de ESTE evento para UN solo reintento.
+    let resendAuthorized = false
+    if (opts.confirmResend === true) {
+      const keys = this.sendIdempotencyKeysOf(idemKey, orgId)
+      for (const k of keys) {
+        const res = this.db.prepare(`
+          UPDATE daemon_send_idempotency SET resend_authorized_at = ?, updated_at = ?
+          WHERE organization_id = ? AND idempotency_key = ? AND status = 'UNCERTAIN'
+        `).run(now, now, orgId, k)
+        if (Number(res.changes) === 1) resendAuthorized = true
+      }
+    }
+
     const heartbeat = this.startLeaseHeartbeat(idemKey)
     try {
-      return await this.runInboundEffects(event, idemKey, event.correlationId || event.eventId, heartbeat, { skipLock: true })
-    } catch (err) {
+      await this.runInboundEffects(event, idemKey, correlationId, heartbeat, { skipLock: true })
+    } catch {
+      // El ciclo no pudo completarse (p.ej. envío incierto bloqueado por el
+      // registro durable): la clave vuelve a UNCERTAIN y se entrega la
+      // evidencia — NUNCA se reintenta a ciegas.
       this.deferIdempotency(idemKey)
-      throw err
     } finally {
       heartbeat.stop()
     }
+
+    const finalStatus = (this.db.prepare('SELECT status FROM idempotency_keys WHERE key = ?').get(idemKey) as { status: string } | undefined)?.status
+    const evidence = this.describeUncertainEvent(idemKey)
+    const report: ReconcileReport = {
+      key: idemKey,
+      resolved: finalStatus === 'COMPLETED',
+      requiresManualResolution: finalStatus !== 'COMPLETED',
+      resendAuthorized,
+      uncertainSends: evidence.sends
+        .filter((s) => s.status === 'UNCERTAIN' || s.status === 'IN_FLIGHT')
+        .map((s) => ({
+          idempotencyKey: s.idempotency_key,
+          status: s.status,
+          to: s.to_phone,
+          textPreview: s.message_text.slice(0, 80),
+          attempts: s.attempt_count,
+          correlationId: s.correlation_id,
+          updatedAt: s.updated_at,
+        })),
+      pendingEffects: evidence.pendingEffects,
+    }
+    if (report.resolved && resendAuthorized) {
+      report.note = 'Reenvío autorizado explícitamente aplicado: la entrega sigue siendo at-least-once (sin garantía exactly-once del proveedor).'
+    } else if (!report.resolved) {
+      report.note = 'Sin confirmación de entrega: requiere verificación humana (p.ej. en la bandeja del negocio) antes de cualquier reenvío; use confirmResend:true SÓLO con evidencia externa de no llegada.'
+    }
+    return report
   }
 
   /** Guarda el payload del evento para reconciliación posterior (4.C). */
