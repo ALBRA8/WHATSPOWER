@@ -6,7 +6,7 @@
   "description": "WHATSPOWER (Nivel 2) — Automatización Conversacional y Flujos Inteligentes para CRM ALBRA",
   "scripts": {
     "start": "node --experimental-strip-types src/server.ts",
-    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test": "node --experimental-strip-types --test --test-isolation=process tests/*.test.ts",
     "tsc": "tsc --noEmit -p tsconfig.json"
   }
 }

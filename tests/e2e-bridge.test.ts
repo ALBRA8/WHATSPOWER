@@ -43,9 +43,8 @@ class CrmAutoReplySimulator {
           message: { id: `msg_${Date.now()}`, text: message, type: 'text' },
         }
         const bodyStr = JSON.stringify(payload)
-        // Firma HMAC v2 (contrato §3): el MISMO timestamp va firmado y en la cabecera
-        const ts = String(Date.now())
-        const signature = createHmac('sha256', this.bridgeSecret).update(`${ts}.${bodyStr}`, 'utf8').digest('hex')
+        const ts = new Date().toISOString()
+        const signature = createHmac('sha256', this.bridgeSecret).update(`${ts}.${bodyStr}`).digest('hex')
 
         const res = await fetch(this.bridgeUrl, {
           method: 'POST',

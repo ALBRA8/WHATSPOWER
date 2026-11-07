@@ -2,6 +2,8 @@ import type { DatabaseSync } from 'node:sqlite'
 import type { FlowEngine } from './flow-engine.ts'
 
 export interface StageChangeEvent {
+  /** (segunda reparación §3.A) Organización propietaria del pipeline — obligatoria. */
+  orgId: string
   clientId: string
   clientPhone: string
   clientName?: string
@@ -57,7 +59,7 @@ export class CrmTriggerListener {
     })
   }
 
-  async handleStageChange(event: StageChangeEvent, orgId: string = 'default'): Promise<{
+  async handleStageChange(event: StageChangeEvent): Promise<{
     triggered: boolean
     action?: string
     messageSent?: string
@@ -73,12 +75,12 @@ export class CrmTriggerListener {
 
     if (rule.action === 'send_message' && rule.templateMessage) {
       const text = rule.templateMessage.replace(/\{\{nombre\}\}/g, contactName)
-      // Encolar mensaje o registrarlo en inbox (scoped por organización)
+      // Encolar mensaje o registrarlo en inbox
       const now = Math.floor(Date.now() / 1000)
       this.db.prepare(`
         INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, created_at)
         VALUES (?, ?, ?, 'outbound', ?, ?)
-      `).run(`msg_trig_${Date.now()}`, orgId, event.clientPhone, text, now)
+      `).run(`msg_trig_${Date.now()}`, event.orgId, event.clientPhone, text, now)
 
       return {
         triggered: true,
@@ -88,9 +90,12 @@ export class CrmTriggerListener {
     }
 
     if (rule.action === 'start_flow' && rule.targetFlowId) {
+      // (tercera reparación 4.B) El flujo debe existir EN LA ORGANIZACIÓN del
+      // evento: nunca se arranca un flujo global/de otra org por coincidencia de id.
+      const flowInOrg = this.flowEngine.getFlow(event.orgId, rule.targetFlowId)
       return {
-        triggered: true,
-        action: `start_flow:${rule.targetFlowId}`,
+        triggered: Boolean(flowInOrg),
+        action: flowInOrg ? `start_flow:${rule.targetFlowId}` : `start_flow_unavailable_in_org:${rule.targetFlowId}`,
       }
     }
 

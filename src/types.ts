@@ -39,7 +39,7 @@ export interface SuppressionEntry {
 
 export interface ExecutionResult {
   handled: boolean
-  actionTaken: 'new_lead_welcome' | 'keyword_rule' | 'handoff_human' | 'suppression_opt_out' | 'deduplicated' | 'locked_busy' | 'ignored' | 'visual_flow_execution' | 'event_in_progress'
+  actionTaken: 'new_lead_welcome' | 'keyword_rule' | 'handoff_human' | 'suppression_opt_out' | 'deduplicated' | 'locked_busy' | 'ignored' | 'visual_flow_execution' | 'in_flight' | 'uncertain_needs_reconciliation'
   replyText?: string
   crmSynced?: boolean
   error?: string
@@ -53,10 +53,37 @@ export interface CrmActionResult {
   data?: Record<string, unknown>
   clientId?: string
   error?: string
+  /** (segunda reparación §3.B) Organización que el CRM confirma haber aplicado. */
+  orgId?: string
+}
+
+/**
+ * B2 — Clasificación del resultado de un envío externo.
+ *  - 'SENT': el daemon/devolución confirma aceptación del mensaje.
+ *  - 'REJECTED': evidencia FABLE de NO aceptación (rechazo a nivel de API
+ *    antes del despacho: 400/401/403/404/413/422/429).
+ *  - 'UNCERTAIN': resultado AMBIGUO — 5xx, 408/425, timeout, conexión cortada
+ *    o respuesta ilegible: el mensaje PUDO haberse aceptado antes del fallo.
+ */
+export type DispatchOutcome = 'SENT' | 'REJECTED' | 'UNCERTAIN'
+
+export interface TransportSendResult {
+  ok: boolean
+  messageId?: string
+  error?: string
+  /** B2: clasificación del resultado. Si falta con ok=false se asume UNCERTAIN (fail-safe). */
+  outcome?: DispatchOutcome
 }
 
 export interface TransportSender {
-  sendMessage(to: string, text: string, correlationId: string): Promise<{ ok: boolean; messageId?: string; error?: string }>
+  /**
+   * B2 (fase final): `idempotencyKey` es la clave de idempotencia POR MENSAJE
+   * (distinta del correlationId del evento, que puede amparar varios mensajes).
+   * Viaja al daemon en el header X-Idempotency-Key y en el cuerpo para que el
+   * receptor pueda verificarla/aplicarla. Opcional por compatibilidad: si se
+   * omite, el transporte usa correlationId (comportamiento previo).
+   */
+  sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string): Promise<TransportSendResult>
 }
 
 export interface CrmClientInterface {

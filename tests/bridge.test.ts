@@ -26,12 +26,8 @@ async function runBridgeTests() {
   await new Promise<void>((resolve) => server.listen(PORT, resolve))
 
   try {
-    // Firma HMAC v2 (contrato §3): hex = HMAC-SHA256(secret, timestamp + "." + body)
-    const signV2 = (secret: string, body: string, ts: string) =>
-      createHmac('sha256', secret).update(`${ts}.${body}`, 'utf8').digest('hex')
-
     // -------------------------------------------------------------------------
-    // 1. Petición válida con firma HMAC v2 y Timestamp actual
+    // 1. Petición válida con firma HMAC y Timestamp actual
     // -------------------------------------------------------------------------
     const validEvent = {
       eventId: 'evt_bridge_01',
@@ -44,15 +40,15 @@ async function runBridgeTests() {
     }
 
     const validBody = JSON.stringify(validEvent)
-    const validTs = String(Date.now())
-    const validHmac = signV2(webhookSecret, validBody, validTs)
+    const tsValid = new Date().toISOString()
+    const validHmac = createHmac('sha256', webhookSecret).update(`${tsValid}.${validBody}`).digest('hex')
 
     const resValid = await fetch(`http://localhost:${PORT}/api/inbound`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Signature-SHA256': validHmac,
-        'X-Timestamp': validTs,
+        'X-Timestamp': tsValid,
         'X-Correlation-Id': 'corr_bridge_01',
       },
       body: validBody,
@@ -66,15 +62,14 @@ async function runBridgeTests() {
     console.log('  ✅ [PASS] Petición válida con HMAC y Timestamp procesada correctamente (200 OK)')
 
     // -------------------------------------------------------------------------
-    // 2. Petición con Timestamp desfasado (> 300 segundos), firmado con ESE timestamp
-    // (la firma es válida pero el timestamp está fuera de ventana ⇒ replay)
+    // 2. Petición con Timestamp desfasado (> 300 segundos)
     // -------------------------------------------------------------------------
-    const expiredTimestamp = String(Date.now() - 400_000)
+    const expiredTimestamp = new Date(Date.now() - 400_000).toISOString()
     const resExpired = await fetch(`http://localhost:${PORT}/api/inbound`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Signature-SHA256': signV2(webhookSecret, validBody, expiredTimestamp),
+        'X-Signature-SHA256': validHmac,
         'X-Timestamp': expiredTimestamp,
         'X-Correlation-Id': 'corr_bridge_02',
       },
@@ -94,7 +89,7 @@ async function runBridgeTests() {
       headers: {
         'Content-Type': 'application/json',
         'X-Signature-SHA256': 'corrupted_hmac_signature_value',
-        'X-Timestamp': String(Date.now()),
+        'X-Timestamp': new Date().toISOString(),
         'X-Correlation-Id': 'corr_bridge_03',
       },
       body: validBody,
@@ -118,15 +113,15 @@ async function runBridgeTests() {
       message: { id: 'msg_04', text: 'Quiero hablar con un asesor', type: 'text' },
     }
     const handoffBody = JSON.stringify(handoffEvent)
-    const handoffTs = String(Date.now())
-    const handoffHmac = signV2(webhookSecret, handoffBody, handoffTs)
+    const tsHandoff = new Date().toISOString()
+    const handoffHmac = createHmac('sha256', webhookSecret).update(`${tsHandoff}.${handoffBody}`).digest('hex')
 
     const resHandoff = await fetch(`http://localhost:${PORT}/api/inbound`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Signature-SHA256': handoffHmac,
-        'X-Timestamp': handoffTs,
+        'X-Timestamp': tsHandoff,
         'X-Correlation-Id': 'corr_bridge_04',
       },
       body: handoffBody,

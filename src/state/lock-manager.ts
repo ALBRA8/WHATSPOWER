@@ -4,9 +4,10 @@ import type { ConversationLock, ConversationState } from '../types.ts'
 export const LOCK_TTL_SECONDS = 900 // 15 minutos de inactividad
 
 /**
- * LockManager multi-organización (contrato v1.1.0 §9): el lock es propiedad de la
- * organización. Un teléfono compartido entre dos organizaciones NO comparte estado:
- * cada org gestiona su propio lock (fila independiente por (organization_id, phone)).
+ * LockManager — locks de conversación POR (organización, contacto).
+ * (segunda reparación §3.A) La PK es (organization_id, contact_phone): el mismo
+ * número de teléfono en dos organizaciones tiene locks COMPLETAMENTE
+ * independientes — el handoff de una org jamás bloquea a la otra.
  */
 export class LockManager {
   db: DatabaseSync
@@ -15,7 +16,7 @@ export class LockManager {
   }
 
   /**
-   * Adquisición atómica de lock con verificación de TTL, scoped por organización.
+   * Adquisición atómica de lock con verificación de TTL.
    */
   acquireLock(phone: string, orgId: string, correlationId: string): { acquired: boolean; state: ConversationState; reason?: string } {
     const now = Math.floor(Date.now() / 1000)
@@ -45,44 +46,42 @@ export class LockManager {
       }
 
       // Si el lock expiró por TTL, lo reasigna atómicamente
-      this.db.prepare('UPDATE conversation_locks SET organization_id = ?, current_state = ?, locked_at = ?, expires_at = ?, correlation_id = ? WHERE organization_id = ? AND contact_phone = ?').run(orgId, 'IN_FLOW_2A', now, expiresAt, correlationId, orgId, phone)
+      this.db.prepare('UPDATE conversation_locks SET current_state = ?, locked_at = ?, expires_at = ?, correlation_id = ? WHERE organization_id = ? AND contact_phone = ?').run('IN_FLOW_2A', now, expiresAt, correlationId, orgId, phone)
       return { acquired: true, state: 'IN_FLOW_2A' }
     }
 
-    // Nuevo lock (independiente por organización)
-    this.db.prepare('INSERT INTO conversation_locks (organization_id, contact_phone, current_state, locked_at, expires_at, correlation_id) VALUES (?, ?, ?, ?, ?, ?)').run(orgId, phone, 'IN_FLOW_2A', now, expiresAt, correlationId)
+    // Nuevo lock
+    this.db.prepare('INSERT INTO conversation_locks (contact_phone, organization_id, current_state, locked_at, expires_at, correlation_id) VALUES (?, ?, ?, ?, ?, ?)').run(phone, orgId, 'IN_FLOW_2A', now, expiresAt, correlationId)
     return { acquired: true, state: 'IN_FLOW_2A' }
   }
 
   /**
-   * Pasa el lock a estado de atención humana exclusiva.
+   * Pasa el lock a estado de atención humana exclusiva (SOLO para esta org).
    */
   setHandoff(phone: string, orgId: string, correlationId: string): void {
     const now = Math.floor(Date.now() / 1000)
     // En handoff el TTL es prolongado (24 horas) o indefinido hasta que el asesor cierre la conversación en el CRM
     const expiresAt = now + 86400
     this.db.prepare(`
-      INSERT INTO conversation_locks (organization_id, contact_phone, current_state, locked_at, expires_at, correlation_id)
-      VALUES (?, ?, ?, 'HANDOFF_HUMAN', ?, ?)
+      INSERT INTO conversation_locks (contact_phone, organization_id, current_state, locked_at, expires_at, correlation_id)
+      VALUES (?, ?, 'HANDOFF_HUMAN', ?, ?, ?)
       ON CONFLICT(organization_id, contact_phone) DO UPDATE SET
         current_state = 'HANDOFF_HUMAN',
         locked_at = excluded.locked_at,
         expires_at = excluded.expires_at,
         correlation_id = excluded.correlation_id
-    `).run(orgId, phone, now, expiresAt, correlationId)
+    `).run(phone, orgId, now, expiresAt, correlationId)
   }
 
   /**
-   * Libera el lock de un contacto tras finalizar el flujo o resolución del asesor.
-   * Solo afecta a la organización propietaria.
+   * Libera el lock de un contacto (de la ORGANIZACIÓN dada) tras finalizar el flujo o resolución del asesor.
    */
   releaseLock(phone: string, orgId: string): void {
     this.db.prepare('DELETE FROM conversation_locks WHERE organization_id = ? AND contact_phone = ?').run(orgId, phone)
   }
 
   /**
-   * Consulta el lock de un teléfono para una organización (coordinación con Capa 2B).
-   * Un lock de OTRA organización es invisible (sin oráculo: responde como libre).
+   * Consulta el lock de un teléfono DENTRO de una organización.
    */
   getLock(phone: string, orgId: string): ConversationLock | null {
     const now = Math.floor(Date.now() / 1000)

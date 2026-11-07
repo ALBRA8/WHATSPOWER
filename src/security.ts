@@ -12,8 +12,12 @@
  *  - Los mensajes de error NUNCA revelan valores de secretos; los logs jamás teléfonos completos.
  */
 import { createHmac, timingSafeEqual, createHash } from 'node:crypto'
-import type { DatabaseSync } from 'node:sqlite'
+import { DatabaseSync, StatementSync } from 'node:sqlite'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { mkdirSync } from 'node:fs'
 
+const __dirname = dirname(fileURLToPath(import.meta.url))
 /**
  * Comparación en tiempo constante de dos cadenas.
  * Evita el oracle de timing de las comparaciones `===` sobre secretos.
@@ -94,10 +98,14 @@ export function resolveAdminIdentity(
   authHeader: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
 ): IdentityResolution {
+  // (fusión, spec §3/§10) SOLO credenciales VINCULADAS a una organización
+  // (INTERNAL_API_KEYS="orgId:secreto[:rol],..."). El secreto global
+  // INTERNAL_API_SECRET JAMÁS resuelve a una organización: no es una identidad
+  // de organización (es el OPERADOR CENTRAL y solo actúa como tal en la puerta
+  // /api/*). Sin claves configuradas → 503 fail-closed.
   const { entries } = parseInternalKeys(env.INTERNAL_API_KEYS)
-  const legacy = env.INTERNAL_API_SECRET
-  if (entries.length === 0 && !legacy) {
-    return { ok: false, status: 503, error: 'Service Unavailable: INTERNAL_API_KEYS/INTERNAL_API_SECRET no configurados (fail-closed)' }
+  if (entries.length === 0) {
+    return { ok: false, status: 503, error: 'Service Unavailable: INTERNAL_API_KEYS no configurado (fail-closed)' }
   }
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return { ok: false, status: 401, error: 'Unauthorized: Missing or invalid internal secret' }
@@ -107,9 +115,6 @@ export function resolveAdminIdentity(
     if (safeEqual(presented, e.secret)) {
       return { ok: true, status: 200, identity: { orgId: e.orgId, role: e.role, source: 'keys' } }
     }
-  }
-  if (legacy && safeEqual(presented, legacy)) {
-    return { ok: true, status: 200, identity: { orgId: 'default', role: 'admin', source: 'legacy' } }
   }
   return { ok: false, status: 401, error: 'Unauthorized: Missing or invalid internal secret' }
 }
@@ -132,6 +137,83 @@ export const TIMESTAMP_WINDOW_MS = 300_000
 export function computeHmacV2(secret: string, timestamp: string, rawBody: string): string {
   return createHmac('sha256', secret).update(`${timestamp}.${rawBody}`, 'utf8').digest('hex')
 }
+/**
+ * DurableReplayCache — anti-replay persistente (reparación integral 2026-11-06).
+ * SQLite (node:sqlite): sobrevive reinicios y sirve réplicas que compartan archivo.
+ * La inserción atómica por PRIMARY KEY cierra la carrera entre réplicas.
+ * Fail-fast en constructor; ':memory:' para tests.
+ */
+export class DurableReplayCache {
+  private db: DatabaseSync
+  private insertStmt: StatementSync
+  private touchStmt: StatementSync
+  private getStmt: StatementSync
+  private pruneStmt: StatementSync
+
+  constructor(path?: string) {
+    const target = path ?? process.env.REPLAY_DB_PATH ?? join(__dirname, '..', 'db', 'replay-cache.db')
+    if (target !== ':memory:') mkdirSync(dirname(target), { recursive: true })
+    this.db = new DatabaseSync(target)
+    this.db.exec(`
+      PRAGMA journal_mode=WAL;
+      CREATE TABLE IF NOT EXISTS replay_seen (
+        fingerprint TEXT PRIMARY KEY,
+        expires_at INTEGER NOT NULL
+      );
+    `)
+    this.insertStmt = this.db.prepare('INSERT INTO replay_seen (fingerprint, expires_at) VALUES (?, ?)')
+    this.touchStmt = this.db.prepare('INSERT OR REPLACE INTO replay_seen (fingerprint, expires_at) VALUES (?, ?)')
+    this.getStmt = this.db.prepare('SELECT expires_at FROM replay_seen WHERE fingerprint = ?')
+    this.pruneStmt = this.db.prepare('DELETE FROM replay_seen WHERE expires_at < ?')
+  }
+
+  public register(fingerprint: string, ttlMs: number = TIMESTAMP_WINDOW_MS * 2): boolean {
+    const now = Date.now()
+    const expiresAt = now + ttlMs
+    try {
+      this.insertStmt.run(fingerprint, expiresAt)
+      return true
+    } catch {
+      const row = this.getStmt.get(fingerprint) as { expires_at: number } | undefined
+      if (row && row.expires_at > now) return false
+      this.touchStmt.run(fingerprint, expiresAt)
+      return true
+    } finally {
+      this.pruneStmt.run(now)
+    }
+  }
+
+  public get size(): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM replay_seen').get() as { n: number }
+    return row.n
+  }
+
+  public close(): void {
+    this.db.close()
+  }
+}
+
+/** Caché anti-replay en memoria: huellas de peticiones ya vistas y su expiración. */
+export class ReplayCache {
+  private seen = new Map<string, number>()
+
+  /** Devuelve true si la huella es NUEVA (y la registra); false si es replay. */
+  public register(fingerprint: string, ttlMs: number = TIMESTAMP_WINDOW_MS * 2): boolean {
+    this.prune()
+    if (this.seen.has(fingerprint)) return false
+    this.seen.set(fingerprint, Date.now() + ttlMs)
+    return true
+  }
+
+  private prune(): void {
+    const now = Date.now()
+    for (const [k, exp] of this.seen) if (exp < now) this.seen.delete(k)
+  }
+
+  public get size(): number {
+    return this.seen.size
+  }
+}
 
 /** Huella de replay: (timestamp exacto firmado, MAC esperada). */
 export function replayFingerprint(timestamp: string, expectedMac: string): string {
@@ -145,19 +227,41 @@ export interface HmacCheckResult {
 }
 
 /**
- * Verificación dura de webhook v2: firma HMAC-SHA256 sobre timestamp.body OBLIGATORIA +
- * timestamp en ventana ±300s + anti-replay PERSISTENTE + comparación timing-safe.
- * Se acepta prefijo "v2=" explícito o hex desnudo (transición), SIEMPRE sobre timestamp.body.
+ * Firma canonical v2 (reparación integral 2026-11-06): HMAC-SHA256 sobre
+ * `${orgId}.${timestamp}.${rawBody}` (orgId vacío cuando no aplica).
+ * El timestamp y la organización quedan LIGADOS a la firma: no pueden
+ * sustituirse sin romperla (cierra el replay con timestamp fresco de la v1).
  */
+export function signWebhookPayload(timestamp: string | number, rawBody: string, secret: string, org: string = ''): string {
+  const canonical = `${org ? org + '.' : ''}${String(timestamp)}.${rawBody}`
+  return createHmac('sha256', secret).update(canonical).digest('hex')
+}
+
+/** Expande "actual|previo" en lista de secretos válidos (rotación sin interrupción). */
+export function expandSecretEntry(entry: string): string[] {
+  return entry.split('|').map((s) => s.trim()).filter(Boolean)
+}
+
+/**
+ * Verificación dura de webhook v2: firma HMAC-SHA256 obligatoria (ligada a
+ * timestamp y organización) + timestamp dentro de ventana + caché anti-replay.
+ * Comparaciones timing-safe; acepta varios secretos (rotación "actual|previo").
+ *
+ * Formato esperado:
+ *   x-signature-sha256: hex(HMAC-SHA256(secreto, `${orgId}.${timestamp}.${rawBody}`))
+ *   x-timestamp: <epoch ms> */
 export function checkWebhookSecurity(
   rawBody: string,
   signature: string | undefined,
   timestamp: string | undefined,
-  secret: string | undefined,
-  replay: { register: (fingerprint: string) => boolean },
-  now: number = Date.now(),
+  secrets: string | string[] | undefined,
+  replay: ReplayCache | DurableReplayCache,  now: number = Date.now(),
+  org: string = '',
 ): HmacCheckResult {
-  if (!secret) {
+  const secretList = (Array.isArray(secrets) ? secrets : [secrets])
+    .flatMap((s) => (typeof s === 'string' ? expandSecretEntry(s) : []))
+    .filter(Boolean)
+  if (secretList.length === 0) {
     return { ok: false, status: 503, error: 'Service Unavailable: secreto de webhook no configurado' }
   }
   if (!signature || !timestamp) {
@@ -167,13 +271,18 @@ export function checkWebhookSecurity(
   if (!Number.isFinite(reqTime) || Math.abs(now - reqTime) > TIMESTAMP_WINDOW_MS) {
     return { ok: false, status: 401, error: 'Timestamp expirado o fuera de ventana de tolerancia (replay protection)' }
   }
-  const presented = signature.trim().replace(/^v2=/i, '')
-  const expected = computeHmacV2(secret, timestamp, rawBody)
-  if (!safeEqual(expected, presented)) {
+  let matched: string | null = null
+  for (const secret of secretList) {
+    const expected = signWebhookPayload(timestamp, rawBody, secret, org)
+    if (safeEqual(expected, signature)) {
+      matched = expected
+      break
+    }
+  }
+  if (!matched) {
     return { ok: false, status: 401, error: 'Firma HMAC inválida' }
   }
-  if (!replay.register(replayFingerprint(timestamp, expected))) {
-    return { ok: false, status: 401, error: 'Petición duplicada (replay detectado)' }
+  if (!replay.register(`${org}\u0000${reqTime}:${matched}`)) {    return { ok: false, status: 401, error: 'Petición duplicada (replay detectado)' }
   }
   return { ok: true, status: 200 }
 }
@@ -314,7 +423,7 @@ export interface RateLimitResult {
   retryAfterSec: number
 }
 
-export class RateLimiter {
+export class SlidingRateLimiter {
   private hits = new Map<string, number[]>()
 
   public check(key: string, limit: number, windowMs: number = 60_000): RateLimitResult {
@@ -397,10 +506,90 @@ export function readBody(req: import('node:http').IncomingMessage, maxBytes: num
   })
 }
 
-// ===========================================================================
-// GUARD DE ENTORNO FAIL-FAST PARA PRODUCCIÓN
-// ===========================================================================
+// ============================================================================
+// SESIÓN DE STUDIO POR COOKIE HttpOnly (tercera reparación 4.F — espejo de ULTRA)
+//
+// Causa raíz corregida: el Studio de Capa 2A guardaba el secreto administrativo
+// en sessionStorage — cualquier XSS lo leía. Ahora el navegador canjea el
+// secreto UNA vez por una cookie de sesión:
+//   - HttpOnly → invisible para JavaScript (un XSS NO puede exfiltrarla);
+//   - SameSite=Strict → no viaja en navegaciones cruzadas;
+//   - corta vida (1 h) y token HMAC stateless ligado al secreto vigente:
+//     rotar el secreto revoca todas las sesiones al instante.
+// ============================================================================
 
+export const STUDIO_SESSION_COOKIE = 'wp_2a_studio_session'
+export const STUDIO_SESSION_TTL_SECONDS = 3600
+
+function studioSessionToken(secret: string, issuedAtMs: number): string {
+  return createHmac('sha256', secret).update(`2a.${issuedAtMs}`).digest('base64url')
+}
+
+/** Emite el valor de la cookie de sesión del Studio (índice único = 0). */
+export function issueStudioSession(secret: string, nowMs: number = Date.now()): string {
+  const token = `0.${nowMs}.${studioSessionToken(secret, nowMs)}`
+  return `${STUDIO_SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${STUDIO_SESSION_TTL_SECONDS}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`
+}
+
+/** Verifica la cookie de sesión contra el secreto vigente (rotación ⇒ revocación total). */
+export function resolveStudioSession(cookieHeader: string | undefined, expectedSecret: string | undefined, nowMs: number = Date.now()): boolean {
+  if (!cookieHeader || !expectedSecret) return null as unknown as boolean
+  const cookies = cookieHeader.split(';').map((c) => c.trim())
+  const raw = cookies.find((c) => c.startsWith(`${STUDIO_SESSION_COOKIE}=`))
+  if (!raw) return false
+  const token = raw.slice(STUDIO_SESSION_COOKIE.length + 1)
+  const parts = token.split('.')
+  if (parts.length !== 3) return false
+  const [, iatStr, sig] = parts
+  const iat = Number.parseInt(iatStr, 10)
+  if (!Number.isFinite(iat)) return false
+  if (nowMs - iat > STUDIO_SESSION_TTL_SECONDS * 1000) return false
+  const expected = studioSessionToken(expectedSecret, iat)
+  const a = Buffer.from(sig)
+  const b = Buffer.from(expected)
+  if (a.length !== b.length) return false
+  return timingSafeEqual(a, b)
+}
+
+/**
+ * RateLimiter por cubo (ventana fija en memoria) para endpoints públicos
+ * (tercera reparación 4.F): mitiga abuso de /api/inbound, /api/payments/webhook
+ * y /ref/:slug. Clave = identificador (p. ej. IP o IP+ruta). En memoria por
+ * proceso: suficiente para contener rachas; el límite duro de red se hace en
+ * infraestructura (proxy) cuando existe.
+ */
+export class RateLimiter {
+  private buckets = new Map<string, { count: number; resetAt: number }>()
+  private maxPerWindow: number
+  private windowMs: number
+  private maxBuckets: number
+
+  constructor(maxPerWindow: number, windowMs: number = 60_000, maxBuckets: number = 10_000) {
+    this.maxPerWindow = maxPerWindow
+    this.windowMs = windowMs
+    this.maxBuckets = maxBuckets
+  }
+
+  /** Devuelve true si la petición está PERMITIDA. */
+  public allow(key: string, now: number = Date.now()): boolean {
+    if (this.buckets.size > this.maxBuckets) {
+      // Limpieza de seguridad si el mapa crece demasiado (abuso de claves falsas)
+      for (const [k, b] of this.buckets) if (b.resetAt <= now) this.buckets.delete(k)
+      if (this.buckets.size > this.maxBuckets) this.buckets.clear()
+    }
+    const bucket = this.buckets.get(key)
+    if (!bucket || bucket.resetAt <= now) {
+      this.buckets.set(key, { count: 1, resetAt: now + this.windowMs })
+      return true
+    }
+    bucket.count++
+    return bucket.count <= this.maxPerWindow
+  }
+
+  public get size(): number {
+    return this.buckets.size
+  }
+}
 /**
  * Guard de entorno fail-fast para producción.
  * Devuelve la lista de problemas (variables ausentes o débiles). NUNCA incluye valores.

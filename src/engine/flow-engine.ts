@@ -14,19 +14,27 @@ export class FlowEngine {
 
   constructor(db: DatabaseSync) {
     this.db = db
-    this.seedDefaultFlowIfEmpty()
+    // (tercera reparación 4.B) La seed del flujo demo ya NO es global: cada
+    // organización recibe SU copia la primera vez que consulta/evalúa flujos
+    // (ensureDefaultFlowForOrg). En el constructor no hay contexto de org.
   }
 
   // =========================================================================
-  // 1. GESTIÓN DE FLUJOS (CRUD)
+  // 1. GESTIÓN DE FLUJOS (CRUD) — TODO ESTRICTAMENTE POR ORGANIZACIÓN (4.B)
+  // La PK es (organization_id, id): un flujo de la org A es INVISIBLE e
+  // INALCANZABLE para la org B (listado, lectura, edición, borrado y
+  // ejecución incluidos).
   // =========================================================================
 
-  saveFlow(flow: FlowDefinition): void {
+  saveFlow(orgId: string, flow: FlowDefinition): void {
+    if (!orgId || typeof orgId !== 'string') {
+      throw new Error('VALIDATION: saveFlow exige organizationId (aislamiento multi-organización)')
+    }
     const now = Date.now()
     const stmt = this.db.prepare(`
-      INSERT INTO flows (id, name, trigger_keywords, is_active, graph_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
+      INSERT INTO flows (id, organization_id, name, trigger_keywords, is_active, graph_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(organization_id, id) DO UPDATE SET
         name = excluded.name,
         trigger_keywords = excluded.trigger_keywords,
         is_active = excluded.is_active,
@@ -36,6 +44,7 @@ export class FlowEngine {
 
     stmt.run(
       flow.id,
+      orgId,
       flow.name,
       JSON.stringify(flow.triggerKeywords.map((k) => k.toLowerCase().trim())),
       flow.isActive ? 1 : 0,
@@ -45,8 +54,8 @@ export class FlowEngine {
     )
   }
 
-  getFlow(id: string): FlowDefinition | null {
-    const row = this.db.prepare('SELECT * FROM flows WHERE id = ?').get(id) as
+  getFlow(orgId: string, id: string): FlowDefinition | null {
+    const row = this.db.prepare('SELECT * FROM flows WHERE organization_id = ? AND id = ?').get(orgId, id) as
       | {
           id: string
           name: string
@@ -73,8 +82,11 @@ export class FlowEngine {
     }
   }
 
-  listFlows(): FlowDefinition[] {
-    const rows = this.db.prepare('SELECT * FROM flows ORDER BY updated_at DESC').all() as Array<{
+  listFlows(orgId: string): FlowDefinition[] {
+    // (tercera reparación 4.B) La consulta de una org SIN flujos recibe SU copia
+    // del flujo demo (seed perezosa por organización; jamás comparte la ajena).
+    this.ensureDefaultFlowForOrg(orgId)
+    const rows = this.db.prepare('SELECT * FROM flows WHERE organization_id = ? ORDER BY updated_at DESC').all(orgId) as Array<{
       id: string
       name: string
       trigger_keywords: string
@@ -99,8 +111,8 @@ export class FlowEngine {
     })
   }
 
-  deleteFlow(id: string): boolean {
-    const res = this.db.prepare('DELETE FROM flows WHERE id = ?').run(id)
+  deleteFlow(orgId: string, id: string): boolean {
+    const res = this.db.prepare('DELETE FROM flows WHERE organization_id = ? AND id = ?').run(orgId, id)
     return res.changes > 0
   }
 
@@ -108,8 +120,6 @@ export class FlowEngine {
   // 2. ETIQUETAS (TAGS) Y CAMPOS PERSONALIZADOS (CUSTOM FIELDS)
   // =========================================================================
 
-  // Las etiquetas, campos y estado de conversación son propiedad de la organización
-  // (contrato v1.1.0 §9): claves compuestas (organization_id, contact_phone).
   addTag(orgId: string, phone: string, tag: string): void {
     const cleanTag = tag.trim().toLowerCase()
     this.db.prepare('INSERT OR IGNORE INTO contact_tags (organization_id, contact_phone, tag_name, created_at) VALUES (?, ?, ?, ?)').run(
@@ -175,32 +185,48 @@ export class FlowEngine {
   // 3. SECUENCIAS Y DRIP CAMPAIGNS (CAMPAÑAS DE GOTEO)
   // =========================================================================
 
-  saveSequence(seq: SequenceDefinition): void {
-    this.db.prepare('INSERT OR REPLACE INTO sequences (id, name, is_active, created_at) VALUES (?, ?, ?, ?)').run(
+  saveSequence(orgId: string, seq: SequenceDefinition): void {
+    if (!orgId || typeof orgId !== 'string') {
+      throw new Error('VALIDATION: saveSequence exige organizationId (aislamiento multi-organización)')
+    }
+    this.db.prepare('INSERT OR REPLACE INTO sequences (id, organization_id, name, is_active, created_at) VALUES (?, ?, ?, ?, ?)').run(
       seq.id,
+      orgId,
       seq.name,
       seq.isActive ? 1 : 0,
       Date.now()
     )
 
-    this.db.prepare('DELETE FROM sequence_steps WHERE sequence_id = ?').run(seq.id)
+    this.db.prepare('DELETE FROM sequence_steps WHERE organization_id = ? AND sequence_id = ?').run(orgId, seq.id)
     const stepStmt = this.db.prepare(`
-      INSERT INTO sequence_steps (id, sequence_id, step_order, delay_minutes, message_text, flow_id)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO sequence_steps (id, organization_id, sequence_id, step_order, delay_minutes, message_text, flow_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
 
     for (const step of seq.steps) {
-      stepStmt.run(step.id, seq.id, step.stepOrder, step.delayMinutes, step.messageText, step.flowId || null)
+      stepStmt.run(step.id, orgId, seq.id, step.stepOrder, step.delayMinutes, step.messageText, step.flowId || null)
     }
   }
 
+  /** La secuencia debe existir EN LA ORGANIZACIÓN para poder inscribir contactos en ella (4.B). */
+  getSequence(orgId: string, sequenceId: string): { id: string; name: string; isActive: boolean } | null {
+    const row = this.db.prepare('SELECT id, name, is_active FROM sequences WHERE organization_id = ? AND id = ?').get(orgId, sequenceId) as
+      | { id: string; name: string; is_active: number }
+      | undefined
+    if (!row) return null
+    return { id: row.id, name: row.name, isActive: row.is_active === 1 }
+  }
+
   enrollContactInSequence(orgId: string, phone: string, sequenceId: string): void {
+    // (tercera reparación 4.B) Una organización NO puede inscribir contactos en
+    // secuencias de otra: si la secuencia no existe EN SU org, no se inscribe.
+    if (!this.getSequence(orgId, sequenceId)) return
     const enrollmentId = `enr_${orgId}_${sequenceId}_${phone}`
     const now = Date.now()
     this.db.prepare(`
       INSERT INTO sequence_enrollments (id, organization_id, sequence_id, contact_phone, current_step, next_run_at, status)
       VALUES (?, ?, ?, ?, 1, ?, 'ACTIVE')
-      ON CONFLICT(id) DO UPDATE SET
+      ON CONFLICT(organization_id, sequence_id, contact_phone) DO UPDATE SET
         current_step = 1,
         next_run_at = excluded.next_run_at,
         status = 'ACTIVE'
@@ -286,9 +312,13 @@ export class FlowEngine {
     this.db.prepare('DELETE FROM flow_sessions WHERE organization_id = ? AND contact_phone = ?').run(orgId, contactPhone)
   }
 
-  findMatchingFlow(messageText: string): FlowDefinition | null {
+  findMatchingFlow(orgId: string, messageText: string): FlowDefinition | null {
+    // (tercera reparación 4.B) SOLO flujos de ESTA organización pueden dispararse:
+    // un mensaje de la org A jamás ejecuta un flujo de la org B, aunque los
+    // identificadores o palabras clave coincidan.
+    this.ensureDefaultFlowForOrg(orgId)
     const clean = messageText.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    const flows = this.listFlows().filter((f) => f.isActive)
+    const flows = this.listFlows(orgId).filter((f) => f.isActive)
 
     for (const flow of flows) {
       for (const kw of flow.triggerKeywords) {
@@ -314,24 +344,24 @@ export class FlowEngine {
     let session = this.getSession(orgId, contactPhone)
     let flow: FlowDefinition | null = null
 
-    // Registrar mensaje en bandeja de entrada (Inbox) — scoped por organización
+    // Registrar mensaje en bandeja de entrada (Inbox) — con organización
     this.db.prepare(`
       INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, created_at)
       VALUES (?, ?, ?, 'inbound', ?, ?)
     `).run(`in_${Date.now()}_${Math.random().toString(36).substring(7)}`, orgId, contactPhone, messageText, Date.now())
 
-    // CASO 1: Continuar flujo existente
+    // CASO 1: Continuar flujo existente (el flujo debe pertenecer a ESTA org)
     if (session) {
-      flow = this.getFlow(session.flowId)
+      flow = this.getFlow(orgId, session.flowId)
       if (!flow || !flow.isActive) {
         this.clearSession(orgId, contactPhone)
         session = null
       }
     }
 
-    // CASO 2: Iniciar nuevo flujo por trigger
+    // CASO 2: Iniciar nuevo flujo por trigger (búsqueda CONFINADA a la org)
     if (!session) {
-      flow = this.findMatchingFlow(messageText)
+      flow = this.findMatchingFlow(orgId, messageText)
       if (!flow) {
         return { handled: false, messagesToSend: [], actionsToExecute: [] }
       }
@@ -547,9 +577,9 @@ export class FlowEngine {
         }
       }
 
-      // --- NODO: GOTO_FLOW (Sub-flujo) ---
+      // --- NODO: GOTO_FLOW (Sub-flujo) — el sub-flujo debe pertenecer a ESTA org (4.B) ---
       else if (currentNode.type === 'goto_flow' && currentNode.data.targetFlowId) {
-        const targetFlow = this.getFlow(currentNode.data.targetFlowId)
+        const targetFlow = this.getFlow(orgId, currentNode.data.targetFlowId)
         if (targetFlow) {
           flow = targetFlow
           session.flowId = targetFlow.id
@@ -674,8 +704,14 @@ export class FlowEngine {
     } catch {}
   }
 
-  private seedDefaultFlowIfEmpty(): void {
-    const count = this.db.prepare('SELECT count(*) as total FROM flows').get() as { total: number }
+  /**
+   * (tercera reparación 4.B) Seed POR ORGANIZACIÓN del flujo demo: cada org
+   * recibe SU PROPIA copia la primera vez que evalúa/consulta flujos. Las
+   * organizaciones existentes jamás ven flujos ajenos.
+   */
+  private ensureDefaultFlowForOrg(orgId: string): void {
+    if (!orgId || typeof orgId !== 'string') return
+    const count = this.db.prepare('SELECT count(*) as total FROM flows WHERE organization_id = ?').get(orgId) as { total: number }
     if (count && count.total > 0) return
 
     const defaultFlow: FlowDefinition = {
@@ -761,6 +797,6 @@ export class FlowEngine {
       ],
     }
 
-    this.saveFlow(defaultFlow)
+    this.saveFlow(orgId, defaultFlow)
   }
 }

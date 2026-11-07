@@ -134,7 +134,7 @@ async function runPersistenceAndHandoffTests() {
   console.log('  ✅ [PASS] Conversación reactivada con éxito tras liberación formal del asesor')
 
   // 3. Verificación de persistencia de Supresión tras reinicio
-  assert.ok(routerB.getSuppressionStore().isSuppressed(phoneBaja, 'org_test'))
+  assert.ok(routerB.getSuppressionStore().isSuppressed('org_test', phoneBaja))
   const resBajaIgnored = await routerB.processInbound({
     eventId: 'evt_baja_02',
     orgId: 'org_test',

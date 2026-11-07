@@ -47,9 +47,12 @@ async function listenEphemeral(server: any): Promise<string> {
 }
 
 /** Servidor con secretos POR ORGANIZACIÓN (WEBHOOK_SECRETS) — el modo del contrato §3. */
+const CRED_X_ADMIN = 'contract_cred_org_x_admin_min32ch_001' // (fusión) identidad de servicio POR ORGANIZACIÓN
 function bootPerOrgServer(extraEnv: Record<string, string | undefined> = {}) {
   const prev = process.env.WEBHOOK_SECRETS
+  const prevKeys = process.env.INTERNAL_API_KEYS
   process.env.WEBHOOK_SECRETS = `${ORG_X}:${SECRET_X},${ORG_Y}:${SECRET_Y}`
+  process.env.INTERNAL_API_KEYS = `${ORG_X}:${CRED_X_ADMIN}:admin`
   const transport = new MockTransportSender()
   const crm = new MockCrmClient()
   const { server, db, router, paymentManager } = createAgenticServer({
@@ -57,7 +60,7 @@ function bootPerOrgServer(extraEnv: Record<string, string | undefined> = {}) {
     transport,
     crm,
   })
-  return { server, db, router, paymentManager, transport, crm, restore: () => { if (prev === undefined) delete process.env.WEBHOOK_SECRETS; else process.env.WEBHOOK_SECRETS = prev } }
+  return { server, db, router, paymentManager, transport, crm, restore: () => { if (prev === undefined) delete process.env.WEBHOOK_SECRETS; else process.env.WEBHOOK_SECRETS = prev; if (prevKeys === undefined) delete process.env.INTERNAL_API_KEYS; else process.env.INTERNAL_API_KEYS = prevKeys } }
 }
 
 interface InboundOptions {
@@ -246,11 +249,13 @@ describe('CONTRATO v1.1.0 — persistencia y aislamiento (Capa 2A)', () => {
     try {
       const phone = '573000000707'
       // Org X suprime el teléfono administrativamente (vía API interna autenticada)
-      await fetch(`${base}/api/internal/suppression/${phone}`, { method: 'POST', headers: AUTH_JSON, body: JSON.stringify({ reason: 'baja org X' }) })
+      // (fusión) credencial de servicio POR ORGANIZACIÓN (el secreto global ya no
+      // sustituye identidad de organización — spec §3/§10).
+      await fetch(`${base}/api/internal/suppression/${phone}`, { method: 'POST', headers: { 'Authorization': `Bearer ${CRED_X_ADMIN}`, 'X-Org-Id': ORG_X }, body: JSON.stringify({ reason: 'baja org X' }) })
       // Con credencial legado la org es 'default'; suprimimos también en ORG_X vía store directo
-      router.getSuppressionStore().addSuppression(phone, 'baja X', ORG_X)
-      assert.strictEqual(router.getSuppressionStore().isSuppressed(phone, ORG_X), true)
-      assert.strictEqual(router.getSuppressionStore().isSuppressed(phone, ORG_Y), false, 'la supresión de X NO afecta a Y')
+      router.getSuppressionStore().addSuppression(ORG_X, phone, 'baja X') // API org-first unificada
+      assert.strictEqual(router.getSuppressionStore().isSuppressed(ORG_X, phone), true) // API org-first
+      assert.strictEqual(router.getSuppressionStore().isSuppressed(ORG_Y, phone), false, 'la supresión de X NO afecta a Y')
 
       // El evento inbound de Y con ese teléfono se procesa con normalidad (no suprimido en Y)
       const r = await postInbound(base, { eventId: 'evt_p2', orgId: ORG_Y, secret: SECRET_Y, phone, text: 'Hola desde Y' })
@@ -321,7 +326,10 @@ describe('CONTRATO v1.1.0 — persistencia y aislamiento (Capa 2A)', () => {
         const anon = await fetch(`${base}/qr/data`)
         assert.ok([401, 503].includes(anon.status), 'anónimo jamás recibe datos de QR')
         const anonQr = await fetch(`${base}/qr`)
-        assert.ok([401, 503].includes(anonQr.status), 'el visor /qr tampoco se sirve a anónimos')
+        // (fusión) el shell /qr anónimo es la puerta del fix: HTML SIN datos de QR
+        // (ni imagen ni payload); el QR real solo sale por /qr/data autenticado.
+        const shellHtml = await anonQr.text()
+        assert.ok(!shellHtml.includes('data:image') && !shellHtml.includes('base64'), 'el shell anónimo no contiene QR embebido')
         const agent = await fetch(`${base}/qr/data`, { headers: { 'Authorization': 'Bearer qr_agent_secret_min32chars01' } })
         assert.strictEqual(agent.status, 403, 'rol agent no vincula dispositivos')
         const admin = await fetch(`${base}/qr/data`, { headers: { 'Authorization': 'Bearer qr_admin_secret_min32chars01' } })
@@ -354,7 +362,7 @@ describe('CONTRATO v1.1.0 §6 — máquina de estados de pagos (Capa 2A)', () =>
       // Crear transacción (org default con credencial legado)
       const created = await fetch(`${base}/api/payments/create-link`, {
         method: 'POST', headers: AUTH_JSON,
-        body: JSON.stringify({ contactPhone: '573000001001', amount: 90000, currency: 'COP', description: 'Plan contrato' }),
+        body: JSON.stringify({ orgId: ORG_X, contactPhone: '573000001001', amount: 90000, currency: 'COP', description: 'Plan contrato' }), // (fusión) org explícita del operador central
       })
       assert.strictEqual(created.status, 200)
       const tx = await created.json() as any
@@ -386,7 +394,9 @@ describe('CONTRATO v1.1.0 §6 — máquina de estados de pagos (Capa 2A)', () =>
         const unknown = await postWebhook('APPROVED', 'tx_inexistente_999')
         assert.strictEqual(unknown.status, 404, 'transacción desconocida → 404 (sin filtrar detalles)')
 
-        const audit = db.prepare('SELECT from_status, to_status FROM payment_audit WHERE transaction_id = ?').all(tx.id) as any[]
+        // (fusión) la auditoría registra TAMBIÉN la creación (from NULL, ver PAY-07 de
+      // payments-qr-hardening); la transición se verifica por su acción explícita.
+      const audit = db.prepare("SELECT from_status, to_status FROM payment_audit WHERE transaction_id = ? AND action LIKE 'WEBHOOK_TRANSITION%'").all(tx.id) as any[]
         assert.ok(audit.length >= 1, 'toda transición queda auditada')
         assert.strictEqual(audit[0].from_status, 'PENDING')
         assert.strictEqual(audit[0].to_status, 'APPROVED')
@@ -403,7 +413,7 @@ describe('CONTRATO v1.1.0 §7 — límites y abuso (Capa 2A)', () => {
     const base = await listenEphemeral(server)
     try {
       const big = JSON.stringify({ eventId: 'evt_big', orgId: ORG_X, contact: { phone: '1' }, message: { id: 'm', text: 'x'.repeat(1_100_000) }, channel: 'whatsapp' })
-      const res = await fetch(`${base}/api/flows`, { method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' }, body: big })
+      const res = await fetch(`${base}/api/flows`, { method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json', 'X-Org-Id': ORG_X }, body: big })
       assert.strictEqual(res.status, 413)
     } finally { server.close(); restore() }
   })
