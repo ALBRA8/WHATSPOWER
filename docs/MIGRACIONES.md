@@ -53,6 +53,39 @@ DROP INDEX IF EXISTS idx_send_idem_org_corr;"
 # el código previo sigue funcionando sin él)
 ```
 
+## W-v5.1 (B2 HARDENING) — Autorización por organización en la reconciliación
+
+**Causa raíz corregida:** `GET /api/internal/idempotency/uncertain` y
+`POST /api/internal/idempotency/reconcile` se autorizaban con el secreto
+GLOBAL (`INTERNAL_API_SECRET`): un solo secreto permitía listar claves,
+estados, teléfonos y evidencias de TODAS las organizaciones, reconciliar claves
+ajenas y autorizar reenvíos (`confirmResend`) sin ataduras por organización.
+
+**Cambio de contrato (fail-closed, sin migración de BD):**
+
+1. Ambas rutas exigen identidad de servicio VINCULADA (igual que
+   `/api/internal/locks` y `/api/internal/suppression`): `X-Org-Id` + Bearer de
+   la credencial registrada de ESA organización (`ORG_SERVICE_CREDENTIALS`).
+   El secreto global YA NO autoriza estas rutas: sin identidad → 401;
+   credencial inválida/ajena u org sin provisión → 403.
+2. El GET devuelve EXCLUSIVAMENTE los eventos UNCERTAIN de la organización
+   autenticada (`organizationId` en la respuesta); jamás expone claves,
+   teléfonos ni evidencias de otras organizaciones.
+3. En el POST, una clave de otra organización → **403** sin tomar posesión (la
+   clave ni siquiera pasa a `PROCESSING`); el guard también vive dentro de
+   `reconcileEvent({requestingOrgId})` (defensa en profundidad).
+4. `all: true` sólo procesa los eventos UNCERTAIN de la organización
+   autenticada (jamás eventos globales).
+5. `confirmResend: true` requiere: clave CONCRETA propia (el lote
+   `{all:true, confirmResend:true}` → 400) y campo `evidence` (≥16 caracteres,
+   verificación externa documentada de no llegada), con línea de auditoría.
+   Siguen prohibidos el reenvío automático y el masivo; un permiso = un
+   intento auditado (at-least-once, sin exactly-once).
+
+**Rollback exacto:** revertir el commit (no hay cambio de esquema; los
+llamadores que usaban el secreto global deben migrar a credenciales por
+organización antes de revertir).
+
 ## W-v4 (TERCERA REPARACIÓN) — Configuración/catálogo por organización
 
 **Causa raíz corregida:** `flows`, `sequences`, `sequence_steps`, `agents`,

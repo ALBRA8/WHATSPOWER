@@ -86,6 +86,18 @@ export interface ReconcileReport {
  * REJECTED en el journal y la clave queda FAILED: el reintento limpio está
  * permitido porque hay certeza de que el mensaje NO salió.
  */
+/**
+ * B2 (hardening de reconciliación) — La clave de idempotencia pertenece a OTRA
+ * organización: la reconciliación se niega (fail-closed, sin filtrar de qué org
+ * es la clave). El guard se evalúa ANTES de tomar posesión de la clave.
+ */
+export class ReconcileForbiddenOrgError extends Error {
+  constructor(requestingOrg: string) {
+    super(`RECONCILE_FORBIDDEN_ORG: la clave de idempotencia no pertenece a la organización autenticada (org solicitante: ${requestingOrg})`)
+    this.name = 'ReconcileForbiddenOrgError'
+  }
+}
+
 export class TransportRejectedError extends Error {
   constructor(reason: string) {
     super(`TRANSPORT_REJECTED: envío no aceptado por el transporte (${reason}); evidencia fiable de no aceptación`)
@@ -734,8 +746,21 @@ export class ConversationRouter {
   // RECONCILIACIÓN DE EVENTOS UNCERTAIN (tercera reparación 4.C)
   // ===========================================================================
 
-  /** Lista eventos con resultado incierto (para operación/auditoría). */
-  listUncertainEvents(limit: number = 50): Array<{ key: string; createdAt: number; leaseExpiresAt: number }> {
+  /**
+   * Lista eventos con resultado incierto (para operación/auditoría).
+   * B2 (hardening): con `orgId` SOLO devuelve eventos de ESA organización —
+   * las claves ajenas no se exponen ni se procesan. El prefijo se compara de
+   * forma exacta (`orgId::`, longitud fija) para no confundir organizaciones
+   * cuyos ids compartan prefijo.
+   */
+  listUncertainEvents(limit: number = 50, orgId?: string): Array<{ key: string; createdAt: number; leaseExpiresAt: number }> {
+    if (orgId !== undefined) {
+      if (!orgId || !/^[a-zA-Z0-9_-]{1,64}$/.test(orgId)) return []
+      const rows = this.db.prepare(
+        "SELECT key, created_at, lease_expires_at FROM idempotency_keys WHERE status = 'UNCERTAIN' AND substr(key, 1, ?) = ? ORDER BY created_at ASC LIMIT ?"
+      ).all(orgId.length + 2, `${orgId}::`, limit) as Array<{ key: string; created_at: number; lease_expires_at: number }>
+      return rows.map((r) => ({ key: r.key, createdAt: r.created_at, leaseExpiresAt: r.lease_expires_at }))
+    }
     const rows = this.db.prepare(
       "SELECT key, created_at, lease_expires_at FROM idempotency_keys WHERE status = 'UNCERTAIN' ORDER BY created_at ASC LIMIT ?"
     ).all(limit) as Array<{ key: string; created_at: number; lease_expires_at: number }>
@@ -793,7 +818,15 @@ export class ConversationRouter {
    *    modelo sigue siendo at-least-once (requisito 7: sin exactly-once).
    * Devuelve null si la clave no estaba UNCERTAIN.
    */
-  async reconcileEvent(idemKey: string, opts: { confirmResend?: boolean } = {}): Promise<ReconcileReport | null> {
+  async reconcileEvent(idemKey: string, opts: { confirmResend?: boolean; requestingOrgId?: string } = {}): Promise<ReconcileReport | null> {
+    // B2 (hardening): si se declara la organización solicitante, la clave DEBE
+    // pertenecerle. Se verifica ANTES del claim (tomar posesión muta estado:
+    // un acceso cruzado no puede dejar la clave en PROCESSING).
+    if (opts.requestingOrgId !== undefined) {
+      const sep = idemKey.indexOf('::')
+      const keyOrg = sep > 0 ? idemKey.slice(0, sep) : ''
+      if (keyOrg !== opts.requestingOrgId) throw new ReconcileForbiddenOrgError(opts.requestingOrgId)
+    }
     const now = Math.floor(Date.now() / 1000)
     const claim = this.db.prepare(`
       UPDATE idempotency_keys SET status = 'PROCESSING', response_json = NULL, lease_expires_at = ?

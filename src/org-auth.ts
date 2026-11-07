@@ -72,6 +72,19 @@ export function extractOrgServiceAuth(headers: Record<string, string | string[] 
 }
 
 /**
+ * B2 (hardening de reconciliación): una clave de idempotencia `orgId::eventId`
+ * pertenece a la organización que la emitió (formato construido por el router:
+ * `${orgId}::${eventId}`, con orgId validado SIN ':'). Fail-closed: claves
+ * malformadas (sin separador) o vacías → false.
+ */
+export function idempotencyKeyBelongsToOrg(key: string, orgId: string): boolean {
+  if (!key || !orgId || typeof key !== 'string' || typeof orgId !== 'string') return false
+  const sep = key.indexOf('::')
+  if (sep <= 0) return false
+  return key.slice(0, sep) === orgId
+}
+
+/**
  * Provisión por entorno (operación sin BD manual): ORG_SERVICE_CREDENTIALS con
  * formato "orgId:credencial,orgId2:credencial2". Los valores NUNCA se loguean;
  * en el arranque se registran solo sus hashes.

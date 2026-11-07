@@ -25,7 +25,9 @@ import {
   verifyOrgServiceCredential,
   extractOrgServiceAuth,
   provisionOrgServiceCredentialsFromEnv,
+  idempotencyKeyBelongsToOrg,
 } from './org-auth.ts'
+import { ReconcileForbiddenOrgError } from './engine/router.ts'
 
 try {
   process.loadEnvFile()
@@ -204,13 +206,19 @@ export function createAgenticServer(options?: {
     // (comparación timing-safe) O cookie de sesión del Studio (HttpOnly),
     // SALVO: /api/health (público), /api/inbound (protegida por HMAC+timestamp+
     // replay propio), /api/payments/webhook (protegida por HMAC de la pasarela) y
-    // las rutas de SERVICIO por organización /api/internal/locks|suppression —
-    // B3: esas ya NO aceptan el secreto global; exigen credencial de servicio
-    // VINCULADA a la organización (verificación por endpoint, fail-closed).
+    // las rutas de SERVICIO por organización /api/internal/locks|suppression e
+    // /api/internal/idempotency/{uncertain,reconcile} — B3/B2: esas ya NO
+    // aceptan el secreto global; exigen credencial de servicio VINCULADA a la
+    // organización (verificación por endpoint, fail-closed).
     // Fail-closed: sin secret configurado responde 503, nunca acepta.
     // ==========================================================
     const isOrgScopedServicePath =
       url.pathname.startsWith('/api/internal/locks/') || url.pathname.startsWith('/api/internal/suppression/')
+      // B2 hardening: la reconciliación de idempotencia expone claves, teléfonos
+      // y evidencias → exige identidad de servicio POR ORGANIZACIÓN (el secreto
+      // global compartido ya no autoriza lectura ni escritura aquí).
+      || url.pathname === '/api/internal/idempotency/uncertain'
+      || url.pathname === '/api/internal/idempotency/reconcile'
     const isPublicApiPath = url.pathname === '/api/health'
       || url.pathname === '/api/inbound'
       || url.pathname === '/api/payments/webhook'
@@ -587,7 +595,17 @@ export function createAgenticServer(options?: {
     }
 
     // 4.bis Reconciliación de eventos UNCERTAIN (tercera reparación 4.C + B2 fase final):
-    // POST /api/internal/idempotency/reconcile — body {key} | {all: true} | {confirmResend: true}.
+    // POST /api/internal/idempotency/reconcile — body {key} | {all: true} | {key, confirmResend: true, evidence}.
+    // B2 HARDENING (autorización y aislamiento por organización):
+    //  - Exige identidad de servicio VINCULADA (X-Org-Id + Bearer de SU
+    //    credencial); el secreto global NO autoriza (401/403).
+    //  - Una clave de OTRA organización → 403, sin tomar posesión ni revelar
+    //    estado (verificado también dentro del router, defensa en profundidad).
+    //  - `all: true` sólo procesa los eventos UNCERTAIN de LA organización
+    //    autenticada (nunca eventos globales).
+    //  - `confirmResend: true` JAMÁS en lote: sólo una clave concreta propia, y
+    //    sólo con `evidence` (verificación externa documentada de no llegada);
+    //    queda auditado. Ningún reenvío automático ni masivo.
     // JAMÁS es un reintento ciego: re-ejecuta el ciclo reutilizando el journal
     // (efectos DONE se saltan; ningún mensaje ya enviado se reenvía) y el
     // registro durable de envíos bloquea todo re-despacho de claves
@@ -595,6 +613,9 @@ export function createAgenticServer(options?: {
     // EXPLÍCITA del operador con evidencia externa de no llegada — autoriza UN
     // reenvío por envío incierto (la entrega sigue siendo at-least-once).
     if (req.method === 'POST' && url.pathname === '/api/internal/idempotency/reconcile') {
+      const orgAuthRec = requireOrgServiceAuth(req, res)
+      if (!orgAuthRec) return
+      const orgId = orgAuthRec.orgId
       const rb = await readBody(req)
       if (!rb.ok) {
         res.writeHead(413, { 'Content-Type': 'application/json' })
@@ -602,32 +623,68 @@ export function createAgenticServer(options?: {
         return
       }
       try {
-        const body = JSON.parse(rb.body || '{}') as { key?: string; all?: boolean; confirmResend?: boolean }
+        const body = JSON.parse(rb.body || '{}') as { key?: string; all?: boolean; confirmResend?: boolean; evidence?: string }
         const confirmResend = body.confirmResend === true
+        // Control adicional 1: el reenvío confirmado JAMÁS es masivo.
+        if (confirmResend && body.all === true) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'confirmResend sólo se autoriza para UNA clave concreta ({key}); prohibido el reenvío masivo' }))
+          return
+        }
         if (body.key && typeof body.key === 'string') {
-          const report = await router.reconcileEvent(body.key, { confirmResend })
+          // Control adicional 2 (aislamiento): la clave DEBE ser de la
+          // organización autenticada. Clave ajena → 403 sin tocar estado.
+          if (!idempotencyKeyBelongsToOrg(body.key, orgId)) {
+            console.warn(`[Seguridad 2A ALERTA] Reconciliación de clave AJENA bloqueada (org: ${orgId}, IP: ${req.socket.remoteAddress})`)
+            res.writeHead(403, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: 'Forbidden: la clave no pertenece a la organización autenticada' }))
+            return
+          }
+          let opts: { confirmResend: boolean; requestingOrgId: string }
+          if (confirmResend) {
+            // Control adicional 3: autorización explícita CON evidencia
+            // documentada de no llegada (verificación externa del operador).
+            const evidence = typeof body.evidence === 'string' ? body.evidence.trim() : ''
+            if (evidence.length < 16) {
+              res.writeHead(400, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ error: 'confirmResend exige "evidence": verificación externa documentada de no llegada (mínimo 16 caracteres)' }))
+              return
+            }
+            console.log(`[Seguridad 2A AUDIT] Reenvío autorizado EXPLÍCITAMENTE por operador (org: ${orgId}, key: ${body.key}, IP: ${req.socket.remoteAddress}, evidencia: "${evidence}")`)
+            opts = { confirmResend: true, requestingOrgId: orgId }
+          } else {
+            opts = { confirmResend: false, requestingOrgId: orgId }
+          }
+          const report = await router.reconcileEvent(body.key, opts)
           res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ ok: true, key: body.key, result: report }))
+          res.end(JSON.stringify({ ok: true, organizationId: orgId, key: body.key, result: report }))
           return
         }
         if (body.all === true) {
-          const pending = router.listUncertainEvents(25)
+          // B2 hardening: SÓLO los eventos UNCERTAIN de la organización
+          // autenticada (jamás eventos globales ni de otras organizaciones).
+          const pending = router.listUncertainEvents(25, orgId)
           const outcomes: Array<{ key: string; ok: boolean; requiresManualResolution?: boolean; error?: string }> = []
           for (const ev of pending) {
             try {
-              const report = await router.reconcileEvent(ev.key, { confirmResend })
+              const report = await router.reconcileEvent(ev.key, { requestingOrgId: orgId })
               outcomes.push({ key: ev.key, ok: Boolean(report?.resolved), requiresManualResolution: report?.requiresManualResolution })
             } catch (e: any) {
               outcomes.push({ key: ev.key, ok: false, error: String(e?.message || e) })
             }
           }
           res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ ok: true, reconciled: outcomes.filter((o) => o.ok).length, outcomes }))
+          res.end(JSON.stringify({ ok: true, organizationId: orgId, reconciled: outcomes.filter((o) => o.ok).length, outcomes }))
           return
         }
         res.writeHead(400, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Body requerido: {key} o {all:true} (lista previa vía GET .../uncertain); confirmResend:true sólo con evidencia externa de no llegada' }))
       } catch (e: any) {
+        if (e instanceof ReconcileForbiddenOrgError) {
+          res.writeHead(403, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Forbidden: la clave no pertenece a la organización autenticada' }))
+          return
+        }
         res.writeHead(409, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: String(e?.message || e) }))
       }
@@ -637,13 +694,20 @@ export function createAgenticServer(options?: {
     // 4.ter Listado de eventos UNCERTAIN pendientes (GET /api/internal/idempotency/uncertain)
     // B2: incluye la EVIDENCIA durable de los envíos (registro daemon_send_idempotency)
     // para que la resolución sea documentada, no a ciegas.
+    // B2 HARDENING: exige identidad de servicio POR ORGANIZACIÓN y devuelve
+    // EXCLUSIVAMENTE los eventos UNCERTAIN de la organización autenticada —
+    // claves, estados, teléfonos y evidencias de otras organizaciones jamás
+    // salen por esta ruta.
     if (req.method === 'GET' && url.pathname === '/api/internal/idempotency/uncertain') {
-      const uncertain = router.listUncertainEvents(100).map((u) => ({
+      const orgAuthUnc = requireOrgServiceAuth(req, res)
+      if (!orgAuthUnc) return
+      const orgId = orgAuthUnc.orgId
+      const uncertain = router.listUncertainEvents(100, orgId).map((u) => ({
         ...u,
         evidence: router.describeUncertainEvent(u.key),
       }))
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ uncertain }))
+      res.end(JSON.stringify({ organizationId: orgId, uncertain }))
       return
     }
 
