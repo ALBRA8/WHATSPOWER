@@ -75,6 +75,8 @@ export function parseInternalKeys(raw: string | undefined): { entries: InternalK
     const [orgId, secret, role] = pieces
     if (!orgId || !secret || !/^[a-zA-Z0-9_-]{1,64}$/.test(orgId)) { skipped++; continue }
     if (secret.length < 16) { skipped++; continue } // secretos débiles se rechazan al parsear
+    // §4: '__legacy__' es espacio histórico RESERVADO — ninguna credencial lo opera.
+    if (orgId === '__legacy__') { skipped++; continue }
     const r: InternalRole = role === 'admin' ? 'admin' : 'agent'
     entries.push({ orgId, secret, role: r })
   }
@@ -311,6 +313,8 @@ export function parseWebhookSecrets(raw: string | undefined): WebhookSecretBindi
     const orgId = trimmed.slice(0, idx)
     const secret = trimmed.slice(idx + 1)
     if (!orgId || !secret || !/^[a-zA-Z0-9_-]{1,64}$/.test(orgId) || secret.length < 16) continue
+    // §4: '__legacy__' es espacio histórico RESERVADO — ningún secreto de webhook lo vincula.
+    if (orgId === '__legacy__') continue
     out.push({ orgId, secret })
   }
   return out

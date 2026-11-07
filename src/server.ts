@@ -151,6 +151,12 @@ export function createAgenticServer(options?: {
       const keyIdentity = keyResolution.identity
       const xOrgRaw = req.headers['x-org-id']
       const xOrg = Array.isArray(xOrgRaw) ? String(xOrgRaw[0]) : (xOrgRaw ? String(xOrgRaw) : undefined)
+      if (keyIdentity.orgId === '__legacy__') {
+        // §4: credencial de INTERNAL_API_KEYS ligada a __legacy__ → jamás opera.
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Forbidden: organización reservada' }))
+        return null
+      }
       if (xOrg && xOrg !== keyIdentity.orgId) {
         console.warn(`[Seguridad 2A ALERTA] X-Org-Id ajeno a la credencial de servicio: ${req.method} ${req.url} (org credencial: ${keyIdentity.orgId}, IP: ${req.socket.remoteAddress})`)
         res.writeHead(403, { 'Content-Type': 'application/json' })
@@ -211,7 +217,10 @@ export function createAgenticServer(options?: {
   /** Org obligatoria desde el header X-Org-Id (nunca del body — no se infiere de datos no confiables). */
   function requireOrgHeader(req: IncomingMessage): string | null {
     const orgId = String(req.headers['x-org-id'] || '').trim()
-    return orgId && /^[a-zA-Z0-9_-]{1,64}$/.test(orgId) ? orgId : null
+    if (!orgId || !/^[a-zA-Z0-9_-]{1,64}$/.test(orgId)) return null
+    // §4: '__legacy__' es espacio histórico RESERVADO — ninguna petición puede operarlo.
+    if (orgId === '__legacy__') return null
+    return orgId
   }
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {

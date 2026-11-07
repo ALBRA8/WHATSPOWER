@@ -23,12 +23,25 @@ import type { DatabaseSync } from 'node:sqlite'
  */
 
 /** Hash determinista de la credencial (solo el hash vive en la BD). */
+/**
+ * Espacio RESERVADO para datos históricos sin atribución (reparación integral §4):
+ * ninguna organización real puede llamarse '__legacy__' ni operar como tal.
+ * Todas las vías de identidad/autorización lo RECHAZAN (fail-safe).
+ */
+export const FORBIDDEN_LEGACY_ORG = '__legacy__'
+
+/** True si el orgId está prohibido como organización operable (espacio legacy). */
+export function isForbiddenLegacyOrg(orgId: string | null | undefined): boolean {
+  return typeof orgId === 'string' && orgId.trim() === FORBIDDEN_LEGACY_ORG
+}
+
 export function hashOrgCredential(credential: string): string {
   return createHash('sha256').update(credential, 'utf8').digest('hex')
 }
 
 /** Registra (idempotente) una credencial de servicio para una organización. */
 export function registerOrgServiceCredential(db: DatabaseSync, orgId: string, credential: string, label?: string): void {
+  if (isForbiddenLegacyOrg(orgId)) throw new Error('registerOrgServiceCredential: la organización reservada __legacy__ no admite credenciales (§4)')
   if (!orgId || typeof orgId !== 'string') throw new Error('registerOrgServiceCredential: orgId obligatorio')
   if (!credential || typeof credential !== 'string' || credential.length < 16) {
     throw new Error('registerOrgServiceCredential: credencial obligatoria (≥16 caracteres)')
@@ -54,6 +67,7 @@ function safeEqualHex(a: string, b: string): boolean {
  * Comparación timing-safe sobre hashes.
  */
 export function verifyOrgServiceCredential(db: DatabaseSync, orgId: string, presented: string | null | undefined): boolean {
+  if (isForbiddenLegacyOrg(orgId)) return false // §4: fail-safe, jamás operable
   if (!orgId || typeof orgId !== 'string' || !presented || typeof presented !== 'string') return false
   const rows = db.prepare('SELECT credential_hash FROM service_credentials WHERE org_id = ?').all(orgId) as Array<{ credential_hash: string }>
   if (rows.length === 0) return false // sin credenciales registradas → el secreto global NO sustituye
@@ -99,6 +113,11 @@ export function provisionOrgServiceCredentialsFromEnv(db: DatabaseSync, env: Nod
     const orgId = pair.slice(0, idx).trim()
     const credential = pair.slice(idx + 1).trim()
     if (!orgId || !credential) continue
+    if (isForbiddenLegacyOrg(orgId)) {
+      // §4: el espacio legacy no recibe credenciales (ni siquiera por env).
+      console.warn('[org-auth] ORG_SERVICE_CREDENTIALS: entrada __legacy__ RECHAZADA (espacio histórico no operable)')
+      continue
+    }
     registerOrgServiceCredential(db, orgId, credential, 'provisioned-via-env')
     count++
   }
