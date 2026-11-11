@@ -301,6 +301,58 @@ export function createDatabase(dbPath?: string): DatabaseSync {
   `)
 
   // ============================================================
+  // v4 — OLEADA 2 (decisión de negocio Meta/WhatsApp 2026-11-11):
+  // EJECUTORES DE AUTOMATIZACIONES POR ORGANIZACIÓN.
+  //  - stage_change_dedup    → idempotencia DURABLE de eventos stage-change
+  //    (clave POR ORGANIZACIÓN): un replay del mismo evento jamás vuelve a
+  //    disparar la automatización ni reenvía el mensaje (regla 8: nada de
+  //    duplicados hacia WhatsApp).
+  //  - automation_rules      → reglas de automatización POR ORGANIZACIÓN
+  //    (cada empresa define sus disparadores; los defaults son fallback).
+  //  - automation_events     → pista de auditoría de cada ejecución con el
+  //    resultado REAL del despacho (SENT / UNCERTAIN / REJECTED_*).
+  // Rollback: DROP TABLE stage_change_dedup; DROP TABLE automation_events;
+  //           DROP TABLE automation_rules;
+  // ============================================================
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS stage_change_dedup (
+      organization_id TEXT NOT NULL,
+      event_key TEXT NOT NULL,
+      processed_at INTEGER NOT NULL,
+      result_json TEXT,
+      PRIMARY KEY (organization_id, event_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS automation_rules (
+      id TEXT PRIMARY KEY,
+      organization_id TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      action TEXT NOT NULL,
+      template_message TEXT,
+      target_flow_id TEXT,
+      target_sequence_id TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      UNIQUE (organization_id, stage)
+    );
+
+    CREATE TABLE IF NOT EXISTS automation_events (
+      id TEXT PRIMARY KEY,
+      organization_id TEXT NOT NULL,
+      event_key TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      action TEXT NOT NULL,
+      status TEXT NOT NULL,
+      detail TEXT,
+      message_id TEXT,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_automation_events_org ON automation_events(organization_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_automation_rules_org ON automation_rules(organization_id, stage);
+  `)
+
+  // ============================================================
   // v3 — AISLAMIENTO MULTI-ORG POR CLAVE COMPUESTA (segunda reparación 2026-11-06)
   // Causa raíz corregida: el teléfono era la clave primaria GLOBAL en varias
   // tablas — el mismo número en dos organizaciones compartía locks, sesiones,

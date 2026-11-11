@@ -1,5 +1,52 @@
+/**
+ * crm-triggers.ts — EJECUTORES DE AUTOMATIZACIONES POR ORGANIZACIÓN
+ * (OLEADA 2 — decisión de negocio Meta/WhatsApp 2026-11-11, puntos 4, 6 y 8).
+ *
+ * v2 (esta versión) corrige tres defectos del ejecutor original:
+ *
+ *   1. DESPACHO REAL: `send_message` ya no solo "registra en la bandeja":
+ *      envía por el transporte POR ORGANIZACIÓN (Meta Cloud con las
+ *      credenciales de ESA organización — decisión 2026-11-11 #6). El
+ *      registro en inbox_messages se conserva como auditoría del mensaje
+ *      generado, y `automation_events` guarda el resultado REAL.
+ *
+ *   2. IDEMPOTENCIA: cada evento stage-change tiene una clave de evento
+ *      (eventId explícito del CRM, o clave derivada determinista) guardada en
+ *      stage_change_dedup POR ORGANIZACIÓN. Un replay del mismo evento NO
+ *      vuelve a disparar la automatización ni reenvía el mensaje.
+ *
+ *   3. REGLAS POR ORGANIZACIÓN: cada empresa define sus disparadores
+ *      (automation_rules, tabla propia). Los defaults internos son SOLO
+ *      fallback para organizaciones sin regla propia — nunca pisan la
+ *      configuración de la org (punto 6: cada org opera con lo suyo).
+ *
+ * Honestidad de resultados (prohibido el éxito fingido):
+ *   SENT | UNCERTAIN | REJECTED_NO_CONNECTION | REJECTED |
+ *   RECORDED_NO_TRANSPORT | FLOW_STARTED | FLOW_UNAVAILABLE |
+ *   SEQUENCE_ENROLLED | SEQUENCE_UNAVAILABLE | SKIPPED_NO_RULE
+ */
+import { createHash, randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import type { FlowEngine } from './flow-engine.ts'
+
+/** Resultado mínimo del transporte (compatible con TransportSender). */
+export interface AutomationTransportResult {
+  ok: boolean
+  messageId?: string
+  error?: string
+  outcome?: 'SENT' | 'REJECTED' | 'UNCERTAIN'
+}
+
+/** Interfaz mínima del transporte POR ORGANIZACIÓN (MetaCloudOrgTransport). */
+export interface AutomationTransportSender {
+  sendMessage(
+    to: string,
+    text: string,
+    correlationId: string,
+    idempotencyKey?: string,
+    orgId?: string
+  ): Promise<AutomationTransportResult>
+}
 
 export interface StageChangeEvent {
   /** (segunda reparación §3.A) Organización propietaria del pipeline — obligatoria. */
@@ -11,6 +58,8 @@ export interface StageChangeEvent {
   fromStage: string
   toStage: string
   dealValue?: number
+  /** (v2) Identidad del evento que entrega el CRM: hace la ejecución idempotente. */
+  eventId?: string
 }
 
 export interface StageTriggerRule {
@@ -21,21 +70,91 @@ export interface StageTriggerRule {
   targetSequenceId?: string
 }
 
+/** Estados de ejecución auditables (honestidad: nada de éxito fingido). */
+export type AutomationStatus =
+  | 'SENT'
+  | 'UNCERTAIN'
+  | 'REJECTED_NO_CONNECTION'
+  | 'REJECTED'
+  | 'RECORDED_NO_TRANSPORT'
+  | 'FLOW_STARTED'
+  | 'FLOW_UNAVAILABLE'
+  | 'SEQUENCE_ENROLLED'
+  | 'SEQUENCE_UNAVAILABLE'
+  | 'SKIPPED_NO_RULE'
+
+export interface AutomationExecutionResult {
+  triggered: boolean
+  /** (v2) true si el evento ya había sido procesado (idempotencia). */
+  duplicate?: boolean
+  action?: string
+  /** (v2) Resultado REAL de la ejecución (auditoría y observabilidad). */
+  status?: AutomationStatus
+  messageSent?: string
+  messageId?: string
+  detail?: string
+  /** Clave de idempotencia usada (eventId o derivada determinista). */
+  eventKey: string
+}
+
 export class CrmTriggerListener {
   private db: DatabaseSync
   private flowEngine: FlowEngine
+  /** Transporte POR ORGANIZACIÓN (v2). Opcional: sin él se registra el mensaje
+   *  (modo legacy) con status RECORDED_NO_TRANSPORT — jamás se finge envío. */
+  private transport: AutomationTransportSender | null
   private rules: Map<string, StageTriggerRule> = new Map()
 
-  constructor(db: DatabaseSync, flowEngine: FlowEngine) {
+  constructor(db: DatabaseSync, flowEngine: FlowEngine, transport?: AutomationTransportSender) {
     this.db = db
     this.flowEngine = flowEngine
+    this.transport = transport ?? null
+    this.ensureSchema()
     this.registerDefaultRules()
   }
 
+  /** Esquema idempotente (db.ts lo crea en producción; necesario para :memory:). */
+  private ensureSchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS stage_change_dedup (
+        organization_id TEXT NOT NULL,
+        event_key TEXT NOT NULL,
+        processed_at INTEGER NOT NULL,
+        result_json TEXT,
+        PRIMARY KEY (organization_id, event_key)
+      );
+      CREATE TABLE IF NOT EXISTS automation_rules (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        action TEXT NOT NULL,
+        template_message TEXT,
+        target_flow_id TEXT,
+        target_sequence_id TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        UNIQUE (organization_id, stage)
+      );
+      CREATE TABLE IF NOT EXISTS automation_events (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        event_key TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        action TEXT NOT NULL,
+        status TEXT NOT NULL,
+        detail TEXT,
+        message_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+    `)
+  }
+
+  /** Regla default (fallback) — mantenida por compatibilidad; NO pisa las de la org. */
   registerRule(stage: string, rule: StageTriggerRule) {
     this.rules.set(stage.toUpperCase(), rule)
   }
 
+  /** Defaults internos: SOLO fallback para organizaciones sin regla propia. */
   private registerDefaultRules() {
     // Regla 1: Cotización / Propuesta enviada -> Mensaje de seguimiento automático
     this.rules.set('PROPUESTA_ENVIADA', {
@@ -59,46 +178,307 @@ export class CrmTriggerListener {
     })
   }
 
-  async handleStageChange(event: StageChangeEvent): Promise<{
-    triggered: boolean
-    action?: string
-    messageSent?: string
-  }> {
-    const stageKey = event.toStage.toUpperCase()
-    const rule = this.rules.get(stageKey)
+  /** (v2) Regla de automatización DE UNA ORGANIZACIÓN, persistente y prioritaria. */
+  registerOrgRule(orgId: string, rule: StageTriggerRule & { enabled?: boolean }): void {
+    const stage = rule.targetStage.toUpperCase()
+    this.db.prepare(`
+      INSERT INTO automation_rules (id, organization_id, stage, action, template_message, target_flow_id, target_sequence_id, enabled, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (organization_id, stage) DO UPDATE SET
+        action = excluded.action,
+        template_message = excluded.template_message,
+        target_flow_id = excluded.target_flow_id,
+        target_sequence_id = excluded.target_sequence_id,
+        enabled = excluded.enabled
+    `).run(
+      `arule_${randomUUID()}`,
+      orgId,
+      stage,
+      rule.action,
+      rule.templateMessage ?? null,
+      rule.targetFlowId ?? null,
+      rule.targetSequenceId ?? null,
+      rule.enabled === false ? 0 : 1,
+      Math.floor(Date.now() / 1000)
+    )
+  }
 
+  /** (v2) Resolución de regla: primero la DE LA ORGANIZACIÓN, luego el fallback. */
+  private resolveRule(orgId: string, stage: string): StageTriggerRule | null {
+    const row = this.db.prepare(`
+      SELECT stage, action, template_message, target_flow_id, target_sequence_id
+      FROM automation_rules
+      WHERE organization_id = ? AND stage = ? AND enabled = 1
+      LIMIT 1
+    `).get(orgId, stage) as
+      | { stage: string; action: string; template_message: string | null; target_flow_id: string | null; target_sequence_id: string | null }
+      | undefined
+
+    if (row) {
+      return {
+        targetStage: row.stage,
+        action: row.action as StageTriggerRule['action'],
+        templateMessage: row.template_message ?? undefined,
+        targetFlowId: row.target_flow_id ?? undefined,
+        targetSequenceId: row.target_sequence_id ?? undefined,
+      }
+    }
+    return this.rules.get(stage) ?? null
+  }
+
+  /**
+   * (v2) Clave de idempotencia del evento:
+   *  - eventId explícito del CRM (contrato v2) → tal cual (sanitizado);
+   *  - sin eventId → derivada determinista por (org, oportunidad, transición).
+   */
+  private eventKeyFor(event: StageChangeEvent): string {
+    if (event.eventId && typeof event.eventId === 'string') {
+      const clean = event.eventId.trim()
+      if (clean.length >= 1 && clean.length <= 128) return clean
+    }
+    const basis = `${event.orgId}|${event.opportunityId}|${event.fromStage}|${event.toStage}`
+    return `auto_${createHash('sha256').update(basis).digest('hex').slice(0, 32)}`
+  }
+
+  private recordAutomationEvent(params: {
+    orgId: string
+    eventKey: string
+    stage: string
+    action: string
+    status: AutomationStatus
+    detail?: string
+    messageId?: string
+  }): void {
+    this.db.prepare(`
+      INSERT INTO automation_events (id, organization_id, event_key, stage, action, status, detail, message_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      `aev_${randomUUID()}`,
+      params.orgId,
+      params.eventKey,
+      params.stage,
+      params.action,
+      params.status,
+      params.detail ?? null,
+      params.messageId ?? null,
+      Math.floor(Date.now() / 1000)
+    )
+  }
+
+  async handleStageChange(event: StageChangeEvent): Promise<AutomationExecutionResult> {
+    const stageKey = String(event.toStage || '').toUpperCase()
+    const eventKey = this.eventKeyFor(event)
+    const orgId = event.orgId
+
+    // ---- IDEMPOTENCIA (v2): replay del mismo evento → NO re-ejecuta. ----
+    const now = Math.floor(Date.now() / 1000)
+    try {
+      this.db.prepare(`
+        INSERT INTO stage_change_dedup (organization_id, event_key, processed_at)
+        VALUES (?, ?, ?)
+      `).run(orgId, eventKey, now)
+    } catch {
+      // Violación de PK (organization_id, event_key): el evento YA fue procesado.
+      const previous = this.db.prepare(`
+        SELECT result_json FROM stage_change_dedup WHERE organization_id = ? AND event_key = ?
+      `).get(orgId, eventKey) as { result_json: string | null } | undefined
+      return {
+        triggered: false,
+        duplicate: true,
+        eventKey,
+        detail: previous?.result_json ? `ya procesado: ${previous.result_json.slice(0, 200)}` : 'evento ya procesado',
+      }
+    }
+
+    const rule = this.resolveRule(orgId, stageKey)
     if (!rule) {
-      return { triggered: false }
+      this.recordAutomationEvent({
+        orgId, eventKey, stage: stageKey, action: 'none', status: 'SKIPPED_NO_RULE',
+        detail: 'sin regla de organización ni fallback para la etapa',
+      })
+      const result = { triggered: false, eventKey }
+      this.storeDedupResult(orgId, eventKey, result)
+      return result
     }
 
     const contactName = event.clientName || 'Cliente'
 
     if (rule.action === 'send_message' && rule.templateMessage) {
       const text = rule.templateMessage.replace(/\{\{nombre\}\}/g, contactName)
-      // Encolar mensaje o registrarlo en inbox
-      const now = Math.floor(Date.now() / 1000)
+      // El mensaje generado SIEMPRE queda registrado (auditoría del ejecutor).
       this.db.prepare(`
         INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, created_at)
         VALUES (?, ?, ?, 'outbound', ?, ?)
-      `).run(`msg_trig_${Date.now()}`, event.orgId, event.clientPhone, text, now)
+      `).run(`msg_trig_${randomUUID()}`, orgId, event.clientPhone, text, Math.floor(Date.now() / 1000))
 
-      return {
+      // ---- DESPACHO REAL POR ORGANIZACIÓN (v2, decisión 2026-11-11 #6) ----
+      if (!this.transport) {
+        this.recordAutomationEvent({
+          orgId, eventKey, stage: stageKey, action: 'send_message',
+          status: 'RECORDED_NO_TRANSPORT',
+          detail: 'sin transporte conectado: mensaje registrado, NO enviado (sin éxito fingido)',
+        })
+        const result = { triggered: true, action: 'send_message', status: 'RECORDED_NO_TRANSPORT' as const, messageSent: text, eventKey }
+        this.storeDedupResult(orgId, eventKey, result)
+        return result
+      }
+
+      // La clave de idempotencia POR MENSAJE viaja al transporte: aunque un
+      // upstream replique, Meta Cloud no creará dos mensajes (doble cerradura).
+      const sendRes = await this.transport.sendMessage(
+        event.clientPhone,
+        text,
+        `stage_change:${eventKey}`,
+        `stage:${eventKey}`,
+        orgId
+      )
+
+      let status: AutomationStatus
+      let detail: string | undefined
+      if (sendRes.ok && sendRes.outcome === 'SENT') {
+        status = 'SENT'
+      } else if (sendRes.outcome === 'UNCERTAIN' || (!sendRes.ok && !sendRes.outcome)) {
+        // Fail-safe (B2): sin clasificación se asume incierto — puede haberse enviado.
+        status = 'UNCERTAIN'
+        detail = sendRes.error || 'resultado incierto del despacho (pudo aceptarse)'
+      } else {
+        const err = sendRes.error || 'despacho rechazado'
+        status = err.startsWith('NO_CONNECTED_NUMBER') ? 'REJECTED_NO_CONNECTION' : 'REJECTED'
+        detail = err
+      }
+
+      this.recordAutomationEvent({
+        orgId, eventKey, stage: stageKey, action: 'send_message',
+        status, detail, messageId: sendRes.messageId,
+      })
+      const result: AutomationExecutionResult = {
         triggered: true,
         action: 'send_message',
+        status,
         messageSent: text,
+        messageId: sendRes.messageId,
+        detail,
+        eventKey,
       }
+      this.storeDedupResult(orgId, eventKey, result)
+      return result
     }
 
     if (rule.action === 'start_flow' && rule.targetFlowId) {
       // (tercera reparación 4.B) El flujo debe existir EN LA ORGANIZACIÓN del
       // evento: nunca se arranca un flujo global/de otra org por coincidencia de id.
-      const flowInOrg = this.flowEngine.getFlow(event.orgId, rule.targetFlowId)
-      return {
-        triggered: Boolean(flowInOrg),
-        action: flowInOrg ? `start_flow:${rule.targetFlowId}` : `start_flow_unavailable_in_org:${rule.targetFlowId}`,
+      const flowInOrg = this.flowEngine.getFlow(orgId, rule.targetFlowId)
+      if (!flowInOrg) {
+        this.recordAutomationEvent({
+          orgId, eventKey, stage: stageKey, action: 'start_flow',
+          status: 'FLOW_UNAVAILABLE',
+          detail: `flujo ${rule.targetFlowId} inexistente en la organización (no se arranca uno ajeno)`,
+        })
+        const result: AutomationExecutionResult = {
+          triggered: false, action: `start_flow_unavailable_in_org:${rule.targetFlowId}`,
+          status: 'FLOW_UNAVAILABLE', eventKey,
+        }
+        this.storeDedupResult(orgId, eventKey, result)
+        return result
       }
+
+      // (v2) EJECUCIÓN REAL del arranque: se abre sesión de flujo para el
+      // contacto EN LA ORGANIZACIÓN del evento, y si el primer nodo envía un
+      // mensaje, se entrega por el transporte de ESA organización.
+      const firstNode = flowInOrg.nodes?.[0]
+      const startNodeId = firstNode?.id ?? 'start'
+      this.flowEngine.saveSession(orgId, {
+        contactPhone: event.clientPhone,
+        flowId: flowInOrg.id,
+        currentNodeId: startNodeId,
+        waitingForInput: false,
+        context: { origin: 'crm_stage_trigger', stage: stageKey, opportunityId: event.opportunityId },
+        lastActivity: Math.floor(Date.now() / 1000),
+      })
+
+      let status: AutomationStatus = 'FLOW_STARTED'
+      let detail: string | undefined = `sesión abierta en nodo ${startNodeId}`
+      let messageId: string | undefined
+
+      const firstMessage = firstNode?.data?.messageText
+      if (firstMessage) {
+        const text = firstMessage.replace(/\{\{nombre\}\}/g, contactName)
+        this.db.prepare(`
+          INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, created_at)
+          VALUES (?, ?, ?, 'outbound', ?, ?)
+        `).run(`msg_flow_${randomUUID()}`, orgId, event.clientPhone, text, Math.floor(Date.now() / 1000))
+
+        if (!this.transport) {
+          status = 'RECORDED_NO_TRANSPORT'
+          detail = `sesión abierta; mensaje del nodo registrado sin envío (sin transporte)`
+        } else {
+          const sendRes = await this.transport.sendMessage(
+            event.clientPhone, text, `stage_change:${eventKey}`, `stage:${eventKey}`, orgId
+          )
+          if (sendRes.ok && sendRes.outcome === 'SENT') {
+            messageId = sendRes.messageId
+          } else if (sendRes.outcome === 'UNCERTAIN' || (!sendRes.ok && !sendRes.outcome)) {
+            status = 'UNCERTAIN'
+            detail = `sesión abierta; envío incierto del mensaje inicial: ${sendRes.error || 'sin clasificación'}`
+          } else {
+            const err = sendRes.error || 'despacho rechazado'
+            status = err.startsWith('NO_CONNECTED_NUMBER') ? 'REJECTED_NO_CONNECTION' : 'REJECTED'
+            detail = `sesión abierta; mensaje inicial NO entregado: ${err}`
+          }
+        }
+      }
+
+      this.recordAutomationEvent({
+        orgId, eventKey, stage: stageKey, action: 'start_flow',
+        status, detail, messageId,
+      })
+      const result: AutomationExecutionResult = {
+        triggered: true, action: `start_flow:${flowInOrg.id}`, status, detail, messageId, eventKey,
+      }
+      this.storeDedupResult(orgId, eventKey, result)
+      return result
     }
 
-    return { triggered: true, action: rule.action }
+    if (rule.action === 'enroll_sequence' && rule.targetSequenceId) {
+      const seq = this.flowEngine.getSequence(orgId, rule.targetSequenceId)
+      if (!seq) {
+        this.recordAutomationEvent({
+          orgId, eventKey, stage: stageKey, action: 'enroll_sequence',
+          status: 'SEQUENCE_UNAVAILABLE',
+          detail: `secuencia ${rule.targetSequenceId} inexistente en la organización`,
+        })
+        const result: AutomationExecutionResult = {
+          triggered: false, action: `enroll_sequence_unavailable_in_org:${rule.targetSequenceId}`,
+          status: 'SEQUENCE_UNAVAILABLE', eventKey,
+        }
+        this.storeDedupResult(orgId, eventKey, result)
+        return result
+      }
+      // (v2) Ejecución real: inscripción en la secuencia DE LA ORGANIZACIÓN.
+      this.flowEngine.enrollContactInSequence(orgId, event.clientPhone, rule.targetSequenceId)
+      this.recordAutomationEvent({
+        orgId, eventKey, stage: stageKey, action: 'enroll_sequence',
+        status: 'SEQUENCE_ENROLLED',
+        detail: `contacto inscrito en la secuencia ${rule.targetSequenceId}`,
+      })
+      const result: AutomationExecutionResult = {
+        triggered: true, action: `enroll_sequence:${rule.targetSequenceId}`,
+        status: 'SEQUENCE_ENROLLED', eventKey,
+      }
+      this.storeDedupResult(orgId, eventKey, result)
+      return result
+    }
+
+    const result: AutomationExecutionResult = { triggered: true, action: rule.action, eventKey }
+    this.storeDedupResult(orgId, eventKey, result)
+    return result
+  }
+
+  private storeDedupResult(orgId: string, eventKey: string, result: AutomationExecutionResult): void {
+    try {
+      this.db.prepare(`
+        UPDATE stage_change_dedup SET result_json = ? WHERE organization_id = ? AND event_key = ?
+      `).run(JSON.stringify({ triggered: result.triggered, action: result.action, status: result.status }), orgId, eventKey)
+    } catch { /* la auditoría del resultado nunca rompe la ejecución */ }
   }
 }

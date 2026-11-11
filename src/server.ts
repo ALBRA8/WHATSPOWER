@@ -194,7 +194,9 @@ export function createAgenticServer(options?: {
   const teamManager = new TeamManager(db)
   const cannedManager = new CannedResponseManager(db)
   const growthManager = new GrowthToolsManager(db, options?.businessPhone || '573001234567')
-  const crmTriggers = new CrmTriggerListener(db, router.getFlowEngine())
+  // (OLEADA 2) El ejecutor de automatizaciones despacha con el transporte POR
+  // ORGANIZACIÓN (credenciales Meta de cada org, decisión 2026-11-11 #6).
+  const crmTriggers = new CrmTriggerListener(db, router.getFlowEngine(), transport)
   const paymentManager = new PaymentGatewayManager(db)
 
   function verifyHmac(payload: string, signatureHeader?: string): boolean {
