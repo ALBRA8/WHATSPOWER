@@ -34,3 +34,59 @@ Nueva orden de trabajo (fase 2). Causas raíz corregidas y evidencia por bloque:
 - Suite: **114/114 → 115/115** pruebas (12 archivos; +11 nuevas en `tests/multiorg-isolation.test.ts`).
 - `npx tsc --noEmit` (typescript@5): 0 errores.
 - Sin envíos reales (MockTransport en sala limpia), sin campañas ni cobros reales.
+
+
+---
+
+## Ciclo de auditoría 2026-11-11/12 — corrección integral y reauditoría goldfish (ciclos 1 y 2)
+
+**Método.** 5 auditores independientes consolidaron 73 hallazgos deduplicados. Corrección
+autónoma en 2 ciclos con regla "sin prueba verificable no se declara resuelto". El ciclo 2 fue
+una REAUDITORÍA con revisores "goldfish" de contexto fresco (protocolo EGM de Google:
+elephant-goldfish-model, Apache-2.0) sobre los diffs reales, sin el historial de la conversación.
+
+### Resumen por severidad
+- Críticas/altas de seguridad: resueltas (detalles por commit abajo).
+- 0 vulnerabilidades críticas/altas de dependencias en runtime tras los bumps (quedan 5 moderadas
+  conocidas en el CRM: react-syntax-highlighter/PrismJS DOM clobbering — fix breaking programado).
+
+### Ciclo 1 — correcciones (commits: ver CHANGELOG)
+- Batch B2/D2: clasificación de errores 5xx/timeout como UNCERTAIN (jamás reenvío a ciegas),
+  eventId determinista CRM→WHATSPOWER con ventana de 5 min, rate limiting DURABLE en BD,
+  fail-closed de secretos (webhook secret jamás como Bearer, secreto legado desactivado con
+  claves por-org presentes), transacciones para org+user y para conexiones, dedup de webhooks
+  Meta por waMessageId, cifrado AES-256-GCM + lookup por hash de secretos Telegram.
+- Frontend (CRM): export con JWT en header (nunca en URL), deep-link Settings?tab, reset de
+  formulario, TabsList con wrap, JSON.parse blindado.
+
+### Ciclo 2 — reauditoría goldfish: hallazgos y resolución
+| Sev | Hallazgo | Resolución |
+| --- | --- | --- |
+| CRITICA | CRM: useEffect del form de clientes sin deps (borraba cada tecla) | deps [open, editClient] — 569/569 |
+| ALTA | CRM: backfill Telegram derivaba hash del ciphertext en estado parcial | hash SIEMPRE del valor en claro (descifra primero) |
+| ALTA | ULTRA: sin busy_timeout (server+worker comparten db/) | PRAGMA busy_timeout=5000 en ambas aperturas |
+| MEDIA | WP: sin WAL/busy_timeout | pragmas en createDatabase |
+| MEDIA | WP: fail-open del limiter invisible | console.warn en el catch |
+| MEDIA | WP: evento 'ya procesado sin resultado' si la ejecución falla tras el dedup | liberación de clave on-throw (reintento re-ejecuta) |
+| MEDIA | CRM: statuses de Meta duplicados en reintentos | dedup por messageId también en statuses |
+| MEDIA | CRM: migración de dedup irreversible | respaldo reversible Client_dedup_backup_20261111 |
+| MEDIA | ULTRA: claim A4-10 ≠ código (columnas pesadas) | comentario sincronizado; proyección pendiente |
+| BAJA | CRM: encryptSecret null silencioso; WP/ULTRA: limiter muertos, stacks en logs, tests dual-formato | resueltos |
+
+### Residuales documentados (no bloqueantes, con riesgo conocido)
+1. Prisma SQLite abre BEGIN DEFERRED: la re-verificación del límite de plan dentro de la
+   transacción es best-effort; la cerradura definitiva contra duplicados es el UNIQUE
+   (phoneNumberId) con P2002→409. Multi-instancia sobre PostgreSQL eliminaría la reserva.
+2. ULTRA: API de campañas cambió contrato (201 + {campaigns:[...]}) — consumidor interno
+   actualizado; terceros deben migrar (documentado en CHANGELOG).
+3. WP A1-05: evento sin teléfono deduplicado 24 h — si el CRM corrige el dato debe emitir un
+   eventId nuevo (comportamiento documentado).
+4. CRM: 5 vulnerabilidades moderadas de dependencias (fix breaking programado).
+5. Dedup check-then-act de webhooks conserva ventana TOCTOU microscópica ante POSTs
+   simultáneos verdaderos (el índice parcial cierra la vía del daemon).
+
+### Pruebas (verde al cierre)
+- CRM (vitest): 569/569
+- WHATSPOWER (node --test): 203/203
+- ULTRA (node --test): 152/152
+- TypeScript --noEmit: 0 errores en los 3 repos.
