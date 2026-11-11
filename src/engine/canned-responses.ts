@@ -18,22 +18,28 @@ export class CannedResponseManager {
     this.db = db
   }
 
-  createResponse(params: {
+  // (tercera reparación 4.A) Respuestas predefinidas POR ORGANIZACIÓN:
+  // PK (organization_id, id) y unicidad (organization_id, shortcut).
+
+  createResponse(orgId: string, params: {
     shortcut: string
     title: string
     content: string
     mediaUrl?: string
     category?: string
   }): CannedResponse {
+    if (!orgId || typeof orgId !== 'string') {
+      throw new Error('VALIDATION: createResponse exige organizationId (aislamiento multi-organización)')
+    }
     const id = `can_${randomUUID()}`
     const now = Math.floor(Date.now() / 1000)
     const shortcut = params.shortcut.startsWith('/') ? params.shortcut : `/${params.shortcut}`
     const category = params.category || 'general'
 
     this.db.prepare(`
-      INSERT INTO canned_responses (id, shortcut, title, content, media_url, category, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(id, shortcut, params.title, params.content, params.mediaUrl || null, category, now)
+      INSERT INTO canned_responses (id, organization_id, shortcut, title, content, media_url, category, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, orgId, shortcut, params.title, params.content, params.mediaUrl || null, category, now)
 
     return {
       id,
@@ -46,9 +52,9 @@ export class CannedResponseManager {
     }
   }
 
-  findByShortcut(shortcut: string): CannedResponse | null {
+  findByShortcut(orgId: string, shortcut: string): CannedResponse | null {
     const formatted = shortcut.startsWith('/') ? shortcut : `/${shortcut}`
-    const row = this.db.prepare('SELECT * FROM canned_responses WHERE shortcut = ?').get(formatted) as any
+    const row = this.db.prepare('SELECT * FROM canned_responses WHERE organization_id = ? AND shortcut = ?').get(orgId, formatted) as any
     if (!row) return null
     return {
       id: row.id,
@@ -61,8 +67,8 @@ export class CannedResponseManager {
     }
   }
 
-  listAll(): CannedResponse[] {
-    const rows = this.db.prepare('SELECT * FROM canned_responses ORDER BY category ASC, shortcut ASC').all() as any[]
+  listAll(orgId: string): CannedResponse[] {
+    const rows = this.db.prepare('SELECT * FROM canned_responses WHERE organization_id = ? ORDER BY category ASC, shortcut ASC').all(orgId) as any[]
     return rows.map((r) => ({
       id: r.id,
       shortcut: r.shortcut,

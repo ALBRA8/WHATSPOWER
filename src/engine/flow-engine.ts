@@ -14,19 +14,27 @@ export class FlowEngine {
 
   constructor(db: DatabaseSync) {
     this.db = db
-    this.seedDefaultFlowIfEmpty()
+    // (tercera reparación 4.B) La seed del flujo demo ya NO es global: cada
+    // organización recibe SU copia la primera vez que consulta/evalúa flujos
+    // (ensureDefaultFlowForOrg). En el constructor no hay contexto de org.
   }
 
   // =========================================================================
-  // 1. GESTIÓN DE FLUJOS (CRUD)
+  // 1. GESTIÓN DE FLUJOS (CRUD) — TODO ESTRICTAMENTE POR ORGANIZACIÓN (4.B)
+  // La PK es (organization_id, id): un flujo de la org A es INVISIBLE e
+  // INALCANZABLE para la org B (listado, lectura, edición, borrado y
+  // ejecución incluidos).
   // =========================================================================
 
-  saveFlow(flow: FlowDefinition): void {
+  saveFlow(orgId: string, flow: FlowDefinition): void {
+    if (!orgId || typeof orgId !== 'string') {
+      throw new Error('VALIDATION: saveFlow exige organizationId (aislamiento multi-organización)')
+    }
     const now = Date.now()
     const stmt = this.db.prepare(`
-      INSERT INTO flows (id, name, trigger_keywords, is_active, graph_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
+      INSERT INTO flows (id, organization_id, name, trigger_keywords, is_active, graph_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(organization_id, id) DO UPDATE SET
         name = excluded.name,
         trigger_keywords = excluded.trigger_keywords,
         is_active = excluded.is_active,
@@ -36,6 +44,7 @@ export class FlowEngine {
 
     stmt.run(
       flow.id,
+      orgId,
       flow.name,
       JSON.stringify(flow.triggerKeywords.map((k) => k.toLowerCase().trim())),
       flow.isActive ? 1 : 0,
@@ -45,8 +54,8 @@ export class FlowEngine {
     )
   }
 
-  getFlow(id: string): FlowDefinition | null {
-    const row = this.db.prepare('SELECT * FROM flows WHERE id = ?').get(id) as
+  getFlow(orgId: string, id: string): FlowDefinition | null {
+    const row = this.db.prepare('SELECT * FROM flows WHERE organization_id = ? AND id = ?').get(orgId, id) as
       | {
           id: string
           name: string
@@ -73,8 +82,11 @@ export class FlowEngine {
     }
   }
 
-  listFlows(): FlowDefinition[] {
-    const rows = this.db.prepare('SELECT * FROM flows ORDER BY updated_at DESC').all() as Array<{
+  listFlows(orgId: string): FlowDefinition[] {
+    // (tercera reparación 4.B) La consulta de una org SIN flujos recibe SU copia
+    // del flujo demo (seed perezosa por organización; jamás comparte la ajena).
+    this.ensureDefaultFlowForOrg(orgId)
+    const rows = this.db.prepare('SELECT * FROM flows WHERE organization_id = ? ORDER BY updated_at DESC').all(orgId) as Array<{
       id: string
       name: string
       trigger_keywords: string
@@ -99,8 +111,8 @@ export class FlowEngine {
     })
   }
 
-  deleteFlow(id: string): boolean {
-    const res = this.db.prepare('DELETE FROM flows WHERE id = ?').run(id)
+  deleteFlow(orgId: string, id: string): boolean {
+    const res = this.db.prepare('DELETE FROM flows WHERE organization_id = ? AND id = ?').run(orgId, id)
     return res.changes > 0
   }
 
@@ -108,55 +120,58 @@ export class FlowEngine {
   // 2. ETIQUETAS (TAGS) Y CAMPOS PERSONALIZADOS (CUSTOM FIELDS)
   // =========================================================================
 
-  addTag(phone: string, tag: string): void {
+  addTag(orgId: string, phone: string, tag: string): void {
     const cleanTag = tag.trim().toLowerCase()
-    this.db.prepare('INSERT OR IGNORE INTO contact_tags (contact_phone, tag_name, created_at) VALUES (?, ?, ?)').run(
+    this.db.prepare('INSERT OR IGNORE INTO contact_tags (organization_id, contact_phone, tag_name, created_at) VALUES (?, ?, ?, ?)').run(
+      orgId,
       phone,
       cleanTag,
       Date.now()
     )
   }
 
-  removeTag(phone: string, tag: string): void {
+  removeTag(orgId: string, phone: string, tag: string): void {
     const cleanTag = tag.trim().toLowerCase()
-    this.db.prepare('DELETE FROM contact_tags WHERE contact_phone = ? AND tag_name = ?').run(phone, cleanTag)
+    this.db.prepare('DELETE FROM contact_tags WHERE organization_id = ? AND contact_phone = ? AND tag_name = ?').run(orgId, phone, cleanTag)
   }
 
-  getTags(phone: string): string[] {
-    const rows = this.db.prepare('SELECT tag_name FROM contact_tags WHERE contact_phone = ? ORDER BY created_at ASC').all(phone) as Array<{
+  getTags(orgId: string, phone: string): string[] {
+    const rows = this.db.prepare('SELECT tag_name FROM contact_tags WHERE organization_id = ? AND contact_phone = ? ORDER BY created_at ASC').all(orgId, phone) as Array<{
       tag_name: string
     }>
     return rows.map((r) => r.tag_name)
   }
 
-  hasTag(phone: string, tag: string): boolean {
+  hasTag(orgId: string, phone: string, tag: string): boolean {
     const cleanTag = tag.trim().toLowerCase()
-    const row = this.db.prepare('SELECT 1 FROM contact_tags WHERE contact_phone = ? AND tag_name = ?').get(phone, cleanTag)
+    const row = this.db.prepare('SELECT 1 FROM contact_tags WHERE organization_id = ? AND contact_phone = ? AND tag_name = ?').get(orgId, phone, cleanTag)
     return Boolean(row)
   }
 
-  setCustomField(phone: string, key: string, value: string): void {
+  setCustomField(orgId: string, phone: string, key: string, value: string): void {
     const cleanKey = key.trim().toLowerCase()
     this.db.prepare(`
-      INSERT INTO contact_custom_fields (contact_phone, field_key, field_value, updated_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(contact_phone, field_key) DO UPDATE SET
+      INSERT INTO contact_custom_fields (organization_id, contact_phone, field_key, field_value, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(organization_id, contact_phone, field_key) DO UPDATE SET
         field_value = excluded.field_value,
         updated_at = excluded.updated_at
-    `).run(phone, cleanKey, String(value), Date.now())
+    `).run(orgId, phone, cleanKey, String(value), Date.now())
   }
 
-  getCustomField(phone: string, key: string): string | null {
+  getCustomField(orgId: string, phone: string, key: string): string | null {
     const cleanKey = key.trim().toLowerCase()
-    const row = this.db.prepare('SELECT field_value FROM contact_custom_fields WHERE contact_phone = ? AND field_key = ?').get(
+    const row = this.db.prepare('SELECT field_value FROM contact_custom_fields WHERE organization_id = ? AND contact_phone = ? AND field_key = ?').get(
+      orgId,
       phone,
       cleanKey
     ) as { field_value: string } | undefined
     return row ? row.field_value : null
   }
 
-  getAllCustomFields(phone: string): Record<string, string> {
-    const rows = this.db.prepare('SELECT field_key, field_value FROM contact_custom_fields WHERE contact_phone = ?').all(
+  getAllCustomFields(orgId: string, phone: string): Record<string, string> {
+    const rows = this.db.prepare('SELECT field_key, field_value FROM contact_custom_fields WHERE organization_id = ? AND contact_phone = ?').all(
+      orgId,
       phone
     ) as Array<{ field_key: string; field_value: string }>
     const map: Record<string, string> = {}
@@ -170,46 +185,63 @@ export class FlowEngine {
   // 3. SECUENCIAS Y DRIP CAMPAIGNS (CAMPAÑAS DE GOTEO)
   // =========================================================================
 
-  saveSequence(seq: SequenceDefinition): void {
-    this.db.prepare('INSERT OR REPLACE INTO sequences (id, name, is_active, created_at) VALUES (?, ?, ?, ?)').run(
+  saveSequence(orgId: string, seq: SequenceDefinition): void {
+    if (!orgId || typeof orgId !== 'string') {
+      throw new Error('VALIDATION: saveSequence exige organizationId (aislamiento multi-organización)')
+    }
+    this.db.prepare('INSERT OR REPLACE INTO sequences (id, organization_id, name, is_active, created_at) VALUES (?, ?, ?, ?, ?)').run(
       seq.id,
+      orgId,
       seq.name,
       seq.isActive ? 1 : 0,
       Date.now()
     )
 
-    this.db.prepare('DELETE FROM sequence_steps WHERE sequence_id = ?').run(seq.id)
+    this.db.prepare('DELETE FROM sequence_steps WHERE organization_id = ? AND sequence_id = ?').run(orgId, seq.id)
     const stepStmt = this.db.prepare(`
-      INSERT INTO sequence_steps (id, sequence_id, step_order, delay_minutes, message_text, flow_id)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO sequence_steps (id, organization_id, sequence_id, step_order, delay_minutes, message_text, flow_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
 
     for (const step of seq.steps) {
-      stepStmt.run(step.id, seq.id, step.stepOrder, step.delayMinutes, step.messageText, step.flowId || null)
+      stepStmt.run(step.id, orgId, seq.id, step.stepOrder, step.delayMinutes, step.messageText, step.flowId || null)
     }
   }
 
-  enrollContactInSequence(phone: string, sequenceId: string): void {
-    const enrollmentId = `enr_${sequenceId}_${phone}`
+  /** La secuencia debe existir EN LA ORGANIZACIÓN para poder inscribir contactos en ella (4.B). */
+  getSequence(orgId: string, sequenceId: string): { id: string; name: string; isActive: boolean } | null {
+    const row = this.db.prepare('SELECT id, name, is_active FROM sequences WHERE organization_id = ? AND id = ?').get(orgId, sequenceId) as
+      | { id: string; name: string; is_active: number }
+      | undefined
+    if (!row) return null
+    return { id: row.id, name: row.name, isActive: row.is_active === 1 }
+  }
+
+  enrollContactInSequence(orgId: string, phone: string, sequenceId: string): void {
+    // (tercera reparación 4.B) Una organización NO puede inscribir contactos en
+    // secuencias de otra: si la secuencia no existe EN SU org, no se inscribe.
+    if (!this.getSequence(orgId, sequenceId)) return
+    const enrollmentId = `enr_${orgId}_${sequenceId}_${phone}`
     const now = Date.now()
     this.db.prepare(`
-      INSERT INTO sequence_enrollments (id, sequence_id, contact_phone, current_step, next_run_at, status)
-      VALUES (?, ?, ?, 1, ?, 'ACTIVE')
-      ON CONFLICT(id) DO UPDATE SET
+      INSERT INTO sequence_enrollments (id, organization_id, sequence_id, contact_phone, current_step, next_run_at, status)
+      VALUES (?, ?, ?, ?, 1, ?, 'ACTIVE')
+      ON CONFLICT(organization_id, sequence_id, contact_phone) DO UPDATE SET
         current_step = 1,
         next_run_at = excluded.next_run_at,
         status = 'ACTIVE'
-    `).run(enrollmentId, sequenceId, phone, now)
+    `).run(enrollmentId, orgId, sequenceId, phone, now)
   }
 
-  cancelSequenceEnrollment(phone: string, sequenceId?: string): void {
+  cancelSequenceEnrollment(orgId: string, phone: string, sequenceId?: string): void {
     if (sequenceId) {
-      this.db.prepare("UPDATE sequence_enrollments SET status = 'CANCELLED' WHERE contact_phone = ? AND sequence_id = ?").run(
+      this.db.prepare("UPDATE sequence_enrollments SET status = 'CANCELLED' WHERE organization_id = ? AND contact_phone = ? AND sequence_id = ?").run(
+        orgId,
         phone,
         sequenceId
       )
     } else {
-      this.db.prepare("UPDATE sequence_enrollments SET status = 'CANCELLED' WHERE contact_phone = ?").run(phone)
+      this.db.prepare("UPDATE sequence_enrollments SET status = 'CANCELLED' WHERE organization_id = ? AND contact_phone = ?").run(orgId, phone)
     }
   }
 
@@ -217,8 +249,8 @@ export class FlowEngine {
   // 4. SESIONES DE DIÁLOGO
   // =========================================================================
 
-  getSession(contactPhone: string): FlowSession | null {
-    const row = this.db.prepare('SELECT * FROM flow_sessions WHERE contact_phone = ?').get(contactPhone) as
+  getSession(orgId: string, contactPhone: string): FlowSession | null {
+    const row = this.db.prepare('SELECT * FROM flow_sessions WHERE organization_id = ? AND contact_phone = ?').get(orgId, contactPhone) as
       | {
           contact_phone: string
           flow_id: string
@@ -232,7 +264,7 @@ export class FlowEngine {
     if (!row) return null
 
     if (Date.now() - row.last_activity > 2 * 60 * 60 * 1000) {
-      this.clearSession(contactPhone)
+      this.clearSession(orgId, contactPhone)
       return null
     }
 
@@ -248,11 +280,11 @@ export class FlowEngine {
     }
   }
 
-  saveSession(session: FlowSession): void {
+  saveSession(orgId: string, session: FlowSession): void {
     const stmt = this.db.prepare(`
-      INSERT INTO flow_sessions (contact_phone, flow_id, current_node_id, waiting_for_input, context_json, last_activity)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(contact_phone) DO UPDATE SET
+      INSERT INTO flow_sessions (organization_id, contact_phone, flow_id, current_node_id, waiting_for_input, context_json, last_activity)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(organization_id, contact_phone) DO UPDATE SET
         flow_id = excluded.flow_id,
         current_node_id = excluded.current_node_id,
         waiting_for_input = excluded.waiting_for_input,
@@ -266,6 +298,7 @@ export class FlowEngine {
     }
 
     stmt.run(
+      orgId,
       session.contactPhone,
       session.flowId,
       session.currentNodeId,
@@ -275,13 +308,17 @@ export class FlowEngine {
     )
   }
 
-  clearSession(contactPhone: string): void {
-    this.db.prepare('DELETE FROM flow_sessions WHERE contact_phone = ?').run(contactPhone)
+  clearSession(orgId: string, contactPhone: string): void {
+    this.db.prepare('DELETE FROM flow_sessions WHERE organization_id = ? AND contact_phone = ?').run(orgId, contactPhone)
   }
 
-  findMatchingFlow(messageText: string): FlowDefinition | null {
+  findMatchingFlow(orgId: string, messageText: string): FlowDefinition | null {
+    // (tercera reparación 4.B) SOLO flujos de ESTA organización pueden dispararse:
+    // un mensaje de la org A jamás ejecuta un flujo de la org B, aunque los
+    // identificadores o palabras clave coincidan.
+    this.ensureDefaultFlowForOrg(orgId)
     const clean = messageText.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    const flows = this.listFlows().filter((f) => f.isActive)
+    const flows = this.listFlows(orgId).filter((f) => f.isActive)
 
     for (const flow of flows) {
       for (const kw of flow.triggerKeywords) {
@@ -298,32 +335,33 @@ export class FlowEngine {
   // =========================================================================
 
   async evaluateStep(
+    orgId: string,
     contactPhone: string,
     messageText: string,
     contactInfo?: { name?: string; clientId?: string | null }
   ): Promise<FlowEvaluationResult> {
     const cleanInput = messageText.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    let session = this.getSession(contactPhone)
+    let session = this.getSession(orgId, contactPhone)
     let flow: FlowDefinition | null = null
 
-    // Registrar mensaje en bandeja de entrada (Inbox)
+    // Registrar mensaje en bandeja de entrada (Inbox) — con organización
     this.db.prepare(`
-      INSERT INTO inbox_messages (id, contact_phone, direction, text, created_at)
-      VALUES (?, ?, 'inbound', ?, ?)
-    `).run(`in_${Date.now()}_${Math.random().toString(36).substring(7)}`, contactPhone, messageText, Date.now())
+      INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, created_at)
+      VALUES (?, ?, ?, 'inbound', ?, ?)
+    `).run(`in_${Date.now()}_${Math.random().toString(36).substring(7)}`, orgId, contactPhone, messageText, Date.now())
 
-    // CASO 1: Continuar flujo existente
+    // CASO 1: Continuar flujo existente (el flujo debe pertenecer a ESTA org)
     if (session) {
-      flow = this.getFlow(session.flowId)
+      flow = this.getFlow(orgId, session.flowId)
       if (!flow || !flow.isActive) {
-        this.clearSession(contactPhone)
+        this.clearSession(orgId, contactPhone)
         session = null
       }
     }
 
-    // CASO 2: Iniciar nuevo flujo por trigger
+    // CASO 2: Iniciar nuevo flujo por trigger (búsqueda CONFINADA a la org)
     if (!session) {
-      flow = this.findMatchingFlow(messageText)
+      flow = this.findMatchingFlow(orgId, messageText)
       if (!flow) {
         return { handled: false, messagesToSend: [], actionsToExecute: [] }
       }
@@ -338,7 +376,7 @@ export class FlowEngine {
         return { handled: false, messagesToSend: [], actionsToExecute: [] }
       }
 
-      const customFields = this.getAllCustomFields(contactPhone)
+      const customFields = this.getAllCustomFields(orgId, contactPhone)
       session = {
         contactPhone,
         flowId: flow.id,
@@ -356,13 +394,13 @@ export class FlowEngine {
       // Avanzar en el flujo existente
       const currentNode = flow!.nodes.find((n) => n.id === session!.currentNodeId)
       if (!currentNode) {
-        this.clearSession(contactPhone)
+        this.clearSession(orgId, contactPhone)
         return { handled: false, messagesToSend: [], actionsToExecute: [] }
       }
 
       // Si estábamos esperando User Input (captura de dato a custom field)
       if (currentNode.type === 'user_input' && session.inputTargetField) {
-        this.setCustomField(contactPhone, session.inputTargetField, messageText.trim())
+        this.setCustomField(orgId, contactPhone, session.inputTargetField, messageText.trim())
         session.context[session.inputTargetField] = messageText.trim()
         session.inputTargetField = undefined
       }
@@ -389,7 +427,7 @@ export class FlowEngine {
       }
 
       if (!nextEdge) {
-        this.clearSession(contactPhone)
+        this.clearSession(orgId, contactPhone)
         return {
           handled: true,
           flowId: flow!.id,
@@ -430,10 +468,10 @@ export class FlowEngine {
           buttons,
         })
 
-        this.recordOutboundMessage(contactPhone, text, currentNode.data.mediaUrl)
+        this.recordOutboundMessage(orgId, contactPhone, text, currentNode.data.mediaUrl)
 
         session.waitingForInput = true
-        this.saveSession(session)
+        this.saveSession(orgId, session)
         break // Pausar esperando respuesta
       }
 
@@ -443,11 +481,11 @@ export class FlowEngine {
         prompt = this.interpolateVariables(prompt, session.context, contactPhone)
 
         messagesToSend.push({ text: prompt })
-        this.recordOutboundMessage(contactPhone, prompt)
+        this.recordOutboundMessage(orgId, contactPhone, prompt)
 
         session.waitingForInput = true
         session.inputTargetField = currentNode.data.saveToCustomField || 'dato_capturado'
-        this.saveSession(session)
+        this.saveSession(orgId, session)
         break // Pausar esperando el dato del usuario
       }
 
@@ -455,7 +493,7 @@ export class FlowEngine {
       else if (currentNode.type === 'condition') {
         const rules = currentNode.data.rules || []
         const logic = currentNode.data.conditionLogic || 'AND'
-        const isMatch = this.evaluateConditionRules(contactPhone, rules, logic, session.context)
+        const isMatch = this.evaluateConditionRules(orgId, contactPhone, rules, logic, session.context)
 
         const targetHandle = isMatch ? 'yes' : 'no'
         const nextEdge = flow!.edges.find((e) => e.source === currentNode!.id && e.sourceHandle === targetHandle)
@@ -474,24 +512,24 @@ export class FlowEngine {
 
         // 1. Tagging
         if (actType === 'add_tag' && currentNode.data.tag) {
-          this.addTag(contactPhone, currentNode.data.tag)
+          this.addTag(orgId, contactPhone, currentNode.data.tag)
           tagsToAdd.push(currentNode.data.tag)
         } else if (actType === 'remove_tag' && currentNode.data.tag) {
-          this.removeTag(contactPhone, currentNode.data.tag)
+          this.removeTag(orgId, contactPhone, currentNode.data.tag)
           tagsToRemove.push(currentNode.data.tag)
         }
 
         // 2. Custom Field
         else if (actType === 'set_custom_field' && currentNode.data.customFieldKey && currentNode.data.customFieldValue) {
           const val = this.interpolateVariables(currentNode.data.customFieldValue, session.context, contactPhone)
-          this.setCustomField(contactPhone, currentNode.data.customFieldKey, val)
+          this.setCustomField(orgId, contactPhone, currentNode.data.customFieldKey, val)
           customFieldsToSet[currentNode.data.customFieldKey] = val
           session.context[currentNode.data.customFieldKey] = val
         }
 
         // 3. Drip Sequence
         else if (actType === 'enroll_sequence' && currentNode.data.sequenceId) {
-          this.enrollContactInSequence(contactPhone, currentNode.data.sequenceId)
+          this.enrollContactInSequence(orgId, contactPhone, currentNode.data.sequenceId)
           sequenceToEnroll = currentNode.data.sequenceId
         }
 
@@ -539,9 +577,9 @@ export class FlowEngine {
         }
       }
 
-      // --- NODO: GOTO_FLOW (Sub-flujo) ---
+      // --- NODO: GOTO_FLOW (Sub-flujo) — el sub-flujo debe pertenecer a ESTA org (4.B) ---
       else if (currentNode.type === 'goto_flow' && currentNode.data.targetFlowId) {
-        const targetFlow = this.getFlow(currentNode.data.targetFlowId)
+        const targetFlow = this.getFlow(orgId, currentNode.data.targetFlowId)
         if (targetFlow) {
           flow = targetFlow
           session.flowId = targetFlow.id
@@ -562,8 +600,8 @@ export class FlowEngine {
         handoffReason = currentNode.data.handoffReason || `Transferencia activada en ManyChat: ${flow!.name}`
         const farewell = '👤 Te estamos comunicando con un asesor de nuestro equipo comercial. El bot se ha pausado.'
         messagesToSend.push({ text: farewell })
-        this.recordOutboundMessage(contactPhone, farewell)
-        this.clearSession(contactPhone)
+        this.recordOutboundMessage(orgId, contactPhone, farewell)
+        this.clearSession(orgId, contactPhone)
         break
       }
 
@@ -572,7 +610,7 @@ export class FlowEngine {
         const prompt = currentNode.data.aiPrompt || 'Responde de forma concisa como asistente de ventas.'
         const aiText = `🤖 [IA Asistente]: Gracias por tu pregunta. En breve un asesor te dará más detalles personalizados.`
         messagesToSend.push({ text: aiText })
-        this.recordOutboundMessage(contactPhone, aiText)
+        this.recordOutboundMessage(orgId, contactPhone, aiText)
 
         const nextEdge = flow!.edges.find((e) => e.source === currentNode!.id)
         if (nextEdge) {
@@ -593,7 +631,7 @@ export class FlowEngine {
     }
 
     if (!currentNode && !session.waitingForInput) {
-      this.clearSession(contactPhone)
+      this.clearSession(orgId, contactPhone)
     }
 
     return {
@@ -628,6 +666,7 @@ export class FlowEngine {
   }
 
   private evaluateConditionRules(
+    orgId: string,
     phone: string,
     rules: ConditionRule[],
     logic: 'AND' | 'OR',
@@ -637,14 +676,14 @@ export class FlowEngine {
 
     const results = rules.map((r) => {
       if (r.type === 'has_tag') {
-        return this.hasTag(phone, r.value)
+        return this.hasTag(orgId, phone, r.value)
       } else if (r.type === 'does_not_have_tag') {
-        return !this.hasTag(phone, r.value)
+        return !this.hasTag(orgId, phone, r.value)
       } else if (r.type === 'field_equals' && r.field) {
-        const val = this.getCustomField(phone, r.field) || context[r.field] || ''
+        const val = this.getCustomField(orgId, phone, r.field) || context[r.field] || ''
         return val.toLowerCase() === r.value.toLowerCase()
       } else if (r.type === 'field_contains' && r.field) {
-        const val = this.getCustomField(phone, r.field) || context[r.field] || ''
+        const val = this.getCustomField(orgId, phone, r.field) || context[r.field] || ''
         return val.toLowerCase().includes(r.value.toLowerCase())
       } else if (r.type === 'message_contains') {
         const msg = context.ultimo_mensaje || ''
@@ -656,17 +695,23 @@ export class FlowEngine {
     return logic === 'AND' ? results.every(Boolean) : results.some(Boolean)
   }
 
-  private recordOutboundMessage(phone: string, text: string, mediaUrl?: string): void {
+  private recordOutboundMessage(orgId: string, phone: string, text: string, mediaUrl?: string): void {
     try {
       this.db.prepare(`
-        INSERT INTO inbox_messages (id, contact_phone, direction, text, media_url, created_at)
-        VALUES (?, ?, 'outbound', ?, ?, ?)
-      `).run(`out_${Date.now()}_${Math.random().toString(36).substring(7)}`, phone, text, mediaUrl || null, Date.now())
+        INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, media_url, created_at)
+        VALUES (?, ?, ?, 'outbound', ?, ?, ?)
+      `).run(`out_${Date.now()}_${Math.random().toString(36).substring(7)}`, orgId, phone, text, mediaUrl || null, Date.now())
     } catch {}
   }
 
-  private seedDefaultFlowIfEmpty(): void {
-    const count = this.db.prepare('SELECT count(*) as total FROM flows').get() as { total: number }
+  /**
+   * (tercera reparación 4.B) Seed POR ORGANIZACIÓN del flujo demo: cada org
+   * recibe SU PROPIA copia la primera vez que evalúa/consulta flujos. Las
+   * organizaciones existentes jamás ven flujos ajenos.
+   */
+  private ensureDefaultFlowForOrg(orgId: string): void {
+    if (!orgId || typeof orgId !== 'string') return
+    const count = this.db.prepare('SELECT count(*) as total FROM flows WHERE organization_id = ?').get(orgId) as { total: number }
     if (count && count.total > 0) return
 
     const defaultFlow: FlowDefinition = {
@@ -752,6 +797,6 @@ export class FlowEngine {
       ],
     }
 
-    this.saveFlow(defaultFlow)
+    this.saveFlow(orgId, defaultFlow)
   }
 }

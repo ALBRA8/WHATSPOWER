@@ -13,7 +13,7 @@ test('SUITE: WhatsPower Studio HTTP API & Web Interface', async () => {
 
   try {
     // 1. GET /studio
-    const resStudio = await fetch('http://localhost:3015/studio')
+    const resStudio = await fetch('http://localhost:3015/studio', { headers: AUTH })
     assert.strictEqual(resStudio.status, 200)
     const html = await resStudio.text()
     assert.ok(html.includes('WhatsPower Flow Studio'))
@@ -23,18 +23,35 @@ test('SUITE: WhatsPower Studio HTTP API & Web Interface', async () => {
     const resAnon = await fetch('http://localhost:3015/api/flows')
     assert.strictEqual(resAnon.status, 401)
 
-    // 2. GET /api/flows autenticado
-    const resFlows = await fetch('http://localhost:3015/api/flows', { headers: AUTH })
+    // 1c. GET /api/flows autenticado SIN x-org-id → 400 (tercera reparación 4.B)
+    const resNoOrg = await fetch('http://localhost:3015/api/flows', { headers: AUTH })
+    assert.strictEqual(resNoOrg.status, 400)
+
+    // 2. GET /api/flows autenticado CON org (seed perezosa por-org al listar)
+    const resFlows = await fetch('http://localhost:3015/api/flows', { headers: { ...AUTH, 'X-Org-Id': 'org_test' } })
     assert.strictEqual(resFlows.status, 200)
     const flows = await resFlows.json()
     assert.ok(flows.length >= 1)
     assert.ok(flows[0].name.includes('Calificación'))
+    // Aislamiento: cada org tiene SU espacio de flujos (la seed de org_otra es una copia propia)
+    const resFlowsB = await fetch('http://localhost:3015/api/flows', { headers: { ...AUTH, 'X-Org-Id': 'org_otra' } })
+    const flowsB = await resFlowsB.json()
+    assert.ok(Array.isArray(flowsB) && flowsB.length >= 1)
+    // POST un flujo privado en org_test y verificar que org_otra NO lo ve
+    const resPriv = await fetch('http://localhost:3015/api/flows', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...AUTH, 'X-Org-Id': 'org_test' },
+      body: JSON.stringify({ id: 'flow_privado_api', name: 'Privado API', triggerKeywords: ['privado'], isActive: true, nodes: [], edges: [] }),
+    })
+    assert.strictEqual(resPriv.status, 200)
+    const flowsB2 = await (await fetch('http://localhost:3015/api/flows', { headers: { ...AUTH, 'X-Org-Id': 'org_otra' } })).json()
+    assert.ok(flowsB2.every((f: { id: string }) => f.id !== 'flow_privado_api'), 'org_otra no ve el flujo privado de org_test')
 
     // 3. POST /api/flows/simulate autenticado
     const resSim = await fetch('http://localhost:3015/api/flows/simulate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...AUTH },
-      body: JSON.stringify({ phone: '+573009991122', messageText: 'precio', name: 'Simulada' })
+      body: JSON.stringify({ orgId: 'org_test', phone: '+573009991122', messageText: 'precio', name: 'Simulada' })
     })
     assert.strictEqual(resSim.status, 200)
     const simData = await resSim.json()

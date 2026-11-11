@@ -3,6 +3,12 @@ import type { ConversationLock, ConversationState } from '../types.ts'
 
 export const LOCK_TTL_SECONDS = 900 // 15 minutos de inactividad
 
+/**
+ * LockManager — locks de conversación POR (organización, contacto).
+ * (segunda reparación §3.A) La PK es (organization_id, contact_phone): el mismo
+ * número de teléfono en dos organizaciones tiene locks COMPLETAMENTE
+ * independientes — el handoff de una org jamás bloquea a la otra.
+ */
 export class LockManager {
   db: DatabaseSync
   constructor(db: DatabaseSync) {
@@ -16,8 +22,8 @@ export class LockManager {
     const now = Math.floor(Date.now() / 1000)
     const expiresAt = now + LOCK_TTL_SECONDS
 
-    const stmtSelect = this.db.prepare('SELECT contact_phone, organization_id, current_state, locked_at, expires_at, correlation_id FROM conversation_locks WHERE contact_phone = ?')
-    const existing = stmtSelect.get(phone) as {
+    const stmtSelect = this.db.prepare('SELECT contact_phone, organization_id, current_state, locked_at, expires_at, correlation_id FROM conversation_locks WHERE organization_id = ? AND contact_phone = ?')
+    const existing = stmtSelect.get(orgId, phone) as {
       contact_phone: string
       organization_id: string
       current_state: string
@@ -35,12 +41,12 @@ export class LockManager {
       // Si el lock aún está activo y no ha expirado
       if (existing.expires_at > now) {
         // Mismo flujo activo: extendemos el TTL
-        this.db.prepare('UPDATE conversation_locks SET expires_at = ?, correlation_id = ? WHERE contact_phone = ?').run(expiresAt, correlationId, phone)
+        this.db.prepare('UPDATE conversation_locks SET expires_at = ?, correlation_id = ? WHERE organization_id = ? AND contact_phone = ?').run(expiresAt, correlationId, orgId, phone)
         return { acquired: true, state: 'IN_FLOW_2A' }
       }
 
       // Si el lock expiró por TTL, lo reasigna atómicamente
-      this.db.prepare('UPDATE conversation_locks SET organization_id = ?, current_state = ?, locked_at = ?, expires_at = ?, correlation_id = ? WHERE contact_phone = ?').run(orgId, 'IN_FLOW_2A', now, expiresAt, correlationId, phone)
+      this.db.prepare('UPDATE conversation_locks SET current_state = ?, locked_at = ?, expires_at = ?, correlation_id = ? WHERE organization_id = ? AND contact_phone = ?').run('IN_FLOW_2A', now, expiresAt, correlationId, orgId, phone)
       return { acquired: true, state: 'IN_FLOW_2A' }
     }
 
@@ -50,7 +56,7 @@ export class LockManager {
   }
 
   /**
-   * Pasa el lock a estado de atención humana exclusiva.
+   * Pasa el lock a estado de atención humana exclusiva (SOLO para esta org).
    */
   setHandoff(phone: string, orgId: string, correlationId: string): void {
     const now = Math.floor(Date.now() / 1000)
@@ -59,7 +65,7 @@ export class LockManager {
     this.db.prepare(`
       INSERT INTO conversation_locks (contact_phone, organization_id, current_state, locked_at, expires_at, correlation_id)
       VALUES (?, ?, 'HANDOFF_HUMAN', ?, ?, ?)
-      ON CONFLICT(contact_phone) DO UPDATE SET
+      ON CONFLICT(organization_id, contact_phone) DO UPDATE SET
         current_state = 'HANDOFF_HUMAN',
         locked_at = excluded.locked_at,
         expires_at = excluded.expires_at,
@@ -68,24 +74,24 @@ export class LockManager {
   }
 
   /**
-   * Libera el lock de un contacto tras finalizar el flujo o resolución del asesor.
+   * Libera el lock de un contacto (de la ORGANIZACIÓN dada) tras finalizar el flujo o resolución del asesor.
    */
-  releaseLock(phone: string): void {
-    this.db.prepare('DELETE FROM conversation_locks WHERE contact_phone = ?').run(phone)
+  releaseLock(phone: string, orgId: string): void {
+    this.db.prepare('DELETE FROM conversation_locks WHERE organization_id = ? AND contact_phone = ?').run(orgId, phone)
   }
 
   /**
-   * Consulta el lock de un teléfono (usado para coordinación con Capa 2B).
+   * Consulta el lock de un teléfono DENTRO de una organización.
    */
-  getLock(phone: string): ConversationLock | null {
+  getLock(phone: string, orgId: string): ConversationLock | null {
     const now = Math.floor(Date.now() / 1000)
-    const row = this.db.prepare('SELECT contact_phone, organization_id, current_state, locked_at, expires_at, correlation_id FROM conversation_locks WHERE contact_phone = ?').get(phone) as any
+    const row = this.db.prepare('SELECT contact_phone, organization_id, current_state, locked_at, expires_at, correlation_id FROM conversation_locks WHERE organization_id = ? AND contact_phone = ?').get(orgId, phone) as any
 
     if (!row) return null
 
     // Si expiró por TTL y no es HANDOFF_HUMAN, se considera libre
     if (row.current_state !== 'HANDOFF_HUMAN' && row.expires_at <= now) {
-      this.releaseLock(phone)
+      this.releaseLock(phone, orgId)
       return null
     }
 

@@ -12,6 +12,9 @@ async function runTestSuite() {
   console.log('============================================================\n')
 
   process.env.INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET || 'crm_albra_test_suite_internal_secret_24chars';
+  // B3: provisión de credenciales de servicio ANTES del arranque (los endpoints
+  // /api/internal/* exigen credencial vinculada a la organización).
+  process.env.ORG_SERVICE_CREDENTIALS = 'org_test_1:org_test_1_service_credential_min16ch';
   const transport = new MockTransportSender()
   const crm = new MockCrmClient()
   const webhookSecret = 'test_secret_key_12345'
@@ -105,7 +108,7 @@ async function runTestSuite() {
     assert.ok((crm.executedActions[0].params.content as string).includes('Handoff IA'))
 
     // Comprobar que el lock quedó en HANDOFF_HUMAN
-    const lock = router.getLockManager().getLock('+573000000003')
+    const lock = router.getLockManager().getLock('+573000000003', 'org_test_1')
     assert.ok(lock)
     assert.strictEqual(lock.currentState, 'HANDOFF_HUMAN')
   })
@@ -164,13 +167,13 @@ async function runTestSuite() {
     const phone = '+573000000006'
     router.getLockManager().acquireLock(phone, 'org_test_1', 'corr_006')
 
-    const lockInfo = router.getLockManager().getLock(phone)
+    const lockInfo = router.getLockManager().getLock(phone, 'org_test_1')
     assert.ok(lockInfo)
     assert.strictEqual(lockInfo.currentState, 'IN_FLOW_2A')
 
     // Liberar lock simula cierre de conversación
-    router.getLockManager().releaseLock(phone)
-    const freeLock = router.getLockManager().getLock(phone)
+    router.getLockManager().releaseLock(phone, 'org_test_1')
+    const freeLock = router.getLockManager().getLock(phone, 'org_test_1')
     assert.strictEqual(freeLock, null)
   })
 
@@ -181,13 +184,13 @@ async function runTestSuite() {
     const phone = '+573000000007'
     router.getLockManager().acquireLock(phone, 'org_albra_alpha', 'corr_007_a')
 
-    const lockA = router.getLockManager().getLock(phone)
+    const lockA = router.getLockManager().getLock(phone, 'org_albra_alpha')
     assert.strictEqual(lockA?.organizationId, 'org_albra_alpha')
 
     // Si otra org intenta adquirirlo sobre el mismo número activo, es bloqueado por concurrencia
     const lockTryB = router.getLockManager().acquireLock(phone, 'org_albra_beta', 'corr_007_b')
-    assert.strictEqual(lockTryB.acquired, true) // Extiende el lock
-    assert.strictEqual(router.getLockManager().getLock(phone)?.organizationId, 'org_albra_alpha')
+    assert.strictEqual(lockTryB.acquired, true) // Extiende el lock (org beta es INDEPENDIENTE: su lock no colisiona)
+    assert.strictEqual(router.getLockManager().getLock(phone, 'org_albra_alpha')?.organizationId, 'org_albra_alpha')
   })
 
   // -------------------------------------------------------------
@@ -222,7 +225,7 @@ async function runTestSuite() {
 
     const res = await router.processInbound(eventOptOut)
     assert.strictEqual(res.actionTaken, 'suppression_opt_out')
-    assert.ok(router.getSuppressionStore().isSuppressed(phone))
+    assert.ok(router.getSuppressionStore().isSuppressed('org_test_1', phone))
     assert.ok(transport.dispatched[0].text.includes('dado de baja correctamente'))
 
     // Intento subsiguiente de mensaje normal
@@ -252,10 +255,10 @@ async function runTestSuite() {
     // Simulamos que el lock fue adquirido hace 16 minutos (960 segundos atrás)
     const oldTimestamp = Math.floor(Date.now() / 1000) - 960
     const pastExpires = oldTimestamp + 900 // Ya venció hace 60s
-    router['db'].prepare('UPDATE conversation_locks SET locked_at = ?, expires_at = ? WHERE contact_phone = ?').run(oldTimestamp, pastExpires, phone)
+    router['db'].prepare('UPDATE conversation_locks SET locked_at = ?, expires_at = ? WHERE organization_id = ? AND contact_phone = ?').run(oldTimestamp, pastExpires, 'org_test_1', phone)
 
     // Al consultar, debe detectar expiración por TTL y liberarlo
-    const lockAfterTtl = router.getLockManager().getLock(phone)
+    const lockAfterTtl = router.getLockManager().getLock(phone, 'org_test_1')
     assert.strictEqual(lockAfterTtl, null)
   })
 
@@ -273,11 +276,13 @@ async function runTestSuite() {
       if (!process.env.INTERNAL_API_SECRET) {
         process.env.INTERNAL_API_SECRET = 'crm_albra_test_suite_internal_secret_24chars'
       }
-      const secret = process.env.INTERNAL_API_SECRET
+      // B3: credencial de servicio de la org (provisionada en el arranque, arriba).
+      const orgCred = 'org_test_1_service_credential_min16ch'
+      const secret = orgCred
 
       // 1. Consulta inicial: no suprimido (ahora autenticada)
       const resGet1 = await fetch(`http://localhost:${testPort}/api/internal/suppression/${phone}`, {
-        headers: { 'Authorization': `Bearer ${secret}` },
+        headers: { 'Authorization': `Bearer ${secret}`, 'x-org-id': 'org_test_1' },
       })
       const dataGet1 = await resGet1.json() as any
       assert.strictEqual(dataGet1.suppressed, false)
@@ -288,6 +293,7 @@ async function runTestSuite() {
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${secret}`,
+          'x-org-id': 'org_test_1',
         },
         body: JSON.stringify({ reason: 'Opt-out test unitario CP-11' }),
       })
@@ -297,7 +303,7 @@ async function runTestSuite() {
 
       // 3. Consulta posterior: suprimido confirmado (autenticada)
       const resGet2 = await fetch(`http://localhost:${testPort}/api/internal/suppression/${phone}`, {
-        headers: { 'Authorization': `Bearer ${secret}` },
+        headers: { 'Authorization': `Bearer ${secret}`, 'x-org-id': 'org_test_1' },
       })
       const dataGet2 = await resGet2.json() as any
       assert.strictEqual(dataGet2.suppressed, true)
@@ -318,6 +324,7 @@ async function runTestSuite() {
         method: 'DELETE',
         headers: {
           'Authorization': `Bearer ${secret}`,
+          'x-org-id': 'org_test_1',
         },
       })
       assert.strictEqual(resDel.status, 200)

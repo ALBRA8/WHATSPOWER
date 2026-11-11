@@ -174,8 +174,70 @@ export function renderStudioHtml(): string {
   </div>
 
   <script>
+  // ============================================================
+  // (tercera reparación 4.F) Canje de sesión por cookie HttpOnly:
+  // el secreto administrativo se envía UNA vez a /studio/login y el backend
+  // responde con cookie HttpOnly + SameSite=Strict. El secreto JAMÁS toca
+  // sessionStorage (antes un XSS podía leerlo). La org del operador NO es
+  // secreto y viaja como X-Org-Id en toda llamada /api/.
+  // ============================================================
+  (function () {
+    const _fetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      try {
+        const u = typeof input === 'string' ? input : (input && input.url) || '';
+        if (u.includes('/api/') && !u.includes('/api/health')) {
+          init = init || {};
+          init.credentials = 'same-origin';
+          init.headers = Object.assign({}, init.headers || {}, { 'X-Org-Id': (sessionStorage.getItem('wp_org') || 'default') });
+        }
+      } catch (e) {}
+      return _fetch(input, init);
+    };
+    async function studioLogin() {
+      const k = window.prompt('Introduce el secreto administrativo (se canjea UNA vez por una cookie HttpOnly; jamás se guarda en JS):');
+      if (!k) {
+        document.body.innerHTML = '<p style="font-family:system-ui;padding:24px">Se requiere el secreto administrativo para usar el studio.</p>';
+        return;
+      }
+      try {
+        const res = await _fetch('/studio/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret: k }) });
+        if (!res.ok) {
+          document.body.innerHTML = '<p style="font-family:system-ui;padding:24px">Credencial inválida. Recarga e inténtalo de nuevo.</p>';
+          return;
+        }
+      } catch (e) {
+        document.body.innerHTML = '<p style="font-family:system-ui;padding:24px">Error de red en el login.</p>';
+        return;
+      }
+    }
+    window.addEventListener('DOMContentLoaded', async function () {
+      try { await _fetch('/api/health'); } catch (e) {}
+      const probe = await _fetch('/api/flows');
+      if (probe.status === 401) { await studioLogin(); }
+      if (!sessionStorage.getItem('wp_org')) {
+        const org = window.prompt('Organización de trabajo (X-Org-Id):', 'default');
+        sessionStorage.setItem('wp_org', (org || 'default').replace(/[^a-zA-Z0-9_-]/g, '') || 'default');
+      }
+      loadFlows();
+    });
+  })();
+  </script>
+  <script>
     let currentFlow = null;
     let flowsList = [];
+
+    // (tercera reparación 4.F/5.C-paridad) Escape de HTML para TODO dato de flujo
+    // renderizado: el contenido de los flujos viaja por API y jamás se interpola
+    // sin escapar (defensa en profundidad anti-XSS almacenado).
+    function esc(v) {
+      return String(v == null ? '' : v)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    function escMultiline(v) {
+      return esc(v).replace(/\\n/g, '<br>');
+    }
 
     async function loadFlows() {
       try {
@@ -224,25 +286,25 @@ export function renderStudioHtml(): string {
 
         if (node.type === 'trigger') {
           icon = '🚀';
-          bodyHtml = '<strong>Keywords:</strong> ' + (node.data.keywords || []).map(k => '<span style=\"background:#064e3b; padding:1px 5px; border-radius:3px; font-size:10px;\">' + k + '</span>').join(' ');
+          bodyHtml = '<strong>Keywords:</strong> ' + (node.data.keywords || []).map(k => '<span style=\"background:#064e3b; padding:1px 5px; border-radius:3px; font-size:10px;\">' + esc(k) + '</span>').join(' ');
         } else if (node.type === 'send_message') {
           icon = '💬';
-          bodyHtml = '<div>' + (node.data.messageText || '').replace(/\\n/g, '<br>') + '</div>';
+          bodyHtml = '<div>' + escMultiline(node.data.messageText || '') + '</div>';
           if (node.data.buttons && node.data.buttons.length > 0) {
-            bodyHtml += '<div class=\"node-buttons\">' + node.data.buttons.map((b, i) => '<div class=\"node-btn-opt\"><span>' + (i+1) + '. ' + b + '</span><span style=\"color:#60a5fa;\">Opción ' + (i+1) + '</span></div>').join('') + '</div>';
+            bodyHtml += '<div class=\"node-buttons\">' + node.data.buttons.map((b, i) => '<div class=\"node-btn-opt\"><span>' + (i+1) + '. ' + esc(b) + '</span><span style=\"color:#60a5fa;\">Opción ' + (i+1) + '</span></div>').join('') + '</div>';
           }
         } else if (node.type === 'user_input') {
           icon = '📥';
-          bodyHtml = '<div>Prompt: <em>\"' + (node.data.inputPrompt || '') + '\"</em></div><div style=\"color:#38bdf8; margin-top:4px;\">Guardar en: <code>' + (node.data.saveToCustomField || '') + '</code></div>';
+          bodyHtml = '<div>Prompt: <em>\"' + esc(node.data.inputPrompt || '') + '\"</em></div><div style=\"color:#38bdf8; margin-top:4px;\">Guardar en: <code>' + esc(node.data.saveToCustomField || '') + '</code></div>';
         } else if (node.type === 'condition') {
           icon = '🔀';
-          bodyHtml = '<div>Reglas: ' + (node.data.rules || []).map(r => '<code>' + r.type + ': ' + r.value + '</code>').join('<br>') + '</div><div style=\"display:flex; justify-content:space-between; margin-top:6px;\"><span style=\"color:#10b981;\">✔ Sí</span><span style=\"color:#ef4444;\">✖ No</span></div>';
+          bodyHtml = '<div>Reglas: ' + (node.data.rules || []).map(r => '<code>' + esc(r.type) + ': ' + esc(r.value) + '</code>').join('<br>') + '</div><div style=\"display:flex; justify-content:space-between; margin-top:6px;\"><span style=\"color:#10b981;\">✔ Sí</span><span style=\"color:#ef4444;\">✖ No</span></div>';
         } else if (node.type === 'action') {
           icon = '🏷️';
-          bodyHtml = '<div>Acción: <code>' + (node.data.actionType || '') + '</code></div><div style=\"color:#c084fc;\">Etiqueta: ' + (node.data.tag || '') + '</div>';
+          bodyHtml = '<div>Acción: <code>' + (node.data.actionType || '') + '</code></div><div style=\"color:#c084fc;\">Etiqueta: ' + esc(node.data.tag || '') + '</div>';
         } else if (node.type === 'crm_action') {
           icon = '⚡';
-          bodyHtml = '⚡ <strong>Acción ALBRA:</strong> <code>' + (node.data.crmAction || '') + '</code><br><span style=\"color:#c084fc;\">Monto: $' + (node.data.crmParams?.amount || 0) + '</span>';
+          bodyHtml = '⚡ <strong>Acción ALBRA:</strong> <code>' + esc(node.data.crmAction || '') + '</code><br><span style=\"color:#c084fc;\">Monto: $' + esc(node.data.crmParams?.amount || 0) + '</span>';
         } else if (node.type === 'ab_split') {
           icon = '🎲';
           bodyHtml = '<div>Split Ratio: <strong>' + (node.data.splitRatio || 50) + '% / ' + (100 - (node.data.splitRatio || 50)) + '%</strong></div><div style=\"display:flex; justify-content:space-between; margin-top:6px;\"><span style=\"color:#f472b6;\">Rama A</span><span style=\"color:#38bdf8;\">Rama B</span></div>';
@@ -254,7 +316,7 @@ export function renderStudioHtml(): string {
         div.innerHTML = \`
           <div class="node-header">
             <span>\${icon}</span>
-            <span>\${node.title}</span>
+            <span>\${esc(node.title)}</span>
           </div>
           <div class="node-body">\${bodyHtml}</div>
         \`;
@@ -354,7 +416,8 @@ export function renderStudioHtml(): string {
       const phone = document.getElementById('simPhone');
       const div = document.createElement('div');
       div.className = 'sim-bubble sim-bubble-' + dir;
-      div.innerHTML = text.replace(/\\n/g, '<br>');
+      // (4.F) El texto de los mensajes se escapa: jamás innerHTML con datos crudos
+      div.innerHTML = escMultiline(text);
       phone.appendChild(div);
       phone.scrollTop = phone.scrollHeight;
     }
@@ -379,7 +442,7 @@ export function renderStudioHtml(): string {
 
     function clearSim() {
       simPhone = '+57300' + Math.floor(1000000 + Math.random() * 9000000);
-      document.getElementById('simPhone').innerHTML = '<div class=\"sim-bubble sim-bubble-in\" style=\"align-self:center; background:#182229; font-size:10px; color:#8696a0; text-align:center;\">🔄 Sesión reiniciada. Teléfono simulado: ' + simPhone + '<br>Escribe <strong>\"PRECIO\"</strong> o <strong>\"PLANES\"</strong>.</div>';
+      document.getElementById('simPhone').innerHTML = '<div class=\"sim-bubble sim-bubble-in\" style=\"align-self:center; background:#182229; font-size:10px; color:#8696a0; text-align:center;\">🔄 Sesión reiniciada. Teléfono simulado: ' + esc(simPhone) + '<br>Escribe <strong>\"PRECIO\"</strong> o <strong>\"PLANES\"</strong>.</div>';
     }
 
     loadFlows();
