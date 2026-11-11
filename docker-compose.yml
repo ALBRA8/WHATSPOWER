@@ -1,0 +1,13 @@
+# (A5-07) WHATSPOWER en producción: reinicio automático (equivalente a
+# supervisor), env explícito y volumen persistente para la BD y el anti-replay
+# durable. SQLite en modo WAL soporta multi-proceso en el MISMO host.
+services:
+  whatspower-server:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3003:3003"
+    env_file: .env
+    volumes:
+      - ./db:/app/db
+    command: ["node", "--experimental-strip-types", "src/server.ts"]

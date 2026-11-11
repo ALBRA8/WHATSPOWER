@@ -1,6 +1,6 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
 import { createHmac } from 'node:crypto'
-import { createDatabase, purgeExpiredSecurityRows } from './db.ts'
+import { createDatabase, purgeExpiredSecurityRows, durableRateLimit } from './db.ts'
 import { ConversationRouter } from './engine/router.ts'
 import { MockTransportSender, HttpAlbraTransportSender } from './adapters/transport.ts'
 import { MetaCloudOrgTransport } from './adapters/meta-cloud-org-transport.ts'
@@ -14,6 +14,7 @@ import { PaymentGatewayManager } from './payments/payment-gateway.ts'
 import type { InboundEvent, TransportSender, CrmClientInterface } from './types.ts'
 import {
   isAuthorizedBearer,
+  safeEqual,
   checkWebhookSecurity,
   verifyWebhookWithOrg,
   parseWebhookSecrets,
@@ -202,7 +203,9 @@ export function createAgenticServer(options?: {
   function verifyHmac(payload: string, signatureHeader?: string): boolean {
     if (!webhookSecret || !signatureHeader) return false
     const expected = createHmac('sha256', webhookSecret).update(payload).digest('hex')
-    return expected === signatureHeader
+    // (A2-10, auditoría 2026-11-11) Comparación EN TIEMPO CONSTANTE: `===` corta
+    // en la primera divergencia y filtra por longitud — oráculo de tiempo.
+    return safeEqual(expected, signatureHeader)
   }
   void verifyHmac // conservado por compatibilidad de firma pública; la validación dura usa checkWebhookSecurity
 
@@ -432,7 +435,8 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify({ ok: true, id: flow.id, organizationId: orgId }))
       } catch (e: any) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
       }
       return
     }
@@ -456,7 +460,8 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify(stepRes))
       } catch (e: any) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
       }
       return
     }
@@ -589,7 +594,8 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify(data))
       } catch (e: any) {
         res.writeHead(500, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        console.warn('[API] 500 sin detalles al cliente:', e instanceof Error ? e.message : e)
+        res.end(JSON.stringify({ error: 'Error interno' }))
       }
       return
     }
@@ -829,9 +835,12 @@ export function createAgenticServer(options?: {
     // en ventana ±5min + caché anti-replay + comparación timing-safe. Sin excepción en dev:
     // el puente del CRM ya firma (X-Signature-SHA256 + X-Timestamp).
     if (req.method === 'POST' && url.pathname === '/api/inbound') {
-      // Rate limiting (4.F): ventana por IP
-      if (!inboundRate.allow(`inbound:${clientKey(req)}`)) {
-        res.writeHead(429, { 'Content-Type': 'application/json' })
+      // Rate limiting DURABLE (A2-11, auditoría 2026-11-11): contador en BD —
+      // sobrevive reinicios y coordina procesos que compartan la BD (el limiter
+      // en memoria se resetea con cada deploy y no ve a los demás procesos).
+      const inboundRL = durableRateLimit(db, `inbound:${clientKey(req)}`, 120)
+      if (!inboundRL.allowed) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(inboundRL.retryAfterSec) })
         res.end(JSON.stringify({ error: 'Demasiadas peticiones (rate limit)' }))
         return
       }
@@ -886,7 +895,8 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify(result))
       } catch (err: any) {
         res.writeHead(500, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: err.message }))
+        console.warn('[API] 500 sin detalles al cliente:', err instanceof Error ? err.message : err)
+        res.end(JSON.stringify({ error: 'Error interno' }))
       }
       return
     }
@@ -928,7 +938,8 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify(agent))
       } catch (e: any) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
       }
       return
     }
@@ -956,7 +967,8 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify({ assignedAgent: agent }))
       } catch (e: any) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
       }
       return
     }
@@ -993,7 +1005,8 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify(item))
       } catch (e: any) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
       }
       return
     }
@@ -1036,7 +1049,8 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify(link))
       } catch (e: any) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
       }
       return
     }
@@ -1094,7 +1108,8 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify(result))
       } catch (e: any) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
       }
       return
     }
@@ -1121,7 +1136,8 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify({ ...tx, mode: tx.gateway }))
       } catch (e: any) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
       }
       return
     }
@@ -1129,9 +1145,10 @@ export function createAgenticServer(options?: {
     // Webhook de la pasarela de pagos: exige HMAC propio (PAYMENTS_WEBHOOK_SECRET) +
     // timestamp + anti-replay. Fail-closed: sin secret configurado, 503.
     if (req.method === 'POST' && url.pathname === '/api/payments/webhook') {
-      // Rate limiting (4.F)
-      if (!paymentsRate.allow(`pay:${clientKey(req)}`)) {
-        res.writeHead(429, { 'Content-Type': 'application/json' })
+      // Rate limiting DURABLE (A2-11, auditoría 2026-11-11)
+      const paymentsRL = durableRateLimit(db, `pay:${clientKey(req)}`, 60)
+      if (!paymentsRL.allowed) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(paymentsRL.retryAfterSec) })
         res.end(JSON.stringify({ error: 'Demasiadas peticiones (rate limit)' }))
         return
       }
@@ -1187,7 +1204,8 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify({ ok: true, transaction: result.transaction, idempotent: result.idempotent === true }))
       } catch (e: any) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
       }
       return
     }
