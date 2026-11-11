@@ -49,6 +49,13 @@ export function createDatabase(dbPath?: string): DatabaseSync {
 
   const db = new DatabaseSync(targetPath)
 
+  // (reauditoría ciclo 2, A2-11) WAL + busy_timeout: los contadores durables y
+  // el anti-replay coordinan PROCESOS que comparten este archivo; sin pragmas,
+  // la segunda conexión fallaba con SQLITE_BUSY al primer choque de escrituras
+  // y el fail-open del limiter anulaba el límite justo bajo carga. En ':memory:'
+  // los pragmas son inofensivos.
+  db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`)
+
   // Detección de migración INTERRUMPIDA (reparación integral §7): un marcador
   // user_version > 0 por debajo de SCHEMA_VERSION indica un proceso que murió
   // a mitad de la cadena. Las migraciones son idempotentes, así que se
@@ -921,10 +928,13 @@ export function durableRateLimit(
       return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((resetAtMs - Date.now()) / 1000)) }
     }
     return { allowed: true, retryAfterSec: 0 }
-  } catch {
+  } catch (err) {
     // Si el contador falla (BD ocupada), fail-closed para endpoints públicos
     // es demasiado agresivo ante un fallo transitorio del almacén: se permite
     // y el HMAC/anti-replay propios del endpoint siguen protegiendo.
+    // (reauditoría ciclo 2) El fail-open era INVISIBLE: se registra para poder
+    // detectar degradación del límite en operación.
+    console.warn('[db] durableRateLimit fail-open:', err instanceof Error ? err.message : err)
     return { allowed: true, retryAfterSec: 0 }
   }
 }

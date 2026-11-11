@@ -216,8 +216,8 @@ export function createAgenticServer(options?: {
   const paymentsReplay = new DurableReplayCache(replayPath)
 
   // Rate limiting de endpoints públicos (tercera reparación 4.F)
-  const inboundRate = new RateLimiter(120, 60_000)
-  const paymentsRate = new RateLimiter(60, 60_000)
+  // (reauditoría ciclo 2) inbound/payments usan durableRateLimit (BD): los
+  // limiter en memoria equivalentes eran código muerto con límites duplicados.
   const refRate = new RateLimiter(300, 60_000)
   const studioLoginRate = new RateLimiter(10, 60_000)
   const qrRate = new RateLimiter(30, 60_000) // (integral §7): /qr/data 30/min por IP
