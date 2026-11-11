@@ -25,7 +25,6 @@ import {
   RateLimiter,
   PersistentReplayStore,
   SlidingRateLimiter,
-  safeEqual,
   clientIp,
   maskPhone,
   issueStudioSession,

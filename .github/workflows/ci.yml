@@ -1,9 +1,9 @@
 name: CI WHATSPOWER
 on:
   push:
-    branches: [main, 'repair/**', 'fix/**']
+    branches: [main, 'impl/**', 'repair/**', 'fix/**']
   pull_request:
-    branches: [main, 'repair/**', 'fix/**']
+    branches: [main, 'impl/**', 'repair/**', 'fix/**']
 
 jobs:
   ci:

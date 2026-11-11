@@ -554,46 +554,6 @@ export class CrmTriggerListener {
     } catch { /* la liberación nunca rompe el error original */ }
   }
 
-  /**
-   * (A4-06) Despacho con liberación de dedup: si el transporte lanza una
-   * excepción ANTES de clasificar el resultado (el mensaje no llegó a
-   * iniciarse), se libera la clave de idempotencia para que el reintento del
-   * CRM re-ejecute el evento — ni pérdida ni duplicado. Los resultados
-   * clasificados (SENT/REJECTED/UNCERTAIN) vuelven como valor y conservan
-   * el dedup (UNCERTAIN jamás se reenvía a ciegas — clasificación B2).
-   */
-  private async dispatchWithRelease<T>(orgId: string, eventKey: string, send: () => Promise<T>): Promise<T> {
-    try {
-      return await send()
-    } catch (err) {
-      this.releaseDedup(orgId, eventKey)
-      throw err
-    }
-  }
-
-  private lastDedupPurgeAt = 0
-
-  /**
-   * (A4-06) Purga del dedup: retiene 24 h de historia (ventana de replay),
-   * ejecutada como máximo una vez cada 10 min por proceso. Sin purga la
-   * tabla crece sin techo (auditoría A4-06).
-   */
-  private maybePurgeDedup(): void {
-    const now = Date.now()
-    if (now - this.lastDedupPurgeAt < 10 * 60 * 1000) return
-    this.lastDedupPurgeAt = now
-    try {
-      this.db.prepare(`DELETE FROM stage_change_dedup WHERE processed_at < ?`)
-        .run(Math.floor(now / 1000) - 24 * 60 * 60)
-    } catch { /* la purga nunca rompe la ejecución */ }
-  }
-
-  private releaseDedup(orgId: string, eventKey: string): void {
-    try {
-      this.db.prepare(`DELETE FROM stage_change_dedup WHERE organization_id = ? AND event_key = ?`).run(orgId, eventKey)
-    } catch { /* la liberación nunca rompe el error original */ }
-  }
-
   private storeDedupResult(orgId: string, eventKey: string, result: AutomationExecutionResult): void {
     try {
       this.db.prepare(`
