@@ -3,6 +3,7 @@ import { createHmac } from 'node:crypto'
 import { createDatabase, purgeExpiredSecurityRows } from './db.ts'
 import { ConversationRouter } from './engine/router.ts'
 import { MockTransportSender, HttpAlbraTransportSender } from './adapters/transport.ts'
+import { MetaCloudOrgTransport } from './adapters/meta-cloud-org-transport.ts'
 import { MockCrmClient, HttpCrmClient } from './adapters/crm-client.ts'
 import { renderStudioHtml } from './studio/studio-html.ts'
 import { TeamManager } from './state/team-manager.ts'
@@ -67,6 +68,21 @@ export function createAgenticServer(options?: {
         console.warn('[Capa 2A AVISO] TRANSPORT=http con ALLOW_REAL_DISPATCH=false: los envíos quedarán BLOQUEADOS por la salvaguarda.')
       }
       return new HttpAlbraTransportSender(process.env.WHATSAPP_DAEMON_URL || 'http://localhost:3002', daemonSecret)
+    }
+    if (mode === 'meta-cloud') {
+      // OLEADA 2 (decisión 2026-11-11 #6): envíos DIRECTOS a Meta Cloud con las
+      // credenciales de CADA organización (resueltas por OrgWaRegistry). Cada
+      // org necesita SU credencial de servicio (WA_ORG_CREDENTIALS o CRM) y SUS
+      // números (WA_ORG_NUMBERS o inventario del CRM). Sin credencial para una
+      // org → esa org NO envía (fail-closed); las demás organizaciones siguen
+      // operativas (punto 9).
+      if (process.env.ALLOW_REAL_DISPATCH !== 'true') {
+        console.warn('[Capa 2A AVISO] TRANSPORT=meta-cloud con ALLOW_REAL_DISPATCH=false: los envíos quedarán BLOQUEADOS por la salvaguarda.')
+      }
+      if (!process.env.WA_ORG_CREDENTIALS && !process.env.CRM_INTERNAL_CREDENTIAL) {
+        throw new Error('TRANSPORT=meta-cloud exige credenciales por organización: WA_ORG_CREDENTIALS (standalone) o CRM_INTERNAL_CREDENTIAL (vía CRM). Sin ellas ninguna org puede enviar (fail-closed).')
+      }
+      return new MetaCloudOrgTransport()
     }
     if (mode === 'mock') {
       if (isProduction && process.env.ALLOW_MOCK_TRANSPORT !== 'true') {

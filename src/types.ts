@@ -82,8 +82,13 @@ export interface TransportSender {
    * Viaja al daemon en el header X-Idempotency-Key y en el cuerpo para que el
    * receptor pueda verificarla/aplicarla. Opcional por compatibilidad: si se
    * omite, el transporte usa correlationId (comportamiento previo).
+   *
+   * OLEADA 2 (decisión 2026-11-11 #6): `orgId` es la organización del envío.
+   * Los transportes POR ORGANIZACIÓN (Meta Cloud) la EXIGEN y resuelven las
+   * credenciales de ESA organización — fail-closed si falta. Los transportes
+   * legacy (Baileys por org) la aceptan y pueden usarla para el enrutamiento.
    */
-  sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string): Promise<TransportSendResult>
+  sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string, orgId?: string): Promise<TransportSendResult>
 }
 
 export interface CrmClientInterface {

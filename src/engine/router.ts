@@ -505,7 +505,10 @@ export class ConversationRouter {
         }
         let res: Awaited<ReturnType<typeof this.transport.sendMessage>>
         try {
-          res = await this.transport.sendMessage(phone, text, correlationId, sendIdemKey)
+          // OLEADA 2 (decisión 2026-11-11 #6): el orgId acompaña al envío para
+          // que los transportes por organización (Meta Cloud) usen SIEMPRE las
+          // credenciales de ESA organización. Los transportes legacy lo ignoran.
+          res = await this.transport.sendMessage(phone, text, correlationId, sendIdemKey, orgId)
         } catch (err) {
           // Un throw del transporte (red cortada a mitad) NO prueba que el daemon
           // no aceptara: ambiguo, jamás rechazo definitivo.
