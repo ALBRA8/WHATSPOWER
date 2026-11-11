@@ -1,6 +1,6 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
 import { createHmac } from 'node:crypto'
-import { createDatabase, purgeExpiredSecurityRows } from './db.ts'
+import { createDatabase, purgeExpiredSecurityRows, durableRateLimit } from './db.ts'
 import { ConversationRouter } from './engine/router.ts'
 import { MockTransportSender, HttpAlbraTransportSender } from './adapters/transport.ts'
 import { MetaCloudOrgTransport } from './adapters/meta-cloud-org-transport.ts'
@@ -24,6 +24,7 @@ import {
   RateLimiter,
   PersistentReplayStore,
   SlidingRateLimiter,
+  safeEqual,
   clientIp,
   maskPhone,
   issueStudioSession,
@@ -202,7 +203,9 @@ export function createAgenticServer(options?: {
   function verifyHmac(payload: string, signatureHeader?: string): boolean {
     if (!webhookSecret || !signatureHeader) return false
     const expected = createHmac('sha256', webhookSecret).update(payload).digest('hex')
-    return expected === signatureHeader
+    // (A2-10) Comparación EN TIEMPO CONSTANTE: la firma nunca se compara con
+    // '===' (evita oráculo de tiempo si alguien reusa esta función).
+    return safeEqual(expected, signatureHeader)
   }
   void verifyHmac // conservado por compatibilidad de firma pública; la validación dura usa checkWebhookSecurity
 
@@ -431,8 +434,11 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: true, id: flow.id, organizationId: orgId }))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        res.end(JSON.stringify({ error: 'Solicitud inválida: no se pudo procesar el evento' }))
       }
       return
     }
@@ -455,8 +461,11 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(stepRes))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        res.end(JSON.stringify({ error: 'Solicitud inválida: no se pudo procesar el evento' }))
       }
       return
     }
@@ -829,7 +838,15 @@ export function createAgenticServer(options?: {
     // en ventana ±5min + caché anti-replay + comparación timing-safe. Sin excepción en dev:
     // el puente del CRM ya firma (X-Signature-SHA256 + X-Timestamp).
     if (req.method === 'POST' && url.pathname === '/api/inbound') {
-      // Rate limiting (4.F): ventana por IP
+      // Rate limiting (4.F): ventana por IP — CAPA DURABLE (A2-11): contadores
+      // en SQLite, sobreviven reinicios y valen entre réplicas del mismo
+      // volumen; la ventana en memoria sigue como segunda cerradura rápida.
+      const dl = durableRateLimit(db, `inbound:${clientKey(req)}`, 240)
+      if (!dl.allowed) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(dl.retryAfterSec) })
+        res.end(JSON.stringify({ error: 'Demasiadas peticiones (rate limit durable)' }))
+        return
+      }
       if (!inboundRate.allow(`inbound:${clientKey(req)}`)) {
         res.writeHead(429, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Demasiadas peticiones (rate limit)' }))
@@ -927,8 +944,11 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(agent))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        res.end(JSON.stringify({ error: 'Solicitud inválida: no se pudo procesar el evento' }))
       }
       return
     }
@@ -955,8 +975,11 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ assignedAgent: agent }))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        res.end(JSON.stringify({ error: 'Solicitud inválida: no se pudo procesar el evento' }))
       }
       return
     }
@@ -992,8 +1015,11 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(item))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        res.end(JSON.stringify({ error: 'Solicitud inválida: no se pudo procesar el evento' }))
       }
       return
     }
@@ -1035,8 +1061,11 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(link))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        res.end(JSON.stringify({ error: 'Solicitud inválida: no se pudo procesar el evento' }))
       }
       return
     }
@@ -1093,8 +1122,11 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(result))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        res.end(JSON.stringify({ error: 'Solicitud inválida: no se pudo procesar el evento' }))
       }
       return
     }
@@ -1120,8 +1152,11 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ...tx, mode: tx.gateway }))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        res.end(JSON.stringify({ error: 'Solicitud inválida: no se pudo procesar el evento' }))
       }
       return
     }
@@ -1129,7 +1164,13 @@ export function createAgenticServer(options?: {
     // Webhook de la pasarela de pagos: exige HMAC propio (PAYMENTS_WEBHOOK_SECRET) +
     // timestamp + anti-replay. Fail-closed: sin secret configurado, 503.
     if (req.method === 'POST' && url.pathname === '/api/payments/webhook') {
-      // Rate limiting (4.F)
+      // Rate limiting (4.F) — CAPA DURABLE (A2-11), ver /api/inbound.
+      const dlp = durableRateLimit(db, `pay:${clientKey(req)}`, 120)
+      if (!dlp.allowed) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(dlp.retryAfterSec) })
+        res.end(JSON.stringify({ error: 'Demasiadas peticiones (rate limit durable)' }))
+        return
+      }
       if (!paymentsRate.allow(`pay:${clientKey(req)}`)) {
         res.writeHead(429, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Demasiadas peticiones (rate limit)' }))
@@ -1186,8 +1227,11 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: true, transaction: result.transaction, idempotent: result.idempotent === true }))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: e.message }))
+        res.end(JSON.stringify({ error: 'Solicitud inválida: no se pudo procesar el evento' }))
       }
       return
     }
@@ -1224,6 +1268,15 @@ if (process.argv[1]?.includes('server.ts')) {
   }
   const PORT = Number(process.env.PORT || 3003)
   const { server } = createAgenticServer()
+// (A5-08, auditoría 2026-11-11) Umbrales de proceso: sin muerte silenciosa.
+process.on('unhandledRejection', (reason) => {
+  console.error('[wp-server] unhandledRejection:', reason instanceof Error ? reason.message : reason)
+})
+process.on('uncaughtException', (err) => {
+  console.error('[wp-server] uncaughtException (parada de emergencia):', err.message)
+  process.exit(1)
+})
+
   server.listen(PORT, process.env.HOST || '127.0.0.1', () => {
     console.log(`[Capa 2A] Servidor Agéntico escuchando en http://localhost:${PORT}`)
   })

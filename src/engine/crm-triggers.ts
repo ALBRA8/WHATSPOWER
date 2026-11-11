@@ -82,6 +82,7 @@ export type AutomationStatus =
   | 'SEQUENCE_ENROLLED'
   | 'SEQUENCE_UNAVAILABLE'
   | 'SKIPPED_NO_RULE'
+  | 'SKIPPED_NO_PHONE'
 
 export interface AutomationExecutionResult {
   triggered: boolean
@@ -277,7 +278,13 @@ export class CrmTriggerListener {
         INSERT INTO stage_change_dedup (organization_id, event_key, processed_at)
         VALUES (?, ?, ?)
       `).run(orgId, eventKey, now)
-    } catch {
+    } catch (err) {
+      // (A1-03, auditoría 2026-11-11) SOLO una violación de unicidad significa
+      // "ya procesado". Cualquier otro error (SQLite BUSY, readonly, disco...)
+      // es un error REAL: se propaga → el endpoint responde 500 y el CRM
+      // reintenta; JAMÁS se descarta el evento como duplicado sin ejecutarlo.
+      const msg = err instanceof Error ? err.message : String(err)
+      if (!msg.includes('UNIQUE constraint failed')) throw err
       // Violación de PK (organization_id, event_key): el evento YA fue procesado.
       const previous = this.db.prepare(`
         SELECT result_json FROM stage_change_dedup WHERE organization_id = ? AND event_key = ?
@@ -288,6 +295,26 @@ export class CrmTriggerListener {
         eventKey,
         detail: previous?.result_json ? `ya procesado: ${previous.result_json.slice(0, 200)}` : 'evento ya procesado',
       }
+    }
+
+    // (A4-06) Purga periódica del dedup: retiene 24 h de historia (ventana de
+    // replay legítimo) — sin esto crece sin techo y, con eventIds con ventana
+    // temporal (CRM deriveStageEventId, A4-01), el replay posterior es válido.
+    this.maybePurgeDedup()
+
+    // (A1-05) Validación honesta del teléfono del cliente: el CRM omite la
+    // clave cuando el cliente no tiene teléfono. Antes, un binding undefined
+    // reventaba en node:sqlite y el evento terminaba en 400; ahora se
+    // registra un estado auditable SKIPPED_NO_PHONE y el evento se cierra.
+    const phone = typeof event.clientPhone === 'string' ? event.clientPhone.trim() : ''
+    if (!/^\+?[0-9]{6,20}$/.test(phone)) {
+      this.recordAutomationEvent({
+        orgId, eventKey, stage: stageKey, action: 'none', status: 'SKIPPED_NO_PHONE',
+        detail: 'evento sin teléfono de cliente válido: nada que despachar (auditoría A1-05)',
+      })
+      const result: AutomationExecutionResult = { triggered: false, action: 'send_message_skipped', status: 'SKIPPED_NO_PHONE', eventKey }
+      this.storeDedupResult(orgId, eventKey, result)
+      return result
     }
 
     const rule = this.resolveRule(orgId, stageKey)
@@ -309,7 +336,7 @@ export class CrmTriggerListener {
       this.db.prepare(`
         INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, created_at)
         VALUES (?, ?, ?, 'outbound', ?, ?)
-      `).run(`msg_trig_${randomUUID()}`, orgId, event.clientPhone, text, Math.floor(Date.now() / 1000))
+      `).run(`msg_trig_${randomUUID()}`, orgId, phone, text, Math.floor(Date.now() / 1000))
 
       // ---- DESPACHO REAL POR ORGANIZACIÓN (v2, decisión 2026-11-11 #6) ----
       if (!this.transport) {
@@ -325,12 +352,11 @@ export class CrmTriggerListener {
 
       // La clave de idempotencia POR MENSAJE viaja al transporte: aunque un
       // upstream replique, Meta Cloud no creará dos mensajes (doble cerradura).
-      const sendRes = await this.transport.sendMessage(
-        event.clientPhone,
-        text,
-        `stage_change:${eventKey}`,
-        `stage:${eventKey}`,
-        orgId
+      // (A4-06) Si el transporte lanza ANTES de clasificar (envío no iniciado),
+      // dispatchWithRelease libera la clave de dedup para el reintento.
+      const transport = this.transport
+      const sendRes = await this.dispatchWithRelease(orgId, eventKey, () =>
+        transport.sendMessage(phone, text, `stage_change:${eventKey}`, `stage:${eventKey}`, orgId)
       )
 
       let status: AutomationStatus
@@ -388,7 +414,7 @@ export class CrmTriggerListener {
       const firstNode = flowInOrg.nodes?.[0]
       const startNodeId = firstNode?.id ?? 'start'
       this.flowEngine.saveSession(orgId, {
-        contactPhone: event.clientPhone,
+        contactPhone: phone,
         flowId: flowInOrg.id,
         currentNodeId: startNodeId,
         waitingForInput: false,
@@ -406,14 +432,15 @@ export class CrmTriggerListener {
         this.db.prepare(`
           INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, created_at)
           VALUES (?, ?, ?, 'outbound', ?, ?)
-        `).run(`msg_flow_${randomUUID()}`, orgId, event.clientPhone, text, Math.floor(Date.now() / 1000))
+        `).run(`msg_flow_${randomUUID()}`, orgId, phone, text, Math.floor(Date.now() / 1000))
 
         if (!this.transport) {
           status = 'RECORDED_NO_TRANSPORT'
           detail = `sesión abierta; mensaje del nodo registrado sin envío (sin transporte)`
         } else {
-          const sendRes = await this.transport.sendMessage(
-            event.clientPhone, text, `stage_change:${eventKey}`, `stage:${eventKey}`, orgId
+          const transport = this.transport
+          const sendRes = await this.dispatchWithRelease(orgId, eventKey, () =>
+            transport.sendMessage(phone, text, `stage_change:${eventKey}`, `stage:${eventKey}`, orgId)
           )
           if (sendRes.ok && sendRes.outcome === 'SENT') {
             messageId = sendRes.messageId
@@ -472,6 +499,46 @@ export class CrmTriggerListener {
     const result: AutomationExecutionResult = { triggered: true, action: rule.action, eventKey }
     this.storeDedupResult(orgId, eventKey, result)
     return result
+  }
+
+  /**
+   * (A4-06) Despacho con liberación de dedup: si el transporte lanza una
+   * excepción ANTES de clasificar el resultado (el mensaje no llegó a
+   * iniciarse), se libera la clave de idempotencia para que el reintento del
+   * CRM re-ejecute el evento — ni pérdida ni duplicado. Los resultados
+   * clasificados (SENT/REJECTED/UNCERTAIN) vuelven como valor y conservan
+   * el dedup (UNCERTAIN jamás se reenvía a ciegas — clasificación B2).
+   */
+  private async dispatchWithRelease<T>(orgId: string, eventKey: string, send: () => Promise<T>): Promise<T> {
+    try {
+      return await send()
+    } catch (err) {
+      this.releaseDedup(orgId, eventKey)
+      throw err
+    }
+  }
+
+  private lastDedupPurgeAt = 0
+
+  /**
+   * (A4-06) Purga del dedup: retiene 24 h de historia (ventana de replay),
+   * ejecutada como máximo una vez cada 10 min por proceso. Sin purga la
+   * tabla crece sin techo (auditoría A4-06).
+   */
+  private maybePurgeDedup(): void {
+    const now = Date.now()
+    if (now - this.lastDedupPurgeAt < 10 * 60 * 1000) return
+    this.lastDedupPurgeAt = now
+    try {
+      this.db.prepare(`DELETE FROM stage_change_dedup WHERE processed_at < ?`)
+        .run(Math.floor(now / 1000) - 24 * 60 * 60)
+    } catch { /* la purga nunca rompe la ejecución */ }
+  }
+
+  private releaseDedup(orgId: string, eventKey: string): void {
+    try {
+      this.db.prepare(`DELETE FROM stage_change_dedup WHERE organization_id = ? AND event_key = ?`).run(orgId, eventKey)
+    } catch { /* la liberación nunca rompe el error original */ }
   }
 
   private storeDedupResult(orgId: string, eventKey: string, result: AutomationExecutionResult): void {

@@ -8,5 +8,9 @@
     "start": "node --experimental-strip-types src/server.ts",
     "test": "node --experimental-strip-types --test --test-isolation=process tests/*.test.ts",
     "tsc": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@types/node": "^24.19.2"
   }
 }

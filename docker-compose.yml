@@ -1,0 +1,10 @@
+# (A5-07) WHATSPOWER en producción con reinicio automático.
+services:
+  whatspower:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3003:3003"
+    env_file: .env
+    volumes:
+      - ./db:/app/db
