@@ -25,6 +25,7 @@ import {
   RateLimiter,
   PersistentReplayStore,
   SlidingRateLimiter,
+  safeEqual,
   clientIp,
   maskPhone,
   issueStudioSession,
@@ -434,6 +435,9 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: true, id: flow.id, organizationId: orgId }))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
         console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
         res.end(JSON.stringify({ error: 'Petición inválida' }))
@@ -459,6 +463,9 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(stepRes))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
         console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
         res.end(JSON.stringify({ error: 'Petición inválida' }))
@@ -937,6 +944,9 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(agent))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
         console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
         res.end(JSON.stringify({ error: 'Petición inválida' }))
@@ -966,6 +976,9 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ assignedAgent: agent }))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
         console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
         res.end(JSON.stringify({ error: 'Petición inválida' }))
@@ -1004,6 +1017,9 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(item))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
         console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
         res.end(JSON.stringify({ error: 'Petición inválida' }))
@@ -1048,6 +1064,9 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(link))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
         console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
         res.end(JSON.stringify({ error: 'Petición inválida' }))
@@ -1107,6 +1126,9 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(result))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
         console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
         res.end(JSON.stringify({ error: 'Petición inválida' }))
@@ -1135,6 +1157,9 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ...tx, mode: tx.gateway }))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
         console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
         res.end(JSON.stringify({ error: 'Petición inválida' }))
@@ -1203,6 +1228,9 @@ export function createAgenticServer(options?: {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: true, transaction: result.transaction, idempotent: result.idempotent === true }))
       } catch (e: any) {
+        // (A4-14) Detalle del error SOLO al log del servidor; al llamador un
+        // mensaje genérico (no filtramos internals de BD/crypto por el 400).
+        console.error(`[wp] 400 en ${url.pathname}:`, e?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
         console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
         res.end(JSON.stringify({ error: 'Petición inválida' }))
@@ -1242,6 +1270,15 @@ if (process.argv[1]?.includes('server.ts')) {
   }
   const PORT = Number(process.env.PORT || 3003)
   const { server } = createAgenticServer()
+// (A5-08, auditoría 2026-11-11) Umbrales de proceso: sin muerte silenciosa.
+process.on('unhandledRejection', (reason) => {
+  console.error('[wp-server] unhandledRejection:', reason instanceof Error ? reason.message : reason)
+})
+process.on('uncaughtException', (err) => {
+  console.error('[wp-server] uncaughtException (parada de emergencia):', err.message)
+  process.exit(1)
+})
+
   server.listen(PORT, process.env.HOST || '127.0.0.1', () => {
     console.log(`[Capa 2A] Servidor Agéntico escuchando en http://localhost:${PORT}`)
   })
