@@ -87,6 +87,10 @@ export function parseOrgCredentials(raw: string | undefined): EnvCredentialEntry
     if (parts.length !== 3) continue
     const [orgId, phoneNumberId, accessToken] = parts.map((s) => s.trim())
     if (!orgId || !phoneNumberId || !accessToken || accessToken.length < 16) continue
+    // (A1-04, auditoría 2026-11-11) '__legacy__' es espacio RESERVADO del
+    // contrato §4 (identidad legada inalcanzable) — espejo del guard de ULTRA
+    // parseOrgCredentialTriples: jamás se registra una conexión para él.
+    if (orgId === '__legacy__') continue
     out.push({ orgId, phoneNumberId, accessToken })
   }
   return out

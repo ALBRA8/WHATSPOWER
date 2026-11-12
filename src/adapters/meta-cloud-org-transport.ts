@@ -29,6 +29,9 @@ export interface MetaCloudOrgTransportOptions {
 
 const REJECTABLE_STATUS = new Set([400, 401, 403, 404, 410, 413, 422, 429])
 
+/** Tope del registro en memoria (ring buffer) — fuga de memoria (A1-02, auditoría 2026-11-11). */
+const SENT_LOG_CAP = 500
+
 export class MetaCloudOrgTransport {
   private registry: OrgWaRegistry
   private apiVersion: string
@@ -108,6 +111,9 @@ export class MetaCloudOrgTransport {
           idempotencyKey,
           at: Date.now(),
         })
+        if (this.sentLog.length > SENT_LOG_CAP) {
+          this.sentLog.splice(0, this.sentLog.length - SENT_LOG_CAP)
+        }
         return { ok: true, messageId, outcome: 'SENT' as DispatchOutcome }
       }
       if (REJECTABLE_STATUS.has(response.status)) {

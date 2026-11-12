@@ -49,6 +49,13 @@ export function createDatabase(dbPath?: string): DatabaseSync {
 
   const db = new DatabaseSync(targetPath)
 
+  // (reauditoría ciclo 2, A2-11) WAL + busy_timeout: los contadores durables y
+  // el anti-replay coordinan PROCESOS que comparten este archivo; sin pragmas,
+  // la segunda conexión fallaba con SQLITE_BUSY al primer choque de escrituras
+  // y el fail-open del limiter anulaba el límite justo bajo carga. En ':memory:'
+  // los pragmas son inofensivos.
+  db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`)
+
   // Detección de migración INTERRUMPIDA (reparación integral §7): un marcador
   // user_version > 0 por debajo de SCHEMA_VERSION indica un proceso que murió
   // a mitad de la cadena. Las migraciones son idempotentes, así que se
@@ -72,6 +79,18 @@ export function createDatabase(dbPath?: string): DatabaseSync {
       copyFileSync(targetPath, `${targetPath}.pre-migracion-${stamp}.bak`)
     } catch { /* sin archivo previo o sin permisos: la migración es idempotente, continuar */ }
   }
+
+  // (A2-11, auditoría 2026-11-11) Contadores DURABLES de rate limiting para
+  // endpoints públicos: sobreviven reinicios y son efectivos entre procesos
+  // que compartan esta BD (SQLite serializa escrituras → atómico por diseño).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+      bucket_key   TEXT NOT NULL,
+      window_start INTEGER NOT NULL,
+      count        INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (bucket_key, window_start)
+    )
+  `)
 
   // Inicializar esquema operativo v3 de Capa 2A
   db.exec(`
@@ -881,3 +900,42 @@ export function purgeExpiredSecurityRows(db: DatabaseSync): void {
 export function databaseFileExists(dbPath: string): boolean {
   return dbPath !== ':memory:' && existsSync(dbPath)
 }
+
+/** (A2-11) Rate limit DURABLE de ventana fija, atómico (UPSERT...RETURNING).
+ *  key: 'inbound:<ip>' / 'payments:<ip>'. Limpia ventanas viejas con 2% de
+ *  probabilidad para no crecer sin techo. */
+export function durableRateLimit(
+  db: DatabaseSync,
+  key: string,
+  limit: number,
+  windowMs: number = 60_000,
+): { allowed: boolean; retryAfterSec: number } {
+  const ws = Math.floor(Date.now() / windowMs) * windowMs
+  try {
+    const row = db.prepare(`
+      INSERT INTO rate_limit_buckets (bucket_key, window_start, count)
+      VALUES (?, ?, 1)
+      ON CONFLICT(bucket_key, window_start) DO UPDATE SET count = count + 1
+      RETURNING count
+    `).get(key, Math.floor(ws / 1000)) as { count: number } | undefined
+    if (Math.random() < 0.02) {
+      db.prepare('DELETE FROM rate_limit_buckets WHERE window_start < ?')
+        .run(Math.floor((Date.now() - 2 * windowMs) / 1000))
+    }
+    const count = row?.count ?? 1
+    if (count > limit) {
+      const resetAtMs = ws + windowMs
+      return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((resetAtMs - Date.now()) / 1000)) }
+    }
+    return { allowed: true, retryAfterSec: 0 }
+  } catch (err) {
+    // Si el contador falla (BD ocupada), fail-closed para endpoints públicos
+    // es demasiado agresivo ante un fallo transitorio del almacén: se permite
+    // y el HMAC/anti-replay propios del endpoint siguen protegiendo.
+    // (reauditoría ciclo 2) El fail-open era INVISIBLE: se registra para poder
+    // detectar degradación del límite en operación.
+    console.warn('[db] durableRateLimit fail-open:', err instanceof Error ? err.message : err)
+    return { allowed: true, retryAfterSec: 0 }
+  }
+}
+
