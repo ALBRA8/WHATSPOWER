@@ -1,4 +1,32 @@
-import type { TransportSender, TransportSendResult, DispatchOutcome } from '../types.ts'
+import type { TransportSender, TransportSendResult, DispatchOutcome, OutboundMedia } from '../types.ts'
+
+/**
+ * (hallazgo 6, auditoría funcional 2026-11-12) Degradación EXPLÍCITA de
+ * contenido enriquecido a texto para transportes sin soporte nativo (proxy
+ * Baileys del CRM / simuladores). El contenido NO se pierde en silencio:
+ * la URL viaja como enlace de texto y los botones como lista; cada limitación
+ * se reporta en `degraded` para observabilidad.
+ */
+export function renderMediaAsText(text: string, media?: OutboundMedia): { text: string; degraded: string[] } {
+  const hasMedia = Boolean(media?.mediaUrl)
+  const buttons = media?.buttons ?? []
+  if (!hasMedia && buttons.length === 0) return { text, degraded: [] }
+  let out = text
+  const degraded: string[] = []
+  if (hasMedia) {
+    out += (out ? '\n\n' : '') + (media?.mediaUrl as string)
+    degraded.push('media_url_entregada_como_enlace_de_texto: transporte sin soporte nativo de multimedia')
+  }
+  for (const b of buttons) {
+    out += (out ? '\n' : '') + (b.url ? `▸ ${b.title}: ${b.url}` : `▸ ${b.title}`)
+    degraded.push(
+      b.url
+        ? `boton_url_convertido_a_texto (${b.title}): transporte sin soporte nativo de botones`
+        : `boton_respuesta_convertido_a_texto (${b.title}): transporte sin soporte nativo de botones`
+    )
+  }
+  return { text: out, degraded }
+}
 
 export interface DispatchedLog {
   to: string
@@ -7,6 +35,8 @@ export interface DispatchedLog {
   /** B2 (fase final): clave de idempotencia POR MENSAJE que acompaña al despacho. */
   idempotencyKey?: string
   timestamp: number
+  /** (hallazgo 6) contenido enriquecido solicitado (para verificación en pruebas). */
+  media?: OutboundMedia
 }
 
 /**
@@ -22,18 +52,21 @@ export class MockTransportSender implements TransportSender {
     this.simulateFailure = value
   }
 
-  async sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string): Promise<TransportSendResult> {
+  async sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string, _orgId?: string, media?: OutboundMedia): Promise<TransportSendResult> {
     if (this.simulateFailure) {
       return { ok: false, error: 'Daemon de transporte no disponible (503)', outcome: 'UNCERTAIN' }
     }
 
     const messageId = `mock_wa_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`
+    // (hallazgo 6) el simulador REGISTRA el contenido enriquecido para que las
+    // pruebas verifiquen la propagación completa motor → router → transporte.
     this.dispatched.push({
       to,
       text,
       correlationId,
       idempotencyKey: idempotencyKey ?? correlationId,
       timestamp: Date.now(),
+      media,
     })
 
     return { ok: true, messageId, outcome: 'SENT' }
@@ -80,7 +113,7 @@ export class HttpAlbraTransportSender implements TransportSender {
     this.internalSecret = internalSecret
   }
 
-  async sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string): Promise<TransportSendResult> {
+  async sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string, _orgId?: string, media?: OutboundMedia): Promise<TransportSendResult> {
     // Salvaguarda dura (orden de cierre 2026-11-06): NINGÚN envío real sale sin
     // ALLOW_REAL_DISPATCH=true, independientemente del entorno o la URL. Fail-closed.
     if (process.env.ALLOW_REAL_DISPATCH !== 'true') {
@@ -90,6 +123,10 @@ export class HttpAlbraTransportSender implements TransportSender {
         outcome: 'REJECTED',
       }
     }
+    // (hallazgo 6) Este transporte (proxy Baileys Capa 1) NO soporta multimedia
+    // ni botones en su contrato /send: degradación EXPLÍCITA a texto (la URL
+    // y los botones viajan en el texto; nada se pierde silenciosamente).
+    const { text: finalText, degraded } = renderMediaAsText(text, media)
     const sendKey = idempotencyKey ?? correlationId
     let res: Response
     try {
@@ -105,7 +142,7 @@ export class HttpAlbraTransportSender implements TransportSender {
         body: JSON.stringify({
           path: '/send',
           to,
-          message: text,
+          message: finalText,
           // B2: la clave de idempotencia llega explícitamente al daemon
           // (además del header) para que el receptor pueda verificarla.
           idempotencyKey: sendKey,
@@ -113,22 +150,24 @@ export class HttpAlbraTransportSender implements TransportSender {
       })
     } catch (err: any) {
       // Timeout, conexión cortada, DNS: NO hay evidencia de si el daemon aceptó.
-      return { ok: false, error: `Fallo de conexión con daemon-proxy: ${err?.message || err}`, outcome: 'UNCERTAIN' }
+      return { ok: false, error: `Fallo de conexión con daemon-proxy: ${err?.message || err}`, outcome: 'UNCERTAIN', degraded }
     }
 
     if (!res.ok) {
       const status = res.status
       const DEFINITIVE_REJECTIONS = new Set([400, 401, 403, 404, 410, 413, 422, 429])
       const outcome: DispatchOutcome = DEFINITIVE_REJECTIONS.has(status) ? 'REJECTED' : 'UNCERTAIN'
-      return { ok: false, error: `Error del transporte WhatsApp: ${status}`, outcome }
+      return { ok: false, error: `Error del transporte WhatsApp: ${status}`, outcome, degraded }
     }
 
     // 2xx con cuerpo ilegible: el daemon pudo aceptar y la respuesta perderse.
     try {
       const data = (await res.json()) as { messageId?: string }
-      return { ok: true, messageId: data.messageId, outcome: 'SENT' }
+      return degraded.length > 0
+        ? { ok: true, messageId: data.messageId, outcome: 'SENT', degraded }
+        : { ok: true, messageId: data.messageId, outcome: 'SENT' }
     } catch {
-      return { ok: false, error: 'Respuesta 2xx ilegible del daemon-proxy (aceptación no confirmable)', outcome: 'UNCERTAIN' }
+      return { ok: false, error: 'Respuesta 2xx ilegible del daemon-proxy (aceptación no confirmable)', outcome: 'UNCERTAIN', degraded }
     }
   }
 }

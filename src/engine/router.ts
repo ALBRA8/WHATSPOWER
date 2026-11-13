@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
-import type { InboundEvent, InboundContact, ExecutionResult, TransportSender, CrmClientInterface } from '../types.ts'
+import type { InboundEvent, InboundContact, ExecutionResult, TransportSender, CrmClientInterface, OutboundMedia } from '../types.ts'
 import { LockManager } from '../state/lock-manager.ts'
 import { SuppressionStore } from '../suppression/suppression-store.ts'
 import { evaluateDeterministicRules } from './rules.ts'
@@ -488,7 +488,9 @@ export class ConversationRouter {
      * PENDING + clave UNCERTAIN, sin reintentos ciegos); rechazo definitivo
      * (4xx) lanza TransportRejectedError y marca el efecto REJECTED. Un
      * resultado sin clasificar y fallido se asume ambiguo (fail-safe). */
-    const send = (effectKey: string, text: string) =>
+    // (hallazgo 6) el contenido enriquecido del flujo (media/botones) acompaña
+    // al despacho; el transporte decide soporte nativo o degradación explícita.
+    const send = (effectKey: string, text: string, media?: OutboundMedia) =>
       this.journaledEffect(idemKey, heartbeat, `send:${effectKey}`, 'send_message', async () => {
         const sendIdemKey = `${correlationId}#${effectKey}`
         const claim = this.claimSendAttempt(orgId, sendIdemKey, phone, text, correlationId)
@@ -508,7 +510,8 @@ export class ConversationRouter {
           // OLEADA 2 (decisión 2026-11-11 #6): el orgId acompaña al envío para
           // que los transportes por organización (Meta Cloud) usen SIEMPRE las
           // credenciales de ESA organización. Los transportes legacy lo ignoran.
-          res = await this.transport.sendMessage(phone, text, correlationId, sendIdemKey, orgId)
+          // (hallazgo 6) el contenido enriquecido viaja al transporte (opcional).
+          res = await this.transport.sendMessage(phone, text, correlationId, sendIdemKey, orgId, media)
         } catch (err) {
           // Un throw del transporte (red cortada a mitad) NO prueba que el daemon
           // no aceptara: ambiguo, jamás rechazo definitivo.
@@ -612,14 +615,43 @@ export class ConversationRouter {
         actionIndex++
       }
 
-      // B. Enviar mensajes generados por el flujo (cada uno journaleado)
+      // B. Enviar mensajes generados por el flujo (cada uno journaleado).
+      // (hallazgo 6) mediaUrl/mediaType/buttons configurados en el flujo visual
+      // llegan al TRANSPORTE (soporte nativo en Meta Cloud; degradación
+      // explícita en transportes sin soporte — nada se pierde en silencio).
       let lastReplyText = ''
       let msgIndex = 0
       for (const msg of flowStep.messagesToSend) {
         const text = typeof msg === 'string' ? msg : msg.text
-        await send(`flow_${msgIndex}:${this.effectHash(phone, text)}`, text)
+        const media: OutboundMedia | undefined = typeof msg === 'string' ? undefined : {
+          mediaUrl: msg.mediaUrl,
+          mediaType: msg.mediaType as OutboundMedia['mediaType'],
+          buttons: msg.buttons,
+        }
+        const hasRich = Boolean(media && (media.mediaUrl || (media.buttons && media.buttons.length > 0)))
+        const effKey = hasRich
+          ? `flow_${msgIndex}:${this.effectHash(phone, text, JSON.stringify(media))}`
+          : `flow_${msgIndex}:${this.effectHash(phone, text)}`
+        const sentRes = await send(effKey, text, hasRich ? media : undefined)
+        const degradedList = sentRes && 'degraded' in sentRes && sentRes.degraded ? sentRes.degraded : []
+        if (degradedList.length > 0) {
+          // Limitación del proveedor aplicada de forma explícita y observable.
+          console.warn(`[router] CONTENIDO_DEGRADADO (${degradedList.length}): ${degradedList.join(' | ')} (org=${orgId}, correlación=${correlationId})`)
+        }
         lastReplyText = text
         msgIndex++
+      }
+
+      // B-bis. (hallazgo 5) Ejecutar el webhook saliente configurado por el
+      // flujo (nodo action http_webhook). Punto arquitectónico correcto: el
+      // router es el ORQUESTADOR de efectos externos (como envíos y CRM) y
+      // journaliza la ejecución: una re-ejecución tras crash NO repite la
+      // llamada (efecto DONE se salta). Sin bloquear el flujo: fallos HTTP/red
+      // se registran como resultado observable y el evento continúa.
+      if (flowStep.webhookToCall) {
+        await this.journaledEffect(idemKey, heartbeat, 'webhook:flow_0', 'http_webhook', async () => {
+          return this.executeFlowWebhook(flowStep.webhookToCall!, correlationId, orgId)
+        })
       }
 
       // C. Manejo de Handoff a humano si el nodo lo requiere
@@ -723,6 +755,58 @@ export class ConversationRouter {
       crmSynced: true,
       correlationId,
     })
+  }
+
+  /**
+   * (hallazgo 5, auditoría funcional 2026-11-12) Ejecutor REAL del webhook
+   * saliente del flujo visual:
+   *  - valida la URL (solo http/https — sin SSRF a esquemas raros);
+   *  - respeta URL, cabeceras del nodo y cuerpo del motor;
+   *  - límite de tiempo (FLOW_WEBHOOK_TIMEOUT_MS, default 10s, AbortSignal);
+   *  - SIN bloquear el procesamiento: fallo de red/HTTP se devuelve como
+   *    resultado observable ({ok:false,...}) — el efecto journaliza DONE con
+   *    el resultado (una re-ejecución tras crash NO repite la llamada);
+   *  - jamás expone secretos: no añade credenciales internas a la petición.
+   */
+  private async executeFlowWebhook(
+    webhook: { url: string; headers?: Record<string, string>; body: Record<string, unknown> },
+    correlationId: string,
+    orgId: string
+  ): Promise<{ ok: boolean; status?: number; error?: string }> {
+    let parsed: URL
+    try {
+      parsed = new URL(webhook.url)
+    } catch {
+      return { ok: false, error: 'WEBHOOK_URL_INVALIDA: la URL configurada no es parseable' }
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { ok: false, error: `WEBHOOK_URL_NO_PERMITIDA: esquema ${parsed.protocol.replace(':', '')} no soportado (solo http/https)` }
+    }
+    const timeoutMs = Number(process.env.FLOW_WEBHOOK_TIMEOUT_MS) || 10_000
+    // Cabeceras: defaults del motor + las configuradas del nodo (el nodo puede
+    // añadir autenticación PROPIA del receptor; el motor no inyecta secretos).
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Correlation-Id': correlationId,
+      ...(webhook.headers || {}),
+    }
+    try {
+      const res = await fetch(parsed.toString(), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(webhook.body),
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      const outcome = res.ok
+        ? { ok: true, status: res.status }
+        : { ok: false, status: res.status, error: `el receptor respondió HTTP ${res.status}` }
+      if (!res.ok) console.warn(`[router] WEBHOOK_FLOW falló (org=${orgId}, correlación=${correlationId}): ${outcome.error}`)
+      return outcome
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.warn(`[router] WEBHOOK_FLOW no entregado (org=${orgId}, correlación=${correlationId}): ${msg} — registrado en journal, el evento continúa`)
+      return { ok: false, error: `fallo de entrega del webhook: ${msg}` }
+    }
   }
 
   private async ensureClient(
