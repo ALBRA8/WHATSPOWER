@@ -51,11 +51,15 @@ cp .env.example .env
 Variables clave:
 ```ini
 PORT=3003
-AGENTIC_2A_WEBHOOK_SECRET=tu_secreto_hmac_32_caracteres
-CRM_ACTIONS_URL=http://localhost:3000/api/crm/actions
+AGENTIC_2A_WEBHOOK_SECRET=<secreto-HMAC-propio>
+CRM_BASE_URL=http://localhost:3000
+CRM_API_KEYS={"<orgId>":"<api-key-albra-de-esa-org>"}
+ORG_SERVICE_CREDENTIALS=<orgId>:<credencial-de-servicio>
 WHATSAPP_DAEMON_URL=http://localhost:3002
 ALLOW_REAL_DISPATCH=false
 ```
+
+**Integración con WHATSPOWER-ULTRA:** para cada organización, genera una credencial aleatoria independiente (mínimo 32 bytes). Configura el mismo par `orgId:credencial` en `ORG_SERVICE_CREDENTIALS` de WHATSPOWER y en `WHATSPOWER_ORG_CREDENTIALS` de WHATSPOWER-ULTRA. No reutilices `INTERNAL_API_SECRET`, la API key del CRM ni el secreto HMAC. WHATSPOWER almacena únicamente el hash de la credencial; ambos procesos deben reiniciarse tras cambiarla. En Ultra mantén `WHATSPOWER_ENABLED=true` y `AGENTIC_2A_URL=http://localhost:3003`. Deja `ALLOW_REAL_DISPATCH=false` durante las pruebas.
 
 ### 3. Ejecutar el Servidor y Flow Studio
 ```bash
