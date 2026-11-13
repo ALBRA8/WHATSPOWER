@@ -73,6 +73,25 @@ export interface TransportSendResult {
   error?: string
   /** B2: clasificación del resultado. Si falta con ok=false se asume UNCERTAIN (fail-safe). */
   outcome?: DispatchOutcome
+  /**
+   * (hallazgo 6, auditoría funcional 2026-11-12) Limitaciones aplicadas al
+   * contenido enriquecido por este envío (p.ej. media entregada como enlace de
+   * texto). Vacío/ausente = el contenido llegó completo en su formato nativo.
+   * EXPLÍCITO por diseño: nada se pierde silenciosamente.
+   */
+  degraded?: string[]
+}
+
+/**
+ * (hallazgo 6) Contenido enriquecido que el flujo visual puede pedir y el
+ * transporte intenta entregar en formato NATIVO cuando el proveedor lo soporta.
+ * Los campos son opcionales; un transporte que no soporte una característica
+ * degrada EXPLÍCITAMENTE (degraded) sin perder el contenido.
+ */
+export interface OutboundMedia {
+  mediaUrl?: string
+  mediaType?: 'image' | 'audio' | 'video' | 'document'
+  buttons?: Array<{ title: string; url?: string }>
 }
 
 export interface TransportSender {
@@ -88,7 +107,13 @@ export interface TransportSender {
    * credenciales de ESA organización — fail-closed si falta. Los transportes
    * legacy (Baileys por org) la aceptan y pueden usarla para el enrutamiento.
    */
-  sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string, orgId?: string): Promise<TransportSendResult>
+  /**
+   * (hallazgo 6) `media` es OPCIONAL por compatibilidad: los transportes que no
+   * lo aceptan siguen funcionando (firma previa intacta); los que soportan el
+   * contenido enriquecido lo entregan en formato nativo, y los que no, degradan
+   * explícitamente (TransportSendResult.degraded) sin perder contenido.
+   */
+  sendMessage(to: string, text: string, correlationId: string, idempotencyKey?: string, orgId?: string, media?: OutboundMedia): Promise<TransportSendResult>
 }
 
 export interface CrmClientInterface {

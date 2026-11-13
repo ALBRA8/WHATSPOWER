@@ -8,15 +8,29 @@ import type {
   SequenceDefinition,
   ConditionRule,
 } from './flow-types.ts'
+import { resolveAiProvider, type AiCompletionProvider } from './ai-provider.ts'
+
+/**
+ * (hallazgo 3, auditoría funcional 2026-11-12) Aviso EXPLÍCITO de indisponibilidad
+ * del nodo AI_RESPONSE. NUNCA aparenta ser una respuesta generada por IA: el
+ * fallback honesto es la política del proyecto (no sustituir fallos en silencio
+ * por texto que parezca generado).
+ */
+export const AI_UNAVAILABLE_FALLBACK =
+  '⚙️ El asistente automático no está disponible en este momento. Un asesor de nuestro equipo continuará la conversación en breve.'
 
 export class FlowEngine {
   private db: DatabaseSync
+  private aiProvider: AiCompletionProvider
 
-  constructor(db: DatabaseSync) {
+  constructor(db: DatabaseSync, aiProvider?: AiCompletionProvider) {
     this.db = db
     // (tercera reparación 4.B) La seed del flujo demo ya NO es global: cada
     // organización recibe SU copia la primera vez que consulta/evalúa flujos
     // (ensureDefaultFlowForOrg). En el constructor no hay contexto de org.
+    // (hallazgo 3) Proveedor de IA inyectable (pruebas) o resuelto por entorno
+    // (fail-closed: sin AI_API_KEY el nodo lo reporta honestamente).
+    this.aiProvider = aiProvider ?? resolveAiProvider()
   }
 
   // =========================================================================
@@ -533,10 +547,12 @@ export class FlowEngine {
           sequenceToEnroll = currentNode.data.sequenceId
         }
 
-        // 4. Webhook saliente
+        // 4. Webhook saliente — (hallazgo 5) las cabeceras configuradas del nodo
+        //    viajan al ejecutor del router (que valida, limita y journaliza).
         else if (actType === 'http_webhook' && currentNode.data.webhookUrl) {
           webhookToCall = {
             url: currentNode.data.webhookUrl,
+            headers: currentNode.data.webhookHeaders,
             body: { contactPhone, context: session.context, timestamp: Date.now() },
           }
         }
@@ -607,8 +623,25 @@ export class FlowEngine {
 
       // --- NODO: AI_RESPONSE ---
       else if (currentNode.type === 'ai_response') {
-        const prompt = currentNode.data.aiPrompt || 'Responde de forma concisa como asistente de ventas.'
-        const aiText = `🤖 [IA Asistente]: Gracias por tu pregunta. En breve un asesor te dará más detalles personalizados.`
+        // (hallazgo 3) El nodo ejecuta el motor REAL de IA: envía el prompt
+        // interpolado + contexto al proveedor configurado (inyectable/entorno),
+        // con timeout y clasificación de errores. Sin IA configurada o con
+        // fallo: aviso EXPLÍCITO de indisponibilidad (jamás texto fingido de IA).
+        const promptTemplate = currentNode.data.aiPrompt || 'Responde de forma concisa como asistente de ventas.'
+        const prompt = this.interpolateVariables(promptTemplate, session.context, contactPhone)
+        let aiText: string
+        try {
+          const aiRes = await this.aiProvider.complete(prompt, session.context, { model: currentNode.data.aiModel })
+          if (aiRes.ok && aiRes.text && aiRes.text.trim().length > 0) {
+            aiText = aiRes.text
+          } else {
+            console.error(`[flow-engine] AI_RESPONSE sin resultado usable (fallback=${aiRes.fallback ?? false}): ${aiRes.error || 'respuesta vacía'} — se continúa con aviso explícito, no simulamos IA`)
+            aiText = AI_UNAVAILABLE_FALLBACK
+          }
+        } catch (err) {
+          console.error(`[flow-engine] AI_RESPONSE falló: ${err instanceof Error ? err.message : String(err)} — se continúa con aviso explícito, no simulamos IA`)
+          aiText = AI_UNAVAILABLE_FALLBACK
+        }
         messagesToSend.push({ text: aiText })
         this.recordOutboundMessage(orgId, contactPhone, aiText)
 
@@ -655,12 +688,22 @@ export class FlowEngine {
   // 6. UTILIDADES AUXILIARES
   // =========================================================================
 
+  /**
+   * (hallazgo 1, auditoría funcional 2026-11-12) Interpolación LITERAL por
+   * split/join en lugar de RegExp dinámicas:
+   *  - los nombres de campos son DATOS, no patrones: un nombre como "cliente[",
+   *    "cliente.nombre" o "precio+iva" jamás construye una expresión inválida
+   *    ni coincide por accidente;
+   *  - split/join no sufre la semántica especial de "$" ("$&", "$1") en el
+   *    reemplazo de String.replace, que corrompía valores que la contuvieran;
+   *  - se preserva el formato {{nombre}} y la sustitución existente.
+   */
   private interpolateVariables(text: string, context: Record<string, string>, phone: string): string {
     let res = text
-    res = res.replace(/\{\{nombre\}\}/g, context.nombre || 'amigo(a)')
-    res = res.replace(/\{\{telefono\}\}/g, phone)
+    res = res.split('{{nombre}}').join(context.nombre || 'amigo(a)')
+    res = res.split('{{telefono}}').join(phone)
     for (const [k, v] of Object.entries(context)) {
-      res = res.replace(new RegExp(`\\{\\{${k}\\}\\}`, 'g'), v)
+      res = res.split(`{{${k}}}`).join(String(v))
     }
     return res
   }
@@ -685,9 +728,24 @@ export class FlowEngine {
       } else if (r.type === 'field_contains' && r.field) {
         const val = this.getCustomField(orgId, phone, r.field) || context[r.field] || ''
         return val.toLowerCase().includes(r.value.toLowerCase())
+      } else if (r.type === 'field_greater_than' && r.field) {
+        // (hallazgo 2) Comparación numérica REAL con validación: vacío, NaN o
+        // no numérico → false definido (comportamiento documentado y probado).
+        const val = this.getCustomField(orgId, phone, r.field) || context[r.field] || ''
+        const cmp = compareNumericValues(val, r.value)
+        return cmp !== null && cmp > 0
+      } else if (r.type === 'field_less_than' && r.field) {
+        const val = this.getCustomField(orgId, phone, r.field) || context[r.field] || ''
+        const cmp = compareNumericValues(val, r.value)
+        return cmp !== null && cmp < 0
       } else if (r.type === 'message_contains') {
         const msg = context.ultimo_mensaje || ''
         return msg.toLowerCase().includes(r.value.toLowerCase())
+      } else if (r.type === 'message_equals') {
+        // (hallazgo 2) Comparación EXACTA de mensajes respetando la normalización
+        // del motor (trim + minúsculas + des-acento NFD, la misma del trigger).
+        const msg = context.ultimo_mensaje || ''
+        return normalizeForEngineCompare(msg) === normalizeForEngineCompare(r.value)
       }
       return false
     })
@@ -695,13 +753,32 @@ export class FlowEngine {
     return logic === 'AND' ? results.every(Boolean) : results.some(Boolean)
   }
 
-  private recordOutboundMessage(orgId: string, phone: string, text: string, mediaUrl?: string): void {
+  /**
+   * (hallazgo 4, auditoría funcional 2026-11-12) Persistencia del registro
+   * outbound con POLÍTICA EXPLÍCITA (definida y probada, no silenciosa):
+   *  - El mensaje ya está en messagesToSend: el envío NO se revierte ni se
+   *    reintenta desde aquí (un reintento duplicaría el WhatsApp real).
+   *  - La idempotencia del envío vive en el router (daemon_send_idempotency)
+   *    y NO depende de este registro: inbox_messages es auditoría de bandeja.
+   *  - Un fallo de BD se REGISTRA en el log de operación con contexto mínimo
+   *    (org e id del registro, sin datos sensibles) y devuelve false.
+   *  - SIN reintento automático: evita duplicados en la bandeja.
+   * @returns true si el registro quedó persistido.
+   */
+  private recordOutboundMessage(orgId: string, phone: string, text: string, mediaUrl?: string): boolean {
+    const recordId = `out_${Date.now()}_${Math.random().toString(36).substring(7)}`
     try {
       this.db.prepare(`
         INSERT INTO inbox_messages (id, organization_id, contact_phone, direction, text, media_url, created_at)
         VALUES (?, ?, ?, 'outbound', ?, ?, ?)
-      `).run(`out_${Date.now()}_${Math.random().toString(36).substring(7)}`, orgId, phone, text, mediaUrl || null, Date.now())
-    } catch {}
+      `).run(recordId, orgId, phone, text, mediaUrl || null, Date.now())
+      return true
+    } catch (err) {
+      console.error(
+        `[flow-engine] OUTBOUND_NOT_PERSISTED: no se pudo registrar el mensaje saliente en inbox_messages (org=${orgId}, registro=${recordId}) — el envío continúa y la idempotencia de envío no depende de este registro; sin reintento para no duplicar. error=${err instanceof Error ? err.message : String(err)}`
+      )
+      return false
+    }
   }
 
   /**
@@ -799,4 +876,33 @@ export class FlowEngine {
 
     this.saveFlow(orgId, defaultFlow)
   }
+}
+
+/**
+ * (hallazgo 2, auditoría funcional 2026-11-12) Normalización de comparación de
+ * mensajes: la MISMA que usa el motor para triggers (trim + minúsculas +
+ * des-acento NFD). message_equals respeta exactamente esta normalización.
+ */
+export function normalizeForEngineCompare(s: string): string {
+  return s.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+}
+
+/**
+ * (hallazgo 2) Validación numérica estricta: vacío o no-numérico → null
+ * (sin comparación: la condición evalúa false definido, no excepción).
+ */
+export function parseNumericValue(s: string): number | null {
+  if (s === null || s === undefined) return null
+  const t = String(s).trim()
+  if (t === '') return null
+  const n = Number(t)
+  return Number.isFinite(n) ? n : null
+}
+
+/** (hallazgo 2) Comparación numérica segura: null si algún lado no es numérico. */
+export function compareNumericValues(a: string, b: string): number | null {
+  const na = parseNumericValue(a)
+  const nb = parseNumericValue(b)
+  if (na === null || nb === null) return null
+  return na === nb ? 0 : na < nb ? -1 : 1
 }
