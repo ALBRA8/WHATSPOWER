@@ -12,9 +12,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 22
       - name: TypeScript (fail-fast)
-        run: npm install --no-save typescript@5 @types/node@24 && npx tsc --noEmit -p tsconfig.json
+        run: npm install && npx tsc --noEmit -p tsconfig.json
       - name: Suite completa (incluye seguridad AUTH/WH/ENV/TR/IDEM + contrato v1.1.0)
         run: npm test
         env:
