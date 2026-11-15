@@ -213,6 +213,63 @@ export class FlowEngine {
     }
   }
 
+  // Lista secuencias con sus pasos y contadores de inscripciones (para dashboard/API).
+  listSequences(): Array<{
+    id: string
+    name: string
+    isActive: boolean
+    createdAt: number
+    steps: Array<{ id: string; stepOrder: number; delayMinutes: number; messageText: string; flowId?: string }>
+    enrolled: number
+    active: number
+    completed: number
+  }> {
+    const seqRows = this.db.prepare('SELECT * FROM sequences ORDER BY created_at DESC').all() as Array<{
+      id: string
+      name: string
+      is_active: number
+      created_at: number
+    }>
+
+    const stepStmt = this.db.prepare('SELECT * FROM sequence_steps WHERE sequence_id = ? ORDER BY step_order ASC')
+    const countStmt = this.db.prepare(`
+      SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) AS active,
+        SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed
+      FROM sequence_enrollments WHERE sequence_id = ?
+    `)
+
+    return seqRows.map((row) => {
+      const steps = (stepStmt.all(row.id) as Array<{
+        id: string
+        step_order: number
+        delay_minutes: number
+        message_text: string
+        flow_id: string | null
+      }>).map((s) => ({
+        id: s.id,
+        stepOrder: s.step_order,
+        delayMinutes: s.delay_minutes,
+        messageText: s.message_text,
+        flowId: s.flow_id || undefined,
+      }))
+
+      const counts = countStmt.get(row.id) as { total: number; active: number | null; completed: number | null }
+
+      return {
+        id: row.id,
+        name: row.name,
+        isActive: row.is_active === 1,
+        createdAt: row.created_at,
+        steps,
+        enrolled: counts.total || 0,
+        active: counts.active || 0,
+        completed: counts.completed || 0,
+      }
+    })
+  }
+
   // =========================================================================
   // 4. SESIONES DE DIÁLOGO
   // =========================================================================
@@ -569,11 +626,32 @@ export class FlowEngine {
 
       // --- NODO: AI_RESPONSE ---
       else if (currentNode.type === 'ai_response') {
-        const prompt = currentNode.data.aiPrompt || 'Responde de forma concisa como asistente de ventas.'
-        const aiText = `🤖 [IA Asistente]: Gracias por tu pregunta. En breve un asesor te dará más detalles personalizados.`
+        // ⚠️ MVP sin integración LLM real. MuchChat parity requiere conectar aquí un LLM
+        // (OpenAI/Claude/etc.) usando currentNode.data.aiPrompt / aiModel. El placeholder
+        // informa honestamente al usuario en lugar de simular una respuesta de IA.
+        const aiText = '🤖 Tu mensaje fue recibido. La integración IA aún no está activa en este flujo; un asesor humano te dará una respuesta personalizada en breve.'
         messagesToSend.push({ text: aiText })
         this.recordOutboundMessage(contactPhone, aiText)
 
+        const nextEdge = flow!.edges.find((e) => e.source === currentNode!.id)
+        if (nextEdge) {
+          session.currentNodeId = nextEdge.target
+          currentNode = flow!.nodes.find((n) => n.id === nextEdge.target)
+        } else {
+          currentNode = undefined
+        }
+      }
+      // --- NODO: DELAY / SMART_DELAY ---
+      // Espera sincrónica dentro del flujo. Cap a 60s para no colgar el event loop;
+      // para delays más largos (horas/días) usar drip sequences (sequence_enrollments).
+      else if (currentNode.type === 'delay' || currentNode.type === 'smart_delay') {
+        const delayMs = (currentNode.data.delayMinutes || 0) * 60 * 1000
+          + (currentNode.data.delaySeconds || 0) * 1000
+        if (delayMs > 0 && delayMs <= 60_000) {
+          await new Promise<void>((r) => setTimeout(r, delayMs))
+        } else if (delayMs > 60_000) {
+          console.warn(`[FlowEngine] delay node ${currentNode.id} >60s (${delayMs}ms). Use drip sequences for long delays.`)
+        }
         const nextEdge = flow!.edges.find((e) => e.source === currentNode!.id)
         if (nextEdge) {
           session.currentNodeId = nextEdge.target
@@ -594,6 +672,13 @@ export class FlowEngine {
 
     if (!currentNode && !session.waitingForInput) {
       this.clearSession(contactPhone)
+    } else if (currentNode && !isHandoff) {
+      // Persistir el avance por nodos no-bloqueantes para no perder estado si el
+      // proceso cae antes del siguiente send_message/user_input. saveSession es
+      // idempotente (UPSERT) por teléfono, así que re-grabar cuando send_message
+      // ya grabó es seguro.
+      // Excepción: tras handoff el bloque handoff ya llamó clearSession; no re-guardar.
+      this.saveSession(session)
     }
 
     return {
@@ -646,6 +731,15 @@ export class FlowEngine {
       } else if (r.type === 'field_contains' && r.field) {
         const val = this.getCustomField(phone, r.field) || context[r.field] || ''
         return val.toLowerCase().includes(r.value.toLowerCase())
+      } else if (r.type === 'field_greater_than' && r.field) {
+        const val = Number(this.getCustomField(phone, r.field) || context[r.field] || '0')
+        return val > Number(r.value)
+      } else if (r.type === 'field_less_than' && r.field) {
+        const val = Number(this.getCustomField(phone, r.field) || context[r.field] || '0')
+        return val < Number(r.value)
+      } else if (r.type === 'message_equals') {
+        const msg = (context.ultimo_mensaje || '').toLowerCase()
+        return msg === r.value.toLowerCase()
       } else if (r.type === 'message_contains') {
         const msg = context.ultimo_mensaje || ''
         return msg.toLowerCase().includes(r.value.toLowerCase())

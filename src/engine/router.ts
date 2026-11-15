@@ -133,6 +133,24 @@ export class ConversationRouter {
         }
       }
 
+      // A.2 Disparar webhook HTTP externo (ManyChat parity: Action node 'http_webhook')
+      // Best-effort: timeout 5s, no reintentos. Falla con log warning, no rompe el flujo.
+      if (flowStep.webhookToCall) {
+        try {
+          const controller = new AbortController()
+          const timeout = setTimeout(() => controller.abort(), 5_000)
+          await fetch(flowStep.webhookToCall.url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(flowStep.webhookToCall.body),
+            signal: controller.signal,
+          })
+          clearTimeout(timeout)
+        } catch (whErr: any) {
+          console.warn(`[Webhook Action] Falla disparando ${flowStep.webhookToCall.url}:`, whErr?.message || whErr)
+        }
+      }
+
       // B. Enviar mensajes generados por el flujo
       let lastReplyText = ''
       for (const msg of flowStep.messagesToSend) {

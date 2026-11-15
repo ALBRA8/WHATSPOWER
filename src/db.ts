@@ -13,6 +13,10 @@ export function createDatabase(dbPath?: string): DatabaseSync {
 
   const db = new DatabaseSync(targetPath)
 
+  // Hardening SQLite: foreign keys y WAL para consistencia referencial y concurrencia.
+  db.exec('PRAGMA foreign_keys = ON')
+  db.exec('PRAGMA journal_mode = WAL')
+
   // Inicializar esquema operativo privado de Capa 2A
   db.exec(`
     CREATE TABLE IF NOT EXISTS conversation_locks (
@@ -77,6 +81,17 @@ export function createDatabase(dbPath?: string): DatabaseSync {
       field_value TEXT NOT NULL,
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (contact_phone, field_key)
+    );
+
+    -- CRM de Contactos (paridad ManyChat "Contactos"): ficha principal del contacto
+    CREATE TABLE IF NOT EXISTS crm_contacts (
+      contact_phone TEXT PRIMARY KEY,
+      name TEXT,
+      email TEXT,
+      notes TEXT,
+      source TEXT NOT NULL DEFAULT 'manual',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS sequences (
@@ -164,6 +179,21 @@ export function createDatabase(dbPath?: string): DatabaseSync {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
+  `)
+
+  // Índices para acelerar las consultas más frecuentes (lookups por teléfono, status, next_run_at, etc.)
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_inbox_phone ON inbox_messages(contact_phone);
+    CREATE INDEX IF NOT EXISTS idx_inbox_created ON inbox_messages(created_at);
+    CREATE INDEX IF NOT EXISTS idx_seq_enroll_next ON sequence_enrollments(status, next_run_at);
+    CREATE INDEX IF NOT EXISTS idx_seq_enroll_phone ON sequence_enrollments(contact_phone);
+    CREATE INDEX IF NOT EXISTS idx_tags_name ON contact_tags(tag_name);
+    CREATE INDEX IF NOT EXISTS idx_custom_field_key ON contact_custom_fields(field_key);
+    CREATE INDEX IF NOT EXISTS idx_assignments_agent ON agent_assignments(agent_id, status);
+    CREATE INDEX IF NOT EXISTS idx_assignments_status ON agent_assignments(status);
+    CREATE INDEX IF NOT EXISTS idx_payment_status ON payment_transactions(status);
+    CREATE INDEX IF NOT EXISTS idx_payment_phone ON payment_transactions(contact_phone);
+    CREATE INDEX IF NOT EXISTS idx_flows_active ON flows(is_active);
   `)
 
   return db
