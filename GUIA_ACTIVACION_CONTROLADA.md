@@ -24,13 +24,13 @@ AGENTIC_2A_ENABLED=true
 AGENTIC_2A_URL=http://localhost:3003/api/inbound
 
 # Secreto Compartido para Firma HMAC-SHA256 (mínimo 32 caracteres)
-AGENTIC_2A_WEBHOOK_SECRET=dev_shared_hmac_secret_albra_2a_2026
+AGENTIC_2A_WEBHOOK_SECRET=<GENERAR_CON_openssl_rand_hex_32_NUNCA_USAR_VALOR_DE_EJEMPLO_EN_PRODUCCION>
 ```
 
 ### En `clones/albra-agentic-2a/.env` (Capa 2A)
 ```env
 PORT=3003
-WEBHOOK_SECRET=dev_shared_hmac_secret_albra_2a_2026
+WEBHOOK_SECRET=<GENERAR_CON_openssl_rand_hex_32_NUNCA_USAR_VALOR_DE_EJEMPLO_EN_PRODUCCION>
 CRM_BASE_URL=http://localhost:3000
 ALBRA_API_KEY=albra_tu_api_key_de_la_organizacion
 NODE_ENV=development

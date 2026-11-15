@@ -102,7 +102,7 @@ async function runPersistenceAndHandoffTests() {
   const routerB = new ConversationRouter(dbB, transportB, crmB)
 
   // 1. Verificación de persistencia de HANDOFF_HUMAN tras reinicio
-  const lockPersisted = routerB.getLockManager().getLock(phoneHandoff)
+  const lockPersisted = routerB.getLockManager().getLock(phoneHandoff, 'org_test')
   assert.ok(lockPersisted)
   assert.strictEqual(lockPersisted.currentState, 'HANDOFF_HUMAN')
   console.log('  ✅ [PASS] El lock HANDOFF_HUMAN sobrevivió al reinicio del servicio')
@@ -119,8 +119,8 @@ async function runPersistenceAndHandoffTests() {
 
   // 2. Liberación formal de conversación por el asesor humano
   console.log('\n[Fase 3] Asesor resuelve la conversación en el CRM y libera el lock...')
-  routerB.getLockManager().releaseLock(phoneHandoff)
-  const lockReleased = routerB.getLockManager().getLock(phoneHandoff)
+  routerB.getLockManager().releaseLock(phoneHandoff, 'org_test')
+  const lockReleased = routerB.getLockManager().getLock(phoneHandoff, 'org_test')
   assert.strictEqual(lockReleased, null)
 
   // Ahora que fue liberado, un nuevo mensaje vuelve a ser atendido normalmente
@@ -134,7 +134,7 @@ async function runPersistenceAndHandoffTests() {
   console.log('  ✅ [PASS] Conversación reactivada con éxito tras liberación formal del asesor')
 
   // 3. Verificación de persistencia de Supresión tras reinicio
-  assert.ok(routerB.getSuppressionStore().isSuppressed(phoneBaja))
+  assert.ok(routerB.getSuppressionStore().isSuppressed('org_test', phoneBaja))
   const resBajaIgnored = await routerB.processInbound({
     eventId: 'evt_baja_02',
     orgId: 'org_test',

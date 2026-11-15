@@ -40,14 +40,15 @@ async function runBridgeTests() {
     }
 
     const validBody = JSON.stringify(validEvent)
-    const validHmac = createHmac('sha256', webhookSecret).update(validBody).digest('hex')
+    const tsValid = new Date().toISOString()
+    const validHmac = createHmac('sha256', webhookSecret).update(`${tsValid}.${validBody}`).digest('hex')
 
     const resValid = await fetch(`http://localhost:${PORT}/api/inbound`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Signature-SHA256': validHmac,
-        'X-Timestamp': new Date().toISOString(),
+        'X-Timestamp': tsValid,
         'X-Correlation-Id': 'corr_bridge_01',
       },
       body: validBody,
@@ -112,14 +113,15 @@ async function runBridgeTests() {
       message: { id: 'msg_04', text: 'Quiero hablar con un asesor', type: 'text' },
     }
     const handoffBody = JSON.stringify(handoffEvent)
-    const handoffHmac = createHmac('sha256', webhookSecret).update(handoffBody).digest('hex')
+    const tsHandoff = new Date().toISOString()
+    const handoffHmac = createHmac('sha256', webhookSecret).update(`${tsHandoff}.${handoffBody}`).digest('hex')
 
     const resHandoff = await fetch(`http://localhost:${PORT}/api/inbound`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Signature-SHA256': handoffHmac,
-        'X-Timestamp': new Date().toISOString(),
+        'X-Timestamp': tsHandoff,
         'X-Correlation-Id': 'corr_bridge_04',
       },
       body: handoffBody,

@@ -43,14 +43,15 @@ class CrmAutoReplySimulator {
           message: { id: `msg_${Date.now()}`, text: message, type: 'text' },
         }
         const bodyStr = JSON.stringify(payload)
-        const signature = createHmac('sha256', this.bridgeSecret).update(bodyStr).digest('hex')
+        const ts = new Date().toISOString()
+        const signature = createHmac('sha256', this.bridgeSecret).update(`${ts}.${bodyStr}`).digest('hex')
 
         const res = await fetch(this.bridgeUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'X-Signature-SHA256': signature,
-            'X-Timestamp': new Date().toISOString(),
+            'X-Timestamp': ts,
           },
           body: bodyStr,
           signal: AbortSignal.timeout(3000),

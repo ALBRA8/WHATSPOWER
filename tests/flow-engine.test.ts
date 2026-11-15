@@ -9,18 +9,26 @@ test('SUITE: WhatsPower Flow Engine (Estilo ManyChat)', async (t) => {
   const db = createDatabase(':memory:')
   const engine = new FlowEngine(db)
 
-  await t.test('FL-01: Registro y consulta de flujo visual', () => {
-    const flows = engine.listFlows()
-    assert.ok(flows.length >= 1, 'Debe haber al menos 1 flujo sembrado')
+  await t.test('FL-01: Registro y consulta de flujo visual (seed perezosa POR ORG)', () => {
+    // (tercera reparación 4.B) La seed del flujo demo es perezosa y POR organización:
+    // la primera consulta/evaluación de una org crea SU PROPIA copia.
+    const flows = engine.listFlows('org_test')
+    assert.ok(flows.length >= 1, 'La primera consulta siembra el flujo demo de ESTA org')
     const defaultFlow = flows[0]
     assert.strictEqual(defaultFlow.isActive, true)
     assert.ok(defaultFlow.triggerKeywords.includes('precio'))
     assert.ok(defaultFlow.nodes.length >= 5)
+    assert.ok(engine.findMatchingFlow('org_test', 'precio'), 'el flujo sembrado debe matcher "precio"')
+    // Aislamiento: un flujo guardado en org_test NO aparece en org_otra
+    engine.saveFlow('org_test', { ...defaultFlow, id: 'flow_privado_test', name: 'Privado org_test', triggerKeywords: ['palabra_privada'] })
+    const flowsB = engine.listFlows('org_otra')
+    assert.ok(flowsB.every((f) => f.id !== 'flow_privado_test'), 'las orgs no comparten flujos')
+    assert.strictEqual(engine.getFlow('org_inexistente', 'flow_privado_test'), null, 'otra org no puede leer el flujo por id')
   })
 
   await t.test('FL-02: Trigger activa flujo y envía mensaje inicial con menú', async () => {
     const phone = '+573100000001'
-    const res = await engine.evaluateStep(phone, 'Hola, quiero PRECIO y planes', { name: 'Camila' })
+    const res = await engine.evaluateStep('org_test', phone, 'Hola, quiero PRECIO y planes', { name: 'Camila' })
 
     assert.strictEqual(res.handled, true)
     assert.strictEqual(res.flowId, 'flow_ventas_manychat_01')
@@ -31,7 +39,7 @@ test('SUITE: WhatsPower Flow Engine (Estilo ManyChat)', async (t) => {
     assert.ok(text0.includes('2️⃣ Más de 4 asesores'))
 
     // Verificar que la sesión quedó guardada esperando input
-    const session = engine.getSession(phone)
+    const session = engine.getSession('org_test', phone)
     assert.ok(session)
     assert.strictEqual(session.waitingForInput, true)
     assert.strictEqual(session.context.nombre, 'Camila')
@@ -39,7 +47,7 @@ test('SUITE: WhatsPower Flow Engine (Estilo ManyChat)', async (t) => {
 
   await t.test('FL-03: Respuesta opción 1 navega a Plan Emprendedor', async () => {
     const phone = '+573100000001'
-    const res = await engine.evaluateStep(phone, '1')
+    const res = await engine.evaluateStep('org_test', phone, '1')
 
     assert.strictEqual(res.handled, true)
     assert.strictEqual(res.messagesToSend.length, 1)
@@ -50,10 +58,10 @@ test('SUITE: WhatsPower Flow Engine (Estilo ManyChat)', async (t) => {
   await t.test('FL-04: Respuesta opción 2 dispara acción CRM create_opportunity en ALBRA', async () => {
     const phone = '+573100000002'
     // Paso 1: Iniciar flujo
-    await engine.evaluateStep(phone, 'info de la plataforma', { name: 'Roberto' })
+    await engine.evaluateStep('org_test', phone, 'info de la plataforma', { name: 'Roberto' })
 
     // Paso 2: Seleccionar opción 2 (Corporativo)
-    const res = await engine.evaluateStep(phone, '2')
+    const res = await engine.evaluateStep('org_test', phone, '2')
 
     assert.strictEqual(res.handled, true)
     // Debe haber ejecutado acción CRM
@@ -69,10 +77,10 @@ test('SUITE: WhatsPower Flow Engine (Estilo ManyChat)', async (t) => {
   await t.test('FL-05: Respuesta opción 3 activa Human Handoff', async () => {
     const phone = '+573100000003'
     // Paso 1: Iniciar flujo
-    await engine.evaluateStep(phone, 'planes', { name: 'Valeria' })
+    await engine.evaluateStep('org_test', phone, 'planes', { name: 'Valeria' })
 
     // Paso 2: Seleccionar opción 3 (Asesor)
-    const res = await engine.evaluateStep(phone, '3')
+    const res = await engine.evaluateStep('org_test', phone, '3')
 
     assert.strictEqual(res.handled, true)
     assert.strictEqual(res.isHandoff, true)
@@ -80,7 +88,7 @@ test('SUITE: WhatsPower Flow Engine (Estilo ManyChat)', async (t) => {
     assert.ok(res.messagesToSend[0].text.includes('comunicando con un asesor'))
 
     // La sesión debe quedar cerrada para ceder el turno al asesor
-    const session = engine.getSession(phone)
+    const session = engine.getSession('org_test', phone)
     assert.strictEqual(session, null)
   })
 
@@ -97,12 +105,12 @@ test('SUITE: WhatsPower Flow Engine (Estilo ManyChat)', async (t) => {
       edges: [{ id: 'e1', source: 't1', target: 'm1' }],
     }
 
-    engine.saveFlow(customFlow)
-    const retrieved = engine.getFlow('flow_soporte_rapido')
+    engine.saveFlow('org_test', customFlow)
+    const retrieved = engine.getFlow('org_test', 'flow_soporte_rapido')
     assert.ok(retrieved)
     assert.strictEqual(retrieved.name, 'Flujo de Soporte y Garantía')
 
-    const res = await engine.evaluateStep('+573109998888', 'tengo un problema y necesito ayuda')
+    const res = await engine.evaluateStep('org_test', '+573109998888', 'tengo un problema y necesito ayuda')
     assert.strictEqual(res.handled, true)
     assert.strictEqual(res.flowId, 'flow_soporte_rapido')
     assert.ok(res.messagesToSend[0].text.includes('Centro de soporte'))

@@ -143,7 +143,9 @@ export interface FlowEvaluationResult {
   tagsToRemove?: string[]
   customFieldsToSet?: Record<string, string>
   sequenceToEnroll?: string
-  webhookToCall?: { url: string; body: Record<string, unknown> }
+  /** (hallazgo 5, auditoría funcional 2026-11-12) Las cabeceras configuradas
+   *  en el nodo (webhookHeaders) viajan al ejecutor del router. */
+  webhookToCall?: { url: string; headers?: Record<string, string>; body: Record<string, unknown> }
   isHandoff?: boolean
   handoffReason?: string
   flowCompleted?: boolean

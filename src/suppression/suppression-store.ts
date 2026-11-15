@@ -2,6 +2,12 @@ import { DatabaseSync } from 'node:sqlite'
 
 const OPT_OUT_KEYWORDS = ['baja', 'salir', 'stop', 'cancelar', 'no deseo mas mensajes', 'no enviar mas']
 
+/**
+ * SuppressionStore — lista de supresión POR ORGANIZACIÓN.
+ * (segunda reparación §3.A) La PK es (organization_id, phone): la baja de un
+ * contacto en una organización NO silencia ese número en otra organización
+ * (son relaciones comerciales independientes).
+ */
 export class SuppressionStore {
   db: DatabaseSync
   constructor(db: DatabaseSync) {
@@ -20,31 +26,31 @@ export class SuppressionStore {
   }
 
   /**
-   * Registra un contacto en la lista de supresión permanente.
+   * Registra un contacto en la lista de supresión permanente DE SU ORGANIZACIÓN.
    */
-  addSuppression(phone: string, reason: string): void {
+  addSuppression(orgId: string, phone: string, reason: string): void {
     const now = Math.floor(Date.now() / 1000)
     this.db.prepare(`
-      INSERT INTO suppression_list (phone, reason, created_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(phone) DO UPDATE SET
+      INSERT INTO suppression_list (organization_id, phone, reason, created_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(organization_id, phone) DO UPDATE SET
         reason = excluded.reason,
         created_at = excluded.created_at
-    `).run(phone, reason, now)
+    `).run(orgId, phone, reason, now)
   }
 
   /**
-   * Comprueba si un teléfono se encuentra revocado/suprimido.
+   * Comprueba si un teléfono está suprimido PARA una organización concreta.
    */
-  isSuppressed(phone: string): boolean {
-    const row = this.db.prepare('SELECT phone FROM suppression_list WHERE phone = ?').get(phone)
+  isSuppressed(orgId: string, phone: string): boolean {
+    const row = this.db.prepare('SELECT phone FROM suppression_list WHERE organization_id = ? AND phone = ?').get(orgId, phone)
     return Boolean(row)
   }
 
   /**
-   * Permite re-activar a un contacto si éste solicita explícitamente volver a recibir información.
+   * Re-activa a un contacto SOLO para la organización que lo pide.
    */
-  removeSuppression(phone: string): void {
-    this.db.prepare('DELETE FROM suppression_list WHERE phone = ?').run(phone)
+  removeSuppression(orgId: string, phone: string): void {
+    this.db.prepare('DELETE FROM suppression_list WHERE organization_id = ? AND phone = ?').run(orgId, phone)
   }
 }

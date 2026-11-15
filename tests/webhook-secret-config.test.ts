@@ -8,8 +8,9 @@ import { createAgenticServer } from '../src/server.ts'
  * Cadena de prioridad esperada:
  *   options.webhookSecret > AGENTIC_2A_WEBHOOK_SECRET > WEBHOOK_SECRET (legacy) > default dev
  */
-function sign(payload: string, secret: string): string {
-  return createHmac('sha256', secret).update(payload).digest('hex')
+// Firma canonical v2 (reparación integral): HMAC sobre `${ts}.${payload}`
+function sign(payload: string, secret: string, ts: string): string {
+  return createHmac('sha256', secret).update(`${ts}.${payload}`).digest('hex')
 }
 
 async function listenOnEphemeralPort(server: { listen: Function; close: Function; address: Function }): Promise<number> {
@@ -27,12 +28,13 @@ const PAYLOAD = JSON.stringify({
 })
 
 async function postInbound(port: number, secret: string): Promise<number> {
+  const ts = String(Date.now())
   const res = await fetch(`http://127.0.0.1:${port}/api/inbound`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-Signature-SHA256': sign(PAYLOAD, secret),
-      'X-Timestamp': String(Date.now()),
+      'X-Signature-SHA256': sign(PAYLOAD, secret, ts),
+      'X-Timestamp': ts,
     },
     body: PAYLOAD,
   })
