@@ -291,7 +291,7 @@ test('T3-07: respuestas internas de locks/suppression CONFIRMAN la organización
     assert.strictEqual(bad.status, 403, 'credencial inválida para la org declarada → 403')
 
     // Sin x-org-id ni credencial → 401
-    const noOrg = await fetch(`${base}/api/internal/suppression/573001234567`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...AUTH }, body: '{}' })
+    const noOrg = await fetch(`${base}/api/internal/suppression/573001234567`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
     assert.strictEqual(noOrg.status, 401)
   } finally {
     server.close()

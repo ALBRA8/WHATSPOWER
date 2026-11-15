@@ -120,7 +120,9 @@ describe('AUTH: superficie administrativa protegida', () => {
 
   it('AUTH-503: sin INTERNAL_API_SECRET configurado, la ruta admin responde 503 fail-closed', async () => {
     const prev = process.env.INTERNAL_API_SECRET
+    const prevKeys = process.env.INTERNAL_API_KEYS
     delete process.env.INTERNAL_API_SECRET
+    delete process.env.INTERNAL_API_KEYS
     try {
       const { server } = bootServer()
       const base = await listenEphemeral(server)
@@ -130,6 +132,7 @@ describe('AUTH: superficie administrativa protegida', () => {
       } finally { server.close() }
     } finally {
       process.env.INTERNAL_API_SECRET = prev
+      if (prevKeys !== undefined) process.env.INTERNAL_API_KEYS = prevKeys
     }
   })
 })
