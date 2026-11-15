@@ -606,10 +606,36 @@ export function createAgenticServer(options?: {
       return
     }
 
-    // 1. Healthcheck
+    // 1. Healthcheck y Métricas Operativas
     if (req.method === 'GET' && url.pathname === '/api/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ status: 'ok', service: 'albra-agentic-2a' }))
+      try {
+        db.prepare('SELECT 1').get()
+        const lockCount = (db.prepare('SELECT COUNT(*) as c FROM conversation_locks WHERE expires_at > ?').get(Date.now()) as any)?.c ?? 0
+        const suppCount = (db.prepare('SELECT COUNT(*) as c FROM suppression_list').get() as any)?.c ?? 0
+        const consentCount = (db.prepare("SELECT COUNT(*) as c FROM consent_records WHERE status = 'ACTIVE'").get() as any)?.c ?? 0
+        const mem = process.memoryUsage()
+
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({
+          status: 'ok',
+          service: 'albra-agentic-2a',
+          uptimeSeconds: Math.floor(process.uptime()),
+          timestamp: new Date().toISOString(),
+          database: { connected: true, driver: 'node:sqlite' },
+          metrics: {
+            activeLocks: lockCount,
+            suppressedContacts: suppCount,
+            activeConsents: consentCount,
+          },
+          memory: {
+            rssMb: Math.round(mem.rss / 1024 / 1024),
+            heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+          }
+        }))
+      } catch (err: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ status: 'error', error: err.message }))
+      }
       return
     }
 
