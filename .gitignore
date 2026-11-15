@@ -15,3 +15,5 @@ feed.json
 transcript.json
 usage.json
 dist/
+checks/
+questions.json
