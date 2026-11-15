@@ -96,6 +96,12 @@ export class MetaCloudOrgTransport {
     const formattedPhone = to.replace(/\D/g, '')
     const base = { messaging_product: 'whatsapp', recipient_type: 'individual', to: formattedPhone }
     const degraded: string[] = []
+    // (ronda 17, paso 1) Plantilla HSM: cuando está presente, construye payload
+    // `type: 'template'` con name + language + components. Ignora mediaUrl/buttons
+    // (la plantilla define su propio contenido).
+    if (media?.template) {
+      return this.buildTemplatePayload(base, media.template, degraded)
+    }
     const hasMedia = Boolean(media?.mediaUrl && media?.mediaType)
     const buttons = media?.buttons ?? []
 
@@ -188,6 +194,37 @@ export class MetaCloudOrgTransport {
     }
 
     return { payload: { ...base, type: 'text', text: { preview_url: true, body: text } }, degraded }
+  }
+
+  /**
+   * (ronda 17, paso 1) Construye el payload `type: 'template'` para WhatsApp Cloud
+   * API. La plantilla debe estar APROBADA en el WABA de la organización. El
+   * cuerpo respeta el formato de la Graph API v14+: namespace opcional, language
+   * con code y policy 'deterministic', y components por tipo (header/body/button).
+   * No se validan los nombres de plantilla aquí (la API rechaza con 400 si no
+   * existe o no está aprobada — clasificación REJECTED, no UNCERTAIN).
+   */
+  buildTemplatePayload(
+    base: { messaging_product: string; recipient_type: string; to: string },
+    template: NonNullable<OutboundMedia['template']>,
+    degraded: string[],
+  ): { payload: Record<string, unknown>; degraded: string[] } {
+    const languageCode = template.languageCode || 'es_CO'
+    const components = (template.components ?? []).map((c) => {
+      const out: Record<string, unknown> = { type: c.type, parameters: c.parameters }
+      if (c.type === 'button' && c.sub_type) out.sub_type = c.sub_type
+      if (c.type === 'button' && typeof c.index === 'number') out.index = c.index
+      return out
+    })
+    const templateNode: Record<string, unknown> = {
+      name: template.name,
+      language: { code: languageCode, policy: 'deterministic' },
+    }
+    if (components.length > 0) templateNode.components = components
+    return {
+      payload: { ...base, type: 'template', template: templateNode },
+      degraded,
+    }
   }
 
   private async dispatchViaGraph(credential: WaCredential, to: string, text: string, correlationId: string, idempotencyKey: string | null, media?: OutboundMedia): Promise<TransportSendResult> {

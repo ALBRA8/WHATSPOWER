@@ -589,6 +589,20 @@ export class ConversationRouter {
     }
 
     // 4. EVALUACIÓN DE FLUJOS VISUALES (FLOW ENGINE ESTILO MANYCHAT)
+    // (ronda 17, paso 2) Atribución de growth link: si el texto entrante coincide
+    // con el prefilled_text de un growth link de ESTA org, aplica el initial_tag
+    // al contacto ANTES de evaluar el flujo. El click ya se contó al seguir el
+    // link wa.me; aquí se cierra el lazo de atribución en el inbound resultante.
+    try {
+      const trimmed = message.text.trim()
+      const match = this.db.prepare('SELECT id, initial_tag FROM growth_links WHERE organization_id = ? AND lower(trim(prefilled_text)) = lower(?) LIMIT 1').get(orgId, trimmed) as { id: string; initial_tag: string | null } | undefined
+      if (match?.initial_tag) {
+        this.flowEngine.addTag(orgId, phone, match.initial_tag)
+      }
+    } catch (e) {
+      // La atribución es best-effort: un fallo aquí NO rompe el flujo principal.
+      console.warn(`[router] growth link attribution failed (org=${orgId}, phone=${phone}):`, (e as Error)?.message)
+    }
     const flowStep = await this.flowEngine.evaluateStep(orgId, phone, message.text, contact)
     if (flowStep.handled) {
       let crmSynced = false

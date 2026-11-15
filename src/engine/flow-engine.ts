@@ -326,13 +326,28 @@ export class FlowEngine {
     this.db.prepare('DELETE FROM flow_sessions WHERE organization_id = ? AND contact_phone = ?').run(orgId, contactPhone)
   }
 
-  findMatchingFlow(orgId: string, messageText: string): FlowDefinition | null {
+  findMatchingFlow(orgId: string, messageText: string, contactPhone?: string): FlowDefinition | null {
     // (tercera reparación 4.B) SOLO flujos de ESTA organización pueden dispararse:
     // un mensaje de la org A jamás ejecuta un flujo de la org B, aunque los
     // identificadores o palabras clave coincidan.
     this.ensureDefaultFlowForOrg(orgId)
     const clean = messageText.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     const flows = this.listFlows(orgId).filter((f) => f.isActive)
+
+    // (ronda 17, paso 2) Trigger isFirstContact: si un flujo tiene un nodo
+    // 'trigger' con data.isFirstContact === true Y este es el primer mensaje
+    // del contacto (inbox_messages count == 1, ya insertado por evaluateStep),
+    // dispara PRIORITARIO (antes que keywords). El "primer mensaje" de un
+    // contacto nuevo no debería quedar atrapado por un keyword accidental.
+    if (contactPhone) {
+      const cnt = (this.db.prepare('SELECT COUNT(*) AS n FROM inbox_messages WHERE organization_id = ? AND contact_phone = ?').get(orgId, contactPhone) as { n: number }).n
+      if (cnt <= 1) {
+        for (const flow of flows) {
+          const trigger = flow.nodes.find((n) => n.type === 'trigger')
+          if (trigger?.data?.isFirstContact === true) return flow
+        }
+      }
+    }
 
     for (const flow of flows) {
       for (const kw of flow.triggerKeywords) {
@@ -375,7 +390,7 @@ export class FlowEngine {
 
     // CASO 2: Iniciar nuevo flujo por trigger (búsqueda CONFINADA a la org)
     if (!session) {
-      flow = this.findMatchingFlow(orgId, messageText)
+      flow = this.findMatchingFlow(orgId, messageText, contactPhone)
       if (!flow) {
         return { handled: false, messagesToSend: [], actionsToExecute: [] }
       }

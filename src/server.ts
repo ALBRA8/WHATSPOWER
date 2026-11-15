@@ -215,6 +215,13 @@ export function createAgenticServer(options?: {
   const inboundReplay = new DurableReplayCache(replayPath)
   const paymentsReplay = new DurableReplayCache(replayPath)
 
+  // (ronda 17, paso 2) Contadores de realtime para /api/realtime/stats.
+  // El dashboard usa SSE (/api/wp-stream en el proxy Next.js) para push; si el
+  // WebSocket directo no está activo estos quedan en 0 (respuesta honesta).
+  // Si se cablea MiniWebSocketServer más adelante, los incrementa aquí.
+  const wsClientCountRef = { count: 0 }
+  const wsMessagesSentRef = { count: 0 }
+
   // Rate limiting de endpoints públicos (tercera reparación 4.F)
   // (reauditoría ciclo 2) inbound/payments usan durableRateLimit (BD): los
   // limiter en memoria equivalentes eran código muerto con límites duplicados.
@@ -1234,6 +1241,401 @@ export function createAgenticServer(options?: {
         console.warn('[API] 400 sin detalles al cliente:', e instanceof Error ? e.message : e)
         res.end(JSON.stringify({ error: 'Petición inválida' }))
       }
+      return
+    }
+
+    // =========================================================================
+    // (ronda 17, paso 2) Endpoints de lista/lectura que el dashboard Next.js
+    // espera y que antes faltaban → caía a datos demo. Todos exigen X-Org-Id
+    // (aislamiento multi-organización fail-closed) y leen EXCLUSIVAMENTE las
+    // filas de la organización autenticada. Sin secretos en las respuestas.
+    // =========================================================================
+
+    // GET /api/inbox — lista mensajes de la bandeja de la organización.
+    // Query: phone? (filtra por contacto), since? (epoch ms), limit? (default 200, máx 500).
+    if (req.method === 'GET' && url.pathname === '/api/inbox') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const phone = url.searchParams.get('phone') || undefined
+      const sinceStr = url.searchParams.get('since')
+      const since = sinceStr ? Number(sinceStr) : undefined
+      const limitStr = url.searchParams.get('limit')
+      const limit = Math.min(Math.max(Number(limitStr) || 200, 1), 500)
+      let sql = 'SELECT id, contact_phone, direction, text, media_url, created_at FROM inbox_messages WHERE organization_id = ?'
+      const params: Array<string | number> = [orgId]
+      if (phone) { sql += ' AND contact_phone = ?'; params.push(phone) }
+      if (since !== undefined && !Number.isNaN(since)) { sql += ' AND created_at >= ?'; params.push(since) }
+      sql += ' ORDER BY created_at ASC LIMIT ?'
+      params.push(limit)
+      const rows = db.prepare(sql).all(...params) as Array<{
+        id: string; contact_phone: string; direction: string; text: string; media_url: string | null; created_at: number
+      }>
+      const messages = rows.map((r) => ({
+        id: r.id,
+        contactPhone: r.contact_phone,
+        direction: r.direction as 'inbound' | 'outbound',
+        text: r.text,
+        mediaUrl: r.media_url,
+        createdAt: r.created_at,
+      }))
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ messages, count: messages.length }))
+      return
+    }
+
+    // GET /api/locks — lista locks activos de la organización (no expirados).
+    // Query: include_handoff? 'true' (default) | 'false' (excluye HANDOFF_HUMAN).
+    if (req.method === 'GET' && url.pathname === '/api/locks') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const includeHandoff = url.searchParams.get('include_handoff') !== 'false'
+      const now = Date.now()
+      let sql = 'SELECT contact_phone, current_state, locked_at, expires_at, correlation_id FROM conversation_locks WHERE organization_id = ? AND expires_at > ?'
+      const params: Array<string | number> = [orgId, now]
+      if (!includeHandoff) { sql += " AND current_state != 'HANDOFF_HUMAN'" }
+      sql += ' ORDER BY locked_at DESC'
+      const rows = db.prepare(sql).all(...params) as Array<{
+        contact_phone: string; current_state: string; locked_at: number; expires_at: number; correlation_id: string
+      }>
+      const locks = rows.map((r) => ({
+        contactPhone: r.contact_phone,
+        organizationId: orgId,
+        currentState: r.current_state,
+        lockedAt: r.locked_at,
+        expiresAt: r.expires_at,
+        correlationId: r.correlation_id,
+      }))
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ locks, count: locks.length }))
+      return
+    }
+
+    // GET /api/suppressions — lista la suppression_list de la organización.
+    // Query: limit? (default 100, máx 500), offset? (default 0).
+    if (req.method === 'GET' && url.pathname === '/api/suppressions') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 100, 1), 500)
+      const offset = Math.max(Number(url.searchParams.get('offset')) || 0, 0)
+      const rows = db.prepare('SELECT phone, reason, created_at FROM suppression_list WHERE organization_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?').all(orgId, limit, offset) as Array<{ phone: string; reason: string; created_at: number }>
+      const total = (db.prepare('SELECT COUNT(*) AS n FROM suppression_list WHERE organization_id = ?').get(orgId) as { n: number }).n
+      const suppressions = rows.map((r) => ({ phone: r.phone, reason: r.reason, createdAt: r.created_at }))
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ suppressions, total, offset, limit }))
+      return
+    }
+
+    // GET /api/metrics — KPIs básicos para el dashboard. Todo por organización.
+    // Conversaciones (inbound/outbound hoy y total), contactos únicos, locks por estado.
+    if (req.method === 'GET' && url.pathname === '/api/metrics') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0)
+      const dayStartMs = dayStart.getTime()
+      const inboundTotal = (db.prepare("SELECT COUNT(*) AS n FROM inbox_messages WHERE organization_id = ? AND direction = 'inbound'").get(orgId) as { n: number }).n
+      const outboundTotal = (db.prepare("SELECT COUNT(*) AS n FROM inbox_messages WHERE organization_id = ? AND direction = 'outbound'").get(orgId) as { n: number }).n
+      const inboundToday = (db.prepare("SELECT COUNT(*) AS n FROM inbox_messages WHERE organization_id = ? AND direction = 'inbound' AND created_at >= ?").get(orgId, dayStartMs) as { n: number }).n
+      const outboundToday = (db.prepare("SELECT COUNT(*) AS n FROM inbox_messages WHERE organization_id = ? AND direction = 'outbound' AND created_at >= ?").get(orgId, dayStartMs) as { n: number }).n
+      const uniqueContacts = (db.prepare('SELECT COUNT(DISTINCT contact_phone) AS n FROM inbox_messages WHERE organization_id = ?').get(orgId) as { n: number }).n
+      const now = Date.now()
+      const activeFlowLocks = (db.prepare("SELECT COUNT(*) AS n FROM conversation_locks WHERE organization_id = ? AND expires_at > ? AND current_state = 'IN_FLOW_2A'").get(orgId, now) as { n: number }).n
+      const handoffLocks = (db.prepare("SELECT COUNT(*) AS n FROM conversation_locks WHERE organization_id = ? AND current_state = 'HANDOFF_HUMAN'").get(orgId) as { n: number }).n
+      const suppressions = (db.prepare('SELECT COUNT(*) AS n FROM suppression_list WHERE organization_id = ?').get(orgId) as { n: number }).n
+      const activeFlows = (db.prepare('SELECT COUNT(*) AS n FROM flows WHERE organization_id = ? AND is_active = 1').get(orgId) as { n: number }).n
+      const activeSequences = (db.prepare('SELECT COUNT(*) AS n FROM sequences WHERE organization_id = ? AND is_active = 1').get(orgId) as { n: number }).n
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        messages: { inboundTotal, outboundTotal, inboundToday, outboundToday },
+        contacts: uniqueContacts,
+        locks: { activeFlow: activeFlowLocks, handoff: handoffLocks },
+        suppressions,
+        flows: activeFlows,
+        sequences: activeSequences,
+      }))
+      return
+    }
+
+    // GET /api/realtime/stats — clientes WebSocket y mensajes enviados.
+    // Si el servidor WS no está activo (modo sin /ws), devuelve ceros.
+    if (req.method === 'GET' && url.pathname === '/api/realtime/stats') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const clients = typeof wsClientCountRef.count === 'number' ? wsClientCountRef.count : 0
+      const messagesSent = typeof wsMessagesSentRef.count === 'number' ? wsMessagesSentRef.count : 0
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ clients, messagesSent }))
+      return
+    }
+
+    // GET /api/sequences — lista secuencias de la organización con conteos.
+    if (req.method === 'GET' && url.pathname === '/api/sequences') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const seqs = db.prepare('SELECT id, name, is_active, created_at FROM sequences WHERE organization_id = ? ORDER BY created_at DESC').all(orgId) as Array<{ id: string; name: string; is_active: number; created_at: number }>
+      const out = seqs.map((s) => {
+        const stepCount = (db.prepare('SELECT COUNT(*) AS n FROM sequence_steps WHERE organization_id = ? AND sequence_id = ?').get(orgId, s.id) as { n: number }).n
+        const activeEnrollments = (db.prepare("SELECT COUNT(*) AS n FROM sequence_enrollments WHERE organization_id = ? AND sequence_id = ? AND status = 'ACTIVE'").get(orgId, s.id) as { n: number }).n
+        const completedEnrollments = (db.prepare("SELECT COUNT(*) AS n FROM sequence_enrollments WHERE organization_id = ? AND sequence_id = ? AND status = 'COMPLETED'").get(orgId, s.id) as { n: number }).n
+        return {
+          id: s.id,
+          name: s.name,
+          isActive: s.is_active === 1,
+          createdAt: s.created_at,
+          stepCount,
+          enrolledActive: activeEnrollments,
+          enrolledCompleted: completedEnrollments,
+        }
+      })
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(out))
+      return
+    }
+
+    // POST /api/sequences — crea una secuencia para la organización.
+    if (req.method === 'POST' && url.pathname === '/api/sequences') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const seq = JSON.parse(rb.body)
+        if (!seq?.id || typeof seq.id !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'sequence.id es obligatorio' }))
+          return
+        }
+        if (seq.organizationId && seq.organizationId !== orgId) {
+          res.writeHead(403, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'organizationId del body no coincide con x-org-id' }))
+          return
+        }
+        seq.organizationId = orgId
+        router.getFlowEngine().saveSequence(orgId, seq)
+        res.writeHead(201, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, id: seq.id }))
+      } catch (e) {
+        console.error(`[wp] 400 en POST /api/sequences:`, (e as Error)?.message)
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
+      }
+      return
+    }
+
+    // GET /api/sequences/:id — detalle de una secuencia con sus pasos.
+    if (req.method === 'GET' && url.pathname.startsWith('/api/sequences/')) {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const seqId = decodeURIComponent(url.pathname.slice('/api/sequences/'.length).split('/')[0])
+      const seq = db.prepare('SELECT id, name, is_active, created_at FROM sequences WHERE organization_id = ? AND id = ?').get(orgId, seqId) as { id: string; name: string; is_active: number; created_at: number } | undefined
+      if (!seq) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Secuencia no encontrada' }))
+        return
+      }
+      const steps = db.prepare('SELECT id, sequence_id, step_number, delay_minutes, message_text, target_flow_id FROM sequence_steps WHERE organization_id = ? AND sequence_id = ? ORDER BY step_number ASC').all(orgId, seqId) as Array<{
+        id: string; sequence_id: string; step_number: number; delay_minutes: number; message_text: string; target_flow_id: string | null
+      }>
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        id: seq.id,
+        name: seq.name,
+        isActive: seq.is_active === 1,
+        createdAt: seq.created_at,
+        steps: steps.map((s) => ({
+          id: s.id,
+          stepNumber: s.step_number,
+          delayMinutes: s.delay_minutes,
+          messageText: s.message_text,
+          targetFlowId: s.target_flow_id,
+        })),
+      }))
+      return
+    }
+
+    // POST /api/sequences/:id/exit — saca a un contacto de una secuencia.
+    if (req.method === 'POST' && url.pathname.startsWith('/api/sequences/') && url.pathname.endsWith('/exit')) {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const parts = url.pathname.slice('/api/sequences/'.length).split('/')
+      const seqId = decodeURIComponent(parts[0])
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const body = JSON.parse(rb.body || '{}')
+        if (!body?.phone || typeof body.phone !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'phone es obligatorio en el body' }))
+          return
+        }
+        router.getFlowEngine().cancelSequenceEnrollment(orgId, body.phone, seqId)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, phone: body.phone, sequenceId: seqId }))
+      } catch (e) {
+        console.error(`[wp] 400 en POST /api/sequences/:id/exit:`, (e as Error)?.message)
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
+      }
+      return
+    }
+
+    // GET /api/contacts — lista contactos de la organización (UNION de
+    // inbox_messages + contact_tags + contact_custom_fields) con sus tags y CF.
+    if (req.method === 'GET' && url.pathname === '/api/contacts') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const phones = new Set<string>()
+      const inboxPhones = db.prepare('SELECT DISTINCT contact_phone FROM inbox_messages WHERE organization_id = ?').all(orgId) as Array<{ contact_phone: string }>
+      for (const r of inboxPhones) phones.add(r.contact_phone)
+      const tagPhones = db.prepare('SELECT DISTINCT contact_phone FROM contact_tags WHERE organization_id = ?').all(orgId) as Array<{ contact_phone: string }>
+      for (const r of tagPhones) phones.add(r.contact_phone)
+      const cfPhones = db.prepare('SELECT DISTINCT contact_phone FROM contact_custom_fields WHERE organization_id = ?').all(orgId) as Array<{ contact_phone: string }>
+      for (const r of cfPhones) phones.add(r.contact_phone)
+      const contacts = Array.from(phones).map((phone) => {
+        const tags = (db.prepare('SELECT tag_name FROM contact_tags WHERE organization_id = ? AND contact_phone = ?').all(orgId, phone) as Array<{ tag_name: string }>).map((r) => r.tag_name)
+        const customFields: Record<string, string> = {}
+        const cfRows = db.prepare('SELECT field_key, field_value FROM contact_custom_fields WHERE organization_id = ? AND contact_phone = ?').all(orgId, phone) as Array<{ field_key: string; field_value: string }>
+        for (const c of cfRows) customFields[c.field_key] = c.field_value
+        const lastMsg = db.prepare('SELECT text, created_at, direction FROM inbox_messages WHERE organization_id = ? AND contact_phone = ? ORDER BY created_at DESC LIMIT 1').get(orgId, phone) as { text: string; created_at: number; direction: string } | undefined
+        return {
+          phone,
+          name: customFields.name || null,
+          email: customFields.email || null,
+          tags,
+          customFields,
+          lastMessageText: lastMsg?.text ?? null,
+          lastMessageAt: lastMsg?.created_at ?? null,
+          lastMessageDirection: lastMsg?.direction ?? null,
+        }
+      })
+      contacts.sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0))
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ contacts, count: contacts.length }))
+      return
+    }
+
+    // POST /api/contacts — registra un contacto nuevo (inserta nombre/email/notas
+    // como custom fields y aplica los tags iniciales). No crea un cliente en el CRM
+    // (eso lo hace el nodo `crm_action` del flow builder) — sólo lo known en 2A.
+    if (req.method === 'POST' && url.pathname === '/api/contacts') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const body = JSON.parse(rb.body)
+        if (!body?.phone || typeof body.phone !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'phone es obligatorio' }))
+          return
+        }
+        const fe = router.getFlowEngine()
+        if (typeof body.name === 'string' && body.name) fe.setCustomField(orgId, body.phone, 'name', body.name)
+        if (typeof body.email === 'string' && body.email) fe.setCustomField(orgId, body.phone, 'email', body.email)
+        if (typeof body.notes === 'string' && body.notes) fe.setCustomField(orgId, body.phone, 'notes', body.notes)
+        if (Array.isArray(body.tags)) for (const t of body.tags) if (typeof t === 'string' && t) fe.addTag(orgId, body.phone, t)
+        res.writeHead(201, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, phone: body.phone }))
+      } catch (e) {
+        console.error(`[wp] 400 en POST /api/contacts:`, (e as Error)?.message)
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Petición inválida' }))
+      }
+      return
+    }
+
+    // GET /api/audit — log de auditoría de automatizaciones (automation_events).
+    // Query: limit? (default 100, máx 500), offset?, event_key?, status?
+    if (req.method === 'GET' && url.pathname === '/api/audit') {
+      const orgId = requireOrgHeader(req)
+      if (!orgId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 100, 1), 500)
+      const offset = Math.max(Number(url.searchParams.get('offset')) || 0, 0)
+      const eventKey = url.searchParams.get('event_key') || undefined
+      const status = url.searchParams.get('status') || undefined
+      let sql = 'SELECT id, event_key, stage, action, status, detail, message_id, created_at FROM automation_events WHERE organization_id = ?'
+      const params: Array<string | number> = [orgId]
+      if (eventKey) { sql += ' AND event_key = ?'; params.push(eventKey) }
+      if (status) { sql += ' AND status = ?'; params.push(status) }
+      sql += ' ORDER BY created_at DESC LIMIT ? OFFSET ?'
+      params.push(limit, offset)
+      const rows = db.prepare(sql).all(...params) as Array<{
+        id: string; event_key: string; stage: string; action: string; status: string; detail: string | null; message_id: string | null; created_at: number
+      }>
+      const totalSql = 'SELECT COUNT(*) AS n FROM automation_events WHERE organization_id = ?' + (eventKey ? ' AND event_key = ?' : '') + (status ? ' AND status = ?' : '')
+      const totalParams: Array<string> = [orgId, ...(eventKey ? [eventKey] : []), ...(status ? [status] : [])]
+      const total = (db.prepare(totalSql).get(...totalParams) as { n: number }).n
+      const events = rows.map((r) => ({
+        id: r.id,
+        eventKey: r.event_key,
+        stage: r.stage,
+        action: r.action,
+        status: r.status,
+        detail: r.detail,
+        messageId: r.message_id,
+        createdAt: r.created_at,
+      }))
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ events, total, offset, limit }))
       return
     }
 
