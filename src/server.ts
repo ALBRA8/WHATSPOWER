@@ -6,6 +6,8 @@ import { MockTransportSender, HttpAlbraTransportSender } from './adapters/transp
 import { MetaCloudOrgTransport } from './adapters/meta-cloud-org-transport.ts'
 import { MockCrmClient, HttpCrmClient } from './adapters/crm-client.ts'
 import { renderStudioHtml } from './studio/studio-html.ts'
+import { renderDashboardHtml, dashboardAsset } from './dashboard/dashboard-html.ts'
+import { handleDashboardApi } from './dashboard/dashboard-api.ts'
 import { TeamManager } from './state/team-manager.ts'
 import { CannedResponseManager } from './engine/canned-responses.ts'
 import { GrowthToolsManager } from './engine/growth-tools.ts'
@@ -387,6 +389,60 @@ export function createAgenticServer(options?: {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(renderStudioHtml())
       return
+    }
+
+    // Panel de control operativo (dashboard tipo ManyChat): la SPA y sus recursos
+    // son inertes; todos los datos viajan por /api/dashboard/*, que exige la misma
+    // identidad administrativa que el resto de la API.
+    if (req.method === 'GET' && url.pathname.startsWith('/dashboard/assets/')) {
+      const asset = dashboardAsset(url.pathname.slice('/dashboard/assets/'.length))
+      if (!asset) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Recurso no encontrado' }))
+        return
+      }
+      res.writeHead(200, { 'Content-Type': asset.type, 'Cache-Control': 'no-store' })
+      res.end(asset.body)
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/dashboard')) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+      res.end(renderDashboardHtml())
+      return
+    }
+
+    // API del panel de control: se resuelve DESPUÉS de la puerta de identidad,
+    // así el orgId que llega al manejador ya pasó la comprobación de credencial.
+    if (url.pathname.startsWith('/api/dashboard')) {
+      const dashOrg = requireOrgHeader(req)
+      if (!dashOrg) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'x-org-id requerido (aislamiento multi-organización)' }))
+        return
+      }
+      // Quién está detrás: la puerta ya validó la credencial. Un operador central
+      // (sin identidad de organización) manda como administración; una credencial
+      // de organización trae su rol, y el panel lo respeta.
+      const dashActor: { label: string; role: 'admin' | 'agent' } = identity
+        ? { label: `cred:${identity.orgId}`, role: identity.role }
+        : { label: 'operator', role: 'admin' }
+      const handled = await handleDashboardApi({
+        req,
+        res,
+        url,
+        orgId: dashOrg,
+        actor: dashActor,
+        db,
+        engine: router.getFlowEngine(),
+        locks: router.getLockManager(),
+        team: teamManager,
+        canned: cannedManager,
+        growth: growthManager,
+        suppression: router.getSuppressionStore(),
+        transport,
+      })
+      if (handled) return
     }
 
     // API REST de Flujos — organización OBLIGATORIA en el header X-Org-Id (4.B):
