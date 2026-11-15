@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite'
 import type { InboundEvent, InboundContact, ExecutionResult, TransportSender, CrmClientInterface, OutboundMedia } from '../types.ts'
 import { LockManager } from '../state/lock-manager.ts'
 import { SuppressionStore } from '../suppression/suppression-store.ts'
+import { ConsentStore } from '../safety/consent-store.ts'
 import { evaluateDeterministicRules } from './rules.ts'
 import { FlowEngine } from './flow-engine.ts'
 
@@ -114,6 +115,7 @@ export class ConversationRouter {
   crm: CrmClientInterface
   private lockManager: LockManager
   private suppressionStore: SuppressionStore
+  private consentStore: ConsentStore
   private flowEngine: FlowEngine
 
   constructor(
@@ -125,7 +127,8 @@ export class ConversationRouter {
     this.transport = transport
     this.crm = crm
     this.lockManager = new LockManager(db)
-    this.suppressionStore = new SuppressionStore(db)
+    this.consentStore = new ConsentStore(db)
+    this.suppressionStore = new SuppressionStore(db, this.consentStore)
     this.flowEngine = new FlowEngine(db)
   }
 
@@ -135,6 +138,10 @@ export class ConversationRouter {
 
   getSuppressionStore(): SuppressionStore {
     return this.suppressionStore
+  }
+
+  getConsentStore(): ConsentStore {
+    return this.consentStore
   }
 
   getFlowEngine(): FlowEngine {

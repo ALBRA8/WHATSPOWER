@@ -2,7 +2,7 @@
  * template-registry.ts — Registro y verificación de plantillas de WhatsApp Cloud API.
  * Modela estados oficiales de aprobación: APPROVED, PENDING, REJECTED, PAUSED.
  */
-import type { Database } from 'node:sqlite'
+import type { DatabaseSync } from 'node:sqlite'
 
 export type TemplateStatus = 'APPROVED' | 'PENDING' | 'REJECTED' | 'PAUSED'
 export type TemplateCategory = 'MARKETING' | 'UTILITY' | 'AUTHENTICATION'
@@ -20,9 +20,9 @@ export interface MetaTemplate {
 }
 
 export class TemplateRegistry {
-  private db: Database
+  private db: DatabaseSync
 
-  constructor(db: Database) {
+  constructor(db: DatabaseSync) {
     this.db = db
     this.ensureSchema()
   }

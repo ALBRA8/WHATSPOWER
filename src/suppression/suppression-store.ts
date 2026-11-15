@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite'
+import type { ConsentStore } from '../safety/consent-store.ts'
 
 const OPT_OUT_KEYWORDS = ['baja', 'salir', 'stop', 'cancelar', 'no deseo mas mensajes', 'no enviar mas']
 
@@ -10,8 +11,10 @@ const OPT_OUT_KEYWORDS = ['baja', 'salir', 'stop', 'cancelar', 'no deseo mas men
  */
 export class SuppressionStore {
   db: DatabaseSync
-  constructor(db: DatabaseSync) {
+  consentStore?: ConsentStore
+  constructor(db: DatabaseSync, consentStore?: ConsentStore) {
     this.db = db
+    this.consentStore = consentStore
   }
 
   /**
@@ -27,6 +30,7 @@ export class SuppressionStore {
 
   /**
    * Registra un contacto en la lista de supresión permanente DE SU ORGANIZACIÓN.
+   * Revoca el consentimiento activo y registra la auditoría (Ley 1581 / Habeas Data).
    */
   addSuppression(orgId: string, phone: string, reason: string): void {
     const now = Math.floor(Date.now() / 1000)
@@ -37,6 +41,14 @@ export class SuppressionStore {
         reason = excluded.reason,
         created_at = excluded.created_at
     `).run(orgId, phone, reason, now)
+
+    if (this.consentStore) {
+      try {
+        this.consentStore.revokeConsent(orgId, phone, `Baja / Opt-out: ${reason}`, 'suppression_service')
+      } catch (err) {
+        console.warn('[SuppressionStore] No se pudo revocar consentimiento al procesar baja:', err)
+      }
+    }
   }
 
   /**

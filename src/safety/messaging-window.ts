@@ -2,12 +2,12 @@
  * messaging-window.ts — Gestión y verificación de la ventana de servicio de 24 horas de WhatsApp.
  * Fuera de la ventana de 24h, Meta prohíbe el envío de mensajes libres (solo plantillas aprobadas).
  */
-import type { Database } from 'node:sqlite'
+import type { DatabaseSync } from 'node:sqlite'
 
 export class MessagingWindowStore {
-  private db: Database
+  private db: DatabaseSync
 
-  constructor(db: Database) {
+  constructor(db: DatabaseSync) {
     this.db = db
     this.ensureSchema()
   }

@@ -5,3 +5,13 @@ node_modules
 *.db-wal
 *.db-shm
 .DS_Store
+*.pid
+db/
+capture/
+inbox/
+investigation.cany/
+craft.json
+feed.json
+transcript.json
+usage.json
+dist/

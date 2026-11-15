@@ -719,6 +719,83 @@ export function createAgenticServer(options?: {
       return
     }
 
+    // 4.ter Cumplimiento y Protección de Datos Personales (Ley 1581 de 2012 / Habeas Data)
+    if (req.method === 'GET' && url.pathname === '/api/compliance/contact-data') {
+      const phone = url.searchParams.get('phone')
+      if (!phone) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'PHONE_REQUIRED' }))
+        return
+      }
+      const orgId = identity?.orgId ?? url.searchParams.get('org') ?? 'default'
+      const data = router.getConsentStore().exportContactData(orgId, phone)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(data))
+      return
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/api/compliance/contact-data') {
+      const phone = url.searchParams.get('phone')
+      if (!phone) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'PHONE_REQUIRED' }))
+        return
+      }
+      const orgId = identity?.orgId ?? url.searchParams.get('org') ?? 'default'
+      const result = router.getConsentStore().deleteContactData(orgId, phone, identity?.orgId || 'admin')
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(result))
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/compliance/consent') {
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const body = JSON.parse(rb.body)
+        const orgId = identity?.orgId ?? body.organizationId ?? 'default'
+        const rec = router.getConsentStore().recordConsent({
+          organizationId: orgId,
+          contactPhone: body.contactPhone,
+          whoAuthorized: body.whoAuthorized,
+          channel: body.channel,
+          textShown: body.textShown,
+          source: body.source,
+          authorizedAt: body.authorizedAt,
+        })
+        res.writeHead(201, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, consent: rec }))
+      } catch (err: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: err.message }))
+      }
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/compliance/opt-out') {
+      const rb = await readBody(req)
+      if (!rb.ok) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Payload demasiado grande' }))
+        return
+      }
+      try {
+        const body = JSON.parse(rb.body)
+        const orgId = identity?.orgId ?? body.organizationId ?? 'default'
+        router.getSuppressionStore().addSuppression(orgId, body.contactPhone, body.reason || 'opt_out')
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, suppressed: true, consentRevoked: true }))
+      } catch (err: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: err.message }))
+      }
+      return
+    }
+
     // 4.bis Reconciliación de eventos UNCERTAIN (tercera reparación 4.C + B2 fase final):
     // POST /api/internal/idempotency/reconcile — body {key} | {all: true} | {key, confirmResend: true, evidence}.
     // B2 HARDENING (autorización y aislamiento por organización):
