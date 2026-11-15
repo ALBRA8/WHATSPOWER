@@ -202,6 +202,43 @@ if (typeof ctx.addNode === 'function') {
   check('añadir un nodo desde la paleta lo pinta y lo guarda', true, 'addNode no expuesto en el contexto (se omite)')
 }
 
+// Ronda 18: nodos de los tipos nuevos SIN `data` (un flujo guardado a medias o
+// venido de una versión anterior). Antes, leer node.data.delayMinutes tumbaba la
+// página — el mismo fallo que se arregló en la ronda 8 para los tipos antiguos.
+fixture[0].nodes.push(
+  { id: 'n5', type: 'delay', title: 'Espera', position: { x: 40, y: 520 } },
+  { id: 'n6', type: 'smart_delay', title: 'Smart', position: { x: 260, y: 520 } },
+  { id: 'n7', type: 'goto_flow', title: 'Ir a otro flujo', position: { x: 480, y: 520 } },
+  { id: 'n8', type: 'ai_response', title: 'IA', position: { x: 700, y: 520 } },
+  { id: 'n9', type: 'git_delay', title: 'Retardo con datos', position: { x: 40, y: 700 }, data: { minutes: 15 } }
+)
+let renderThrew = null
+try { ctx.renderCanvas() } catch (e) { renderThrew = e }
+check('un nodo delay/smart_delay/goto_flow/ia sin datos no rompe el lienzo', !renderThrew,
+  renderThrew ? renderThrew.message : '')
+check('esos cuatro nodos se pintan', ['n5', 'n6', 'n7', 'n8'].every((id) => !!byId(id)),
+  layer.children.map((c) => c.dataset.nodeId).join(','))
+check('el retardo sin datos se pinta a 0 en vez de romperse',
+  !!byId('n5') && /Esperar <strong>0<\/strong>/.test(byId('n5').innerHTML), byId('n5') && byId('n5').innerHTML.slice(0, 90))
+check('el smart delay sin datos se pinta a 0 horas', !!byId('n6') && /esperar <strong>0<\/strong>/.test(byId('n6').innerHTML),
+  byId('n6') && byId('n6').innerHTML.slice(0, 90))
+check('la IA sin datos avisa de que falta el prompt',
+  !!byId('n8') && /prompt no configurado/.test(byId('n8').innerHTML), byId('n8') && byId('n8').innerHTML.slice(0, 90))
+
+// Un nodo añadido desde la paleta nueva usa las claves que el motor lee.
+const antesIa = layer.children.length
+if (typeof ctx.addNode === 'function') {
+  ctx.addNode('ai_response')
+  const nuevo = layer.children[layer.children.length - 1]
+  flush(); await tick()
+  const guardado = lastPost()
+  const enDisco = guardado.nodes[guardado.nodes.length - 1]
+  check('la paleta crea la respuesta IA con aiPrompt (lo que lee el motor)',
+    enDisco.type === 'ai_response' && Object.prototype.hasOwnProperty.call(enDisco.data || {}, 'aiPrompt'),
+    JSON.stringify(enDisco.data))
+  check('añadir desde la paleta deja el nodo en pantalla', layer.children.length === antesIa + 1)
+}
+
 console.log('')
 console.log(fails.length === 0
   ? 'RESULTADO: ' + ok + ' comprobaciones superadas.'

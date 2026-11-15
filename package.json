@@ -11,6 +11,8 @@
     "start": "node --experimental-strip-types src/server.ts",
     "build": "node --experimental-strip-types scripts/build-dashboard.ts",
     "test": "node scripts/run-tests.mjs",
+    "sequences:run": "node --experimental-strip-types scripts/run-sequences.ts",
+    "waits:run": "node --experimental-strip-types scripts/run-waits.ts",
     "tsc": "tsc --noEmit -p tsconfig.json",
     "security:scan": "node scripts/scan-secrets.mjs",
     "security:scan:history": "node scripts/scan-secrets.mjs --history"

@@ -81,6 +81,9 @@ export interface FlowNode {
     // 6. Delay / Smart Delay
     delaySeconds?: number
     delayMinutes?: number
+    /** (ronda 18) Espera de Smart Delay en horas: es la unidad que guarda la paleta
+     *  del estudio (`smartDelayHours`) y que antes no se leía del nodo. */
+    smartDelayHours?: number
 
     // 7. A/B Split Test
     splitRatio?: number // 0 a 100 (% para rama A)
@@ -94,6 +97,10 @@ export interface FlowNode {
     // 10. AI Response
     aiPrompt?: string
     aiModel?: string
+    /** (ronda 18) Nombre antiguo del prompt de IA que guardaba la paleta antes de la
+     *  ronda 17. Se acepta al LEER para que los flujos ya guardados conserven su
+     *  prompt; al escribir se usa `aiPrompt`. */
+    promptOverride?: string
   }
 }
 
@@ -149,6 +156,10 @@ export interface FlowEvaluationResult {
   isHandoff?: boolean
   handoffReason?: string
   flowCompleted?: boolean
+  /** (ronda 22) Espera real: cuándo hay que volver al flujo (epoch ms) y en qué
+   *  nodo se aparcó. El planificador usa esta hora para despertarlo. */
+  parkedUntil?: number
+  waitNodeId?: string
 }
 
 export interface SequenceDefinition {

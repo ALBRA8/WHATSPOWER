@@ -2,6 +2,7 @@ import { createServer, IncomingMessage, ServerResponse } from 'node:http'
 import { createHmac } from 'node:crypto'
 import { createDatabase, purgeExpiredSecurityRows, durableRateLimit } from './db.ts'
 import { ConversationRouter } from './engine/router.ts'
+import { startScheduler } from './engine/scheduler.ts'
 import { MockTransportSender, HttpAlbraTransportSender } from './adapters/transport.ts'
 import { MetaCloudOrgTransport } from './adapters/meta-cloud-org-transport.ts'
 import { MockCrmClient, HttpCrmClient } from './adapters/crm-client.ts'
@@ -1670,9 +1671,26 @@ export function createAgenticServer(options?: {
           res.end(JSON.stringify({ error: 'phone es obligatorio en el body' }))
           return
         }
-        router.getFlowEngine().cancelSequenceEnrollment(orgId, body.phone, seqId)
+        // (ronda 19) Antes se cancelaba con el texto tal cual y se respondía
+        // «ok» aunque no coincidiera ninguna fila: un acuse en falso.
+        const digitos = body.phone.replace(/\D/g, '')
+        if (digitos.length < 8 || digitos.length > 15) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'phone no parece un teléfono utilizable (8-15 dígitos)' }))
+          return
+        }
+        const cancelled = router.getFlowEngine().cancelSequenceEnrollment(orgId, body.phone, seqId)
         res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ ok: true, phone: body.phone, sequenceId: seqId }))
+        res.end(JSON.stringify({
+          ok: true,
+          phone: digitos,
+          requestedPhone: body.phone,
+          sequenceId: seqId,
+          // 0 significa «no había ninguna inscripción activa que cancelar»: se
+          // mantiene 200 para que reintentar sea inofensivo, pero ya no se finge.
+          cancelled,
+          ...(cancelled === 0 ? { note: 'No había ninguna inscripción activa que cancelar' } : {}),
+        }))
       } catch (e) {
         console.error(`[wp] 400 en POST /api/sequences/:id/exit:`, (e as Error)?.message)
         res.writeHead(400, { 'Content-Type': 'application/json' })
@@ -1829,7 +1847,7 @@ if (process.argv[1]?.includes('server.ts')) {
     }
   }
   const PORT = Number(process.env.PORT || 3003)
-  const { server } = createAgenticServer()
+  const { server, router, transport } = createAgenticServer()
 // (A5-08, auditoría 2026-11-11) Umbrales de proceso: sin muerte silenciosa.
 process.on('unhandledRejection', (reason) => {
   console.error('[wp-server] unhandledRejection:', reason instanceof Error ? reason.message : reason)
@@ -1842,4 +1860,23 @@ process.on('uncaughtException', (err) => {
   server.listen(PORT, process.env.HOST || '127.0.0.1', () => {
     console.log(`[Capa 2A] Servidor Agéntico escuchando en http://localhost:${PORT}`)
   })
+
+  // (ronda 22) PLANIFICADOR: sin él, un nodo «Espera» de un flujo y una secuencia
+  // con retardo se quedaban escritos en la base y nadie los ejecutaba. Basta con
+  // que el servidor esté vivo; SCHEDULER_ENABLED=false lo apaga (y entonces lo dice).
+  if (process.env.SCHEDULER_ENABLED !== 'false') {
+    const pedido = Number(process.env.SCHEDULER_INTERVAL_MS || 30000)
+    const cadaMs = Number.isFinite(pedido) && pedido >= 1000 ? pedido : 30000
+    const scheduler = startScheduler({
+      engine: router.getFlowEngine(),
+      transport,
+      suppression: router.getSuppressionStore(),
+      intervalMs: cadaMs,
+    })
+    console.log(`[Capa 2A] Planificador activo: esperas de flujo y pasos de secuencia cada ${Math.round(cadaMs / 1000)} s (SCHEDULER_ENABLED=false lo apaga)`)
+    process.on('SIGTERM', () => scheduler.stop())
+    process.on('SIGINT', () => scheduler.stop())
+  } else {
+    console.warn('[Capa 2A AVISO] Planificador APAGADO por SCHEDULER_ENABLED=false: las esperas de los flujos y los pasos de secuencia no se enviarán solos.')
+  }
 }

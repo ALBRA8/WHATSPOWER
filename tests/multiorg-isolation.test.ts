@@ -3,7 +3,7 @@ import assert from 'node:assert'
 import { createDatabase } from '../src/db.ts'
 import { LockManager } from '../src/state/lock-manager.ts'
 import { SuppressionStore } from '../src/suppression/suppression-store.ts'
-import { FlowEngine } from '../src/engine/flow-engine.ts'
+import { FlowEngine, canonicalPhone } from '../src/engine/flow-engine.ts'
 import { PaymentGatewayManager } from '../src/payments/payment-gateway.ts'
 import { MockCrmClient, HttpCrmClient } from '../src/adapters/crm-client.ts'
 import type { TransportSender, CrmClientInterface, InboundEvent } from '../src/types.ts'
@@ -117,13 +117,17 @@ test('MO-03: etiquetas, campos y sesiones de flujo por (org, contacto)', async (
     steps: [],
   })
   fe.enrollContactInSequence('org_alpha', phone, 'seq_1')
-  const rowsAlpha = (db.prepare("SELECT count(*) c FROM sequence_enrollments WHERE organization_id = 'org_alpha' AND contact_phone = ?").get(phone) as any).c
-  const rowsBeta = (db.prepare("SELECT count(*) c FROM sequence_enrollments WHERE organization_id = 'org_beta' AND contact_phone = ?").get(phone) as any).c
+  // (ronda 20) La inscripción se guarda en la forma canónica del teléfono (sólo
+  // dígitos, con el 57 delante), no con los adornos con que se teclee.
+  const tel = canonicalPhone(phone)
+  assert.strictEqual(tel, '573000555666')
+  const rowsAlpha = (db.prepare("SELECT count(*) c FROM sequence_enrollments WHERE organization_id = 'org_alpha' AND contact_phone = ?").get(tel) as any).c
+  const rowsBeta = (db.prepare("SELECT count(*) c FROM sequence_enrollments WHERE organization_id = 'org_beta' AND contact_phone = ?").get(tel) as any).c
   assert.strictEqual(rowsAlpha, 1)
   assert.strictEqual(rowsBeta, 0)
   // (tercera reparación 4.B) org_beta NO puede inscribirse en la secuencia de org_alpha
   fe.enrollContactInSequence('org_beta', phone, 'seq_1')
-  const rowsBetaAfter = (db.prepare("SELECT count(*) c FROM sequence_enrollments WHERE organization_id = 'org_beta' AND contact_phone = ?").get(phone) as any).c
+  const rowsBetaAfter = (db.prepare("SELECT count(*) c FROM sequence_enrollments WHERE organization_id = 'org_beta' AND contact_phone = ?").get(tel) as any).c
   assert.strictEqual(rowsBetaAfter, 0, 'una org no puede inscribir contactos en secuencias ajenas')
 })
 

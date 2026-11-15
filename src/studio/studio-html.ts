@@ -317,40 +317,11 @@ export function renderStudioHtml(): string {
       }
     }
 
-    // (ronda 17, paso 2) Implementa addNode(type) — la paleta la invoca pero la
-    // función no existía (terminaba el <script> sin declararla). Crea un nodo
-    // nuevo con id/posición únicos en currentFlow, lo agrega al final del array
-    // y re-renderiza el canvas. La paleta usa alias 'action_tag' que mapeamos al
-    // FlowNodeType 'action' con actionType 'add_tag'.
-    function addNode(paletteType) {
-      if (!currentFlow) {
-        alert('Primero crea o selecciona un flujo.');
-        return;
-      }
-      const id = currentFlow.id + '_n_' + Date.now().toString(36);
-      // Posición: cascada simple abajo del último nodo
-      const n = currentFlow.nodes.length;
-      const x = 120 + (n % 4) * 220;
-      const y = 120 + Math.floor(n / 4) * 160;
-      let type = paletteType;
-      let title = 'Nodo nuevo';
-      const data = {};
-      if (paletteType === 'send_message') { title = 'Enviar Mensaje'; data.messageText = ''; }
-      else if (paletteType === 'user_input') { title = 'Capturar Dato'; data.inputPrompt = 'Escribe tu...'; data.saveToCustomField = 'campo1'; data.validationType = 'text'; }
-      else if (paletteType === 'condition') { title = 'Condición'; data.conditionLogic = 'AND'; data.rules = [{ type: 'message_contains', value: '' }]; }
-      else if (paletteType === 'action_tag') { type = 'action'; title = 'Etiquetar'; data.actionType = 'add_tag'; data.tag = 'nuevo_lead'; }
-      else if (paletteType === 'crm_action') { title = 'Acción CRM'; data.crmAction = 'create_opportunity'; data.crmParams = { title: 'Oportunidad', amount: 100 }; }
-      else if (paletteType === 'ab_split') { title = 'Split A/B'; data.splitRatio = 50; }
-      else if (paletteType === 'handoff') { title = 'Handoff'; data.handoffReason = 'Solicita asesor'; }
-      else if (paletteType === 'delay') { title = 'Retardo'; data.delayMinutes = 5; }
-      else if (paletteType === 'smart_delay') { title = 'Smart Delay'; data.delayMinutes = 60; }
-      else if (paletteType === 'goto_flow') { title = 'Ir a Flujo'; data.targetFlowId = ''; }
-      else if (paletteType === 'ai_response') { title = 'Respuesta IA'; data.aiPrompt = 'Eres un asistente comercial...'; data.aiModel = 'gpt-4o-mini'; }
-      currentFlow.nodes.push({ id, type, title, position: { x, y }, data });
-      renderCanvas();
-    }
-    // Exponer addNode en el ámbito window para que onclick="addNode(...)" lo encuentre.
-    window.addNode = addNode;
+    // (ronda 18) addNode() vive más abajo, junto a NODE_PALETTE_DEFAULTS: es la que
+    // se ejecuta de verdad y la que guarda sola (snapshot + scheduleSave). Aquí
+    // había una SEGUNDA declaración con el mismo nombre que nunca se usaba (en un
+    // mismo script gana la última) y que además no guardaba el nodo.
+    // [bloque duplicado eliminado en la ronda 18: la función real está más abajo]
 
     function renderCanvas() {
       const container = document.getElementById('nodesLayer');
@@ -402,16 +373,16 @@ export function renderStudioHtml(): string {
           bodyHtml = '🚨 <strong>Silenciar Bot</strong> y transferir a asesor comercial humano.';
         } else if (node.type === 'delay') {
           icon = '⏱️';
-          bodyHtml = '<div>Esperar <strong>' + esc(String(node.data.delayMinutes ?? node.data.delaySeconds ?? 0)) + '</strong> ' + (node.data.delayMinutes ? 'min' : 'seg') + '</div>';
+          bodyHtml = '<div>Esperar <strong>' + esc(String(nd.delayMinutes ?? nd.delaySeconds ?? 0)) + '</strong> ' + (nd.delayMinutes ? 'min' : 'seg') + '</div>';
         } else if (node.type === 'smart_delay') {
           icon = '🧠';
-          bodyHtml = '<div>Smart Delay: respeta ventana horaria y actividad del contacto</div>';
+          bodyHtml = '<div>Smart Delay: esperar <strong>' + esc(String(nd.smartDelayHours ?? nd.delayMinutes ?? 0)) + '</strong> ' + (nd.smartDelayHours ? 'h' : 'min') + '</div>';
         } else if (node.type === 'goto_flow') {
           icon = '↪️';
-          bodyHtml = '<div>Ir a flujo: <code>' + esc(node.data.targetFlowId || 'no seleccionado') + '</code></div>';
+          bodyHtml = '<div>Ir a flujo: <code>' + esc(nd.targetFlowId || 'no seleccionado') + '</code></div>';
         } else if (node.type === 'ai_response') {
           icon = '🤖';
-          bodyHtml = '<div>IA: <em>' + esc(node.data.aiPrompt || 'prompt no configurado') + '</em></div>';
+          bodyHtml = '<div>IA: <em>' + esc(nd.aiPrompt || nd.promptOverride || 'prompt no configurado') + '</em></div>';
         }
 
         div.innerHTML = \`
@@ -445,7 +416,7 @@ export function renderStudioHtml(): string {
       'delay': { title: 'Espera (Delay)', data: { delaySeconds: 5 } },
       'smart_delay': { title: 'Espera Inteligente', data: { smartDelayHours: 24 } },
       'goto_flow': { title: 'Saltar a Flujo', data: { targetFlowId: '' } },
-      'ai_response': { title: 'Respuesta IA', data: { promptOverride: '' } },
+      'ai_response': { title: 'Respuesta IA', data: { aiPrompt: '', aiModel: '' } },
     };
     function addNode(paletteKey) {
       const def = NODE_PALETTE_DEFAULTS[paletteKey];

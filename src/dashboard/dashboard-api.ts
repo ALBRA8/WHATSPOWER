@@ -78,7 +78,11 @@ const broadcastLimiter = new SlidingRateLimiter()
 function normalizePhone(raw: unknown): string | null {
   if (raw === null || raw === undefined) return null
   const digits = String(raw).replace(/\D/g, '')
-  return digits.length >= 8 && digits.length <= 15 ? digits : null
+  if (digits.length < 8 || digits.length > 15) return null
+  // (ronda 20) Misma forma que usa el motor y el mensaje entrante: un móvil
+  // colombiano de 10 dígitos lleva el 57 delante. Antes el panel guardaba
+  // «3001234567» y la inscripción no encontraba nunca a ese contacto.
+  return digits.length === 10 && digits.startsWith('3') ? `57${digits}` : digits
 }
 
 /** Anota en la auditoría; nunca puede tumbar la respuesta. */
@@ -245,6 +249,9 @@ export async function handleDashboardApi(ctx: DashboardContext): Promise<boolean
     const flows = ctx.engine.listFlows(orgId)
     const activeConversations = contacts.filter((c) => c.lastMessageAt && now - c.lastMessageAt < DAY).length
     const handoffs = contacts.filter((c) => c.lockState === 'HANDOFF_HUMAN').length
+    // (ronda 23) Contactos aparcados en un nodo «Espera». El planificador los
+    // despierta solo; esto es para que quien atiende pueda verlos.
+    const esperas = ctx.engine.flowWaitStats(orgId)
 
     const messagesToday = count(db, "SELECT COUNT(*) AS n FROM inbox_messages WHERE organization_id = ? AND created_at >= ?", orgId, todayStart)
     const inboundToday = count(db, "SELECT COUNT(*) AS n FROM inbox_messages WHERE organization_id = ? AND direction = 'inbound' AND created_at >= ?", orgId, todayStart)
@@ -296,6 +303,10 @@ export async function handleDashboardApi(ctx: DashboardContext): Promise<boolean
         suppressed: contacts.filter((c) => c.suppressed).length,
         scheduledSequences: count(db, "SELECT COUNT(*) AS n FROM sequence_enrollments WHERE organization_id = ? AND status = 'ACTIVE'", orgId),
         growthLinks: count(db, 'SELECT COUNT(*) AS n FROM growth_links WHERE organization_id = ?', orgId),
+        // (ronda 23) Contactos dormidos en un nodo «Espera»: el planificador los
+        // despierta solo, pero quien atiende tiene que poder verlos.
+        waitingFlows: esperas.pending,
+        nextWaitAt: esperas.nextAt,
       },
       payments: payments.map((p) => ({ status: p.status, count: Number(p.n), total: Number(p.total) })),
       series,

@@ -476,6 +476,8 @@ async function viewHome() {
           <div class="card-body">
             <div class="kv"><span>Inscripciones activas</span><span>${shown(k.scheduledSequences)}</span></div>
             <div class="kv"><span>Enlaces de crecimiento</span><span>${shown(k.growthLinks)}</span></div>
+            <div class="kv"><span>Contactos esperando</span><span>${shown(k.waitingFlows)}</span></div>
+            <div class="kv"><span>Próxima espera</span><span>${k.nextWaitAt ? clock(k.nextWaitAt) : '—'}</span></div>
             ${payments}
           </div>
         </div>

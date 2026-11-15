@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import type {
   FlowDefinition,
@@ -18,6 +19,60 @@ import { resolveAiProvider, type AiCompletionProvider } from './ai-provider.ts'
  */
 export const AI_UNAVAILABLE_FALLBACK =
   '⚙️ El asistente automático no está disponible en este momento. Un asesor de nuestro equipo continuará la conversación en breve.'
+
+/**
+ * (ronda 20) UNA SOLA FORMA DE TELÉFONO para toda la tabla de inscripciones.
+ *
+ * El mensaje entrante, la lista de bajas y la sesión de diálogo ya usaban esta
+ * forma: sólo dígitos, y un móvil colombiano de 10 dígitos con el 57 delante.
+ * El panel, en cambio, guardaba lo que tecleara el asesor («300 123 4567»), de
+ * modo que la MISMA persona quedaba como dos contactos distintos: la secuencia
+ * se inscribía en un teléfono que nunca recibía un mensaje y sacarla de la
+ * secuencia no la encontraba. Ahora inscribir y sacar pasan por aquí.
+ */
+export function canonicalPhone(raw: unknown): string {
+  const digitos = String(raw ?? '').replace(/\D/g, '')
+  return digitos.length === 10 && digitos.startsWith('3') ? `57${digitos}` : digitos
+}
+
+/**
+ * (ronda 21) Un paso de secuencia que ya toca enviar.
+ * `current_step` es el número (1, 2, 3…) del SIGUIENTE paso a enviar.
+ */
+export interface DueSequenceWork {
+  enrollmentId: string
+  organizationId: string
+  sequenceId: string
+  phone: string
+  stepOrder: number
+  messageText: string
+}
+
+/**
+ * (ronda 22) Una espera de flujo que ya vence: a quién despertar, en qué flujo y
+ * por qué nodo seguir. La crea el propio motor cuando el flujo llega a un nodo
+ * «Espera»; la lee el planificador (src/engine/scheduler.ts).
+ */
+export interface DueFlowWait {
+  id: string
+  organizationId: string
+  contactPhone: string
+  flowId: string
+  /** Nodo de espera en el que quedó aparcado (para rastrear y para no duplicar). */
+  waitNodeId: string
+  /** Nodo por el que hay que SEGUIR cuando llegue la hora. */
+  nextNodeId: string
+  dueAt: number
+  attempts: number
+  context: Record<string, string>
+}
+
+/** (ronda 22) Qué pasó al reanudar una espera. */
+export interface FlowWaitResume {
+  status: 'resumed' | 'flow_missing' | 'node_missing' | 'session_busy'
+  flowId?: string
+  result?: FlowEvaluationResult
+}
 
 export class FlowEngine {
   private db: DatabaseSync
@@ -235,7 +290,11 @@ export class FlowEngine {
     // (tercera reparación 4.B) Una organización NO puede inscribir contactos en
     // secuencias de otra: si la secuencia no existe EN SU org, no se inscribe.
     if (!this.getSequence(orgId, sequenceId)) return
-    const enrollmentId = `enr_${orgId}_${sequenceId}_${phone}`
+    // (ronda 20) Se guarda siempre en la forma canónica, venga el teléfono del
+    // nodo «inscribir en secuencia», del panel o de donde sea.
+    const tel = canonicalPhone(phone)
+    if (!tel) return
+    const enrollmentId = `enr_${orgId}_${sequenceId}_${tel}`
     const now = Date.now()
     this.db.prepare(`
       INSERT INTO sequence_enrollments (id, organization_id, sequence_id, contact_phone, current_step, next_run_at, status)
@@ -244,20 +303,332 @@ export class FlowEngine {
         current_step = 1,
         next_run_at = excluded.next_run_at,
         status = 'ACTIVE'
-    `).run(enrollmentId, orgId, sequenceId, phone, now)
+    `).run(enrollmentId, orgId, sequenceId, tel, now)
   }
 
-  cancelSequenceEnrollment(orgId: string, phone: string, sequenceId?: string): void {
-    if (sequenceId) {
-      this.db.prepare("UPDATE sequence_enrollments SET status = 'CANCELLED' WHERE organization_id = ? AND contact_phone = ? AND sequence_id = ?").run(
-        orgId,
-        phone,
-        sequenceId
-      )
-    } else {
-      this.db.prepare("UPDATE sequence_enrollments SET status = 'CANCELLED' WHERE organization_id = ? AND contact_phone = ?").run(orgId, phone)
+  /**
+   * (ronda 19) Saca a un contacto de una secuencia y devuelve CUÁNTAS
+   * inscripciones se cancelaron de verdad. Antes devolvía nada y el endpoint
+   * respondía «ok» aunque el teléfono no coincidiera con ninguna fila (por
+   * ejemplo si llegaba con adornos: «+57 300 123 4567» frente a «573001234567»).
+   * Ahora se prueban las dos formas —tal cual y sólo dígitos— y se suman las
+   * filas tocadas, así quien llama puede decir la verdad.
+   */
+  cancelSequenceEnrollment(orgId: string, phone: string, sequenceId?: string): number {
+    const crudo = String(phone ?? '').trim()
+    const digitos = crudo.replace(/\D/g, '')
+    // (ronda 20) También la forma canónica, para las filas que ya estén
+    // guardadas así y para las que grabó el panel antes de este arreglo.
+    const candidatos = [...new Set([crudo, digitos, canonicalPhone(phone)])].filter(Boolean)
+    let cancelled = 0
+    for (const candidato of candidatos) {
+      if (!candidato) continue
+      const result = sequenceId
+        ? this.db.prepare("UPDATE sequence_enrollments SET status = 'CANCELLED' WHERE organization_id = ? AND contact_phone = ? AND sequence_id = ? AND status = 'ACTIVE'").run(orgId, candidato, sequenceId)
+        : this.db.prepare("UPDATE sequence_enrollments SET status = 'CANCELLED' WHERE organization_id = ? AND contact_phone = ? AND status = 'ACTIVE'").run(orgId, candidato)
+      cancelled += Number(result.changes ?? 0)
+    }
+    return cancelled
+  }
+
+  /**
+   * (ronda 21) TRABAJO PENDIENTE de las secuencias.
+   *
+   * Hasta esta ronda NADIE leía `next_run_at`: inscribir a alguien dejaba una
+   * fila ACTIVE que se quedaba ahí para siempre, porque ningún código miraba
+   * la hora ni el paso. Esto devuelve los que ya toca enviar, con el texto del
+   * paso que corresponde a `current_step`. NO envía nada: sólo dice qué hay.
+   *
+   * Sólo cuenta secuencias ACTIVAS de la MISMA organización (nada de mezclar
+   * clientes) y cierra las inscripciones cuyo paso ya no existe (la secuencia
+   * se acortó o se editó), en vez de dejarlas girando para siempre.
+   */
+  dueSequenceWork(now: number = Date.now(), limit = 50): DueSequenceWork[] {
+    const tope = Math.max(1, Math.min(500, Math.floor(Number(limit) || 50)))
+    const rows = this.db.prepare(`
+      SELECT e.id AS enrollment_id, e.organization_id AS organization_id, e.sequence_id AS sequence_id,
+             e.contact_phone AS phone, e.current_step AS step_order
+      FROM sequence_enrollments e
+      JOIN sequences s ON s.organization_id = e.organization_id AND s.id = e.sequence_id
+      WHERE e.status = 'ACTIVE' AND s.is_active = 1 AND e.next_run_at <= ?
+      ORDER BY e.next_run_at ASC
+      LIMIT ?
+    `).all(now, tope) as Array<{
+      enrollment_id: string
+      organization_id: string
+      sequence_id: string
+      phone: string
+      step_order: number
+    }>
+
+    const pasoStmt = this.db.prepare(
+      'SELECT message_text FROM sequence_steps WHERE organization_id = ? AND sequence_id = ? AND step_order = ?'
+    )
+    const work: DueSequenceWork[] = []
+    for (const row of rows) {
+      const paso = pasoStmt.get(row.organization_id, row.sequence_id, row.step_order) as { message_text: string } | undefined
+      if (!paso) {
+        // La secuencia ya no tiene ese paso: se cierra, no se deja colgada.
+        this.closeSequenceEnrollment(row.organization_id, row.enrollment_id, 'COMPLETED')
+        continue
+      }
+      work.push({
+        enrollmentId: row.enrollment_id,
+        organizationId: row.organization_id,
+        sequenceId: row.sequence_id,
+        phone: row.phone,
+        stepOrder: row.step_order,
+        messageText: paso.message_text,
+      })
+    }
+    return work
+  }
+
+  /**
+   * (ronda 21) Da por enviado el paso actual y deja la hora del siguiente.
+   * El retardo que se aplica es el del paso SIGUIENTE (`delay_minutes`), que
+   * es como se lee una secuencia: «5 minutos después del anterior».
+   * Si no queda ningún paso, la inscripción se cierra como COMPLETED.
+   */
+  advanceSequenceEnrollment(
+    orgId: string,
+    enrollmentId: string,
+    now: number = Date.now()
+  ): { status: 'ACTIVE' | 'COMPLETED' | 'MISSING'; nextRunAt: number | null; nextStepOrder: number | null } {
+    const row = this.db.prepare(
+      'SELECT sequence_id, current_step FROM sequence_enrollments WHERE organization_id = ? AND id = ?',
+    ).get(orgId, enrollmentId) as { sequence_id: string; current_step: number } | undefined
+    if (!row) return { status: 'MISSING', nextRunAt: null, nextStepOrder: null }
+
+    const siguiente = row.current_step + 1
+    const paso = this.db.prepare(
+      'SELECT delay_minutes FROM sequence_steps WHERE organization_id = ? AND sequence_id = ? AND step_order = ?',
+    ).get(orgId, row.sequence_id, siguiente) as { delay_minutes: number } | undefined
+
+    if (!paso) {
+      this.closeSequenceEnrollment(orgId, enrollmentId, 'COMPLETED')
+      return { status: 'COMPLETED', nextRunAt: null, nextStepOrder: null }
+    }
+    const retardo = Math.max(0, Math.floor(Number(paso.delay_minutes) || 0))
+    const nextRunAt = now + retardo * 60000
+    this.db.prepare(
+      'UPDATE sequence_enrollments SET current_step = ?, next_run_at = ? WHERE organization_id = ? AND id = ?',
+    ).run(siguiente, nextRunAt, orgId, enrollmentId)
+    return { status: 'ACTIVE', nextRunAt, nextStepOrder: siguiente }
+  }
+
+  /**
+   * (ronda 21) Cierra una inscripción (COMPLETED al terminar, CANCELLED cuando
+   * el contacto pidió la baja). Devuelve si de verdad cambió algo, para no
+   * contar dos veces la misma fila.
+   */
+  closeSequenceEnrollment(orgId: string, enrollmentId: string, status: 'COMPLETED' | 'CANCELLED' = 'COMPLETED'): boolean {
+    const result = this.db.prepare(
+      "UPDATE sequence_enrollments SET status = ? WHERE organization_id = ? AND id = ? AND status = 'ACTIVE'",
+    ).run(status, orgId, enrollmentId)
+    return Number(result.changes ?? 0) > 0
+  }
+
+  /**
+   * (ronda 21) Deja el mensaje de un paso en la bandeja de la organización, que
+   * es lo que el asesor ve. No decide nada: sólo registra lo que ya se envió.
+   */
+  recordSequenceOutboundMessage(orgId: string, phone: string, text: string): boolean {
+    return this.recordOutboundMessage(orgId, canonicalPhone(phone), text)
+  }
+
+  // =========================================================================
+  // 4.b ESPERAS DE FLUJO (ronda 22) — el planificador que faltaba
+  // =========================================================================
+  //
+  // Hasta la ronda 21 un nodo «Espera» (delay / smart_delay) NO esperaba: el motor
+  // atendía el mensaje de forma síncrona, lo avisaba por consola y seguía de
+  // inmediato. Ahora la espera se guarda en la base (tabla flow_waits: qué
+  // contacto, qué flujo, por qué nodo seguir y a qué hora) y la sesión se cierra,
+  // así que un mensaje durante la espera no se salta el nodo. Quien despierta el
+  // flujo es src/engine/scheduler.ts, que llama a resumeFlowWait() a su hora.
+  //
+  // Reglas (todas nacen de algo que ya dolió):
+  //  1. Una espera pendiente del mismo contacto y nodo NO se duplica.
+  //  2. Sólo una pasada puede reanudarla (claimFlowWait: UPDATE condicional).
+  //  3. Si el flujo ya no existe, está apagado o el nodo desapareció, la espera se
+  //     ABANDONA y se dice: nadie se queda esperando para siempre.
+  //  4. Si el contacto ya está metido en otro flujo, la espera se CANCELA: es peor
+  //     pisarle la conversación que perder un aviso.
+
+  private waitStoreReady = false
+
+  /** Crea la tabla de esperas una sola vez (idempotente, como dashboard_audit). */
+  private ensureWaitStore(): void {
+    if (this.waitStoreReady) return
+    this.db.exec(
+      'CREATE TABLE IF NOT EXISTS flow_waits (' +
+        'id TEXT PRIMARY KEY, ' +
+        'organization_id TEXT NOT NULL, ' +
+        'contact_phone TEXT NOT NULL, ' +
+        'flow_id TEXT NOT NULL, ' +
+        'wait_node_id TEXT NOT NULL, ' +
+        'next_node_id TEXT NOT NULL, ' +
+        'due_at INTEGER NOT NULL, ' +
+        "status TEXT NOT NULL DEFAULT 'PENDING', " +
+        'attempts INTEGER NOT NULL DEFAULT 0, ' +
+        'context_json TEXT NOT NULL DEFAULT \'{}\', ' +
+        'created_at INTEGER NOT NULL, ' +
+        'settled_at INTEGER' +
+      ')'
+    )
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_flow_waits_due ON flow_waits (status, due_at)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_flow_waits_contact ON flow_waits (organization_id, contact_phone)')
+    this.waitStoreReady = true
+  }
+
+  /**
+   * Aparca el flujo en un nodo de espera: guarda la hora de vuelta y el nodo por el
+   * que hay que seguir. Devuelve el id de la espera, o null si ya había una
+   * pendiente del mismo contacto y nodo (no se duplica).
+   */
+  parkFlowWait(input: {
+    organizationId: string
+    contactPhone: string
+    flowId: string
+    waitNodeId: string
+    nextNodeId: string
+    dueAt: number
+    context?: Record<string, string>
+  }): string | null {
+    this.ensureWaitStore()
+    const phone = canonicalPhone(input.contactPhone)
+    const previa = this.db.prepare(
+      "SELECT id FROM flow_waits WHERE organization_id = ? AND contact_phone = ? AND flow_id = ? AND wait_node_id = ? AND status = 'PENDING' LIMIT 1"
+    ).get(input.organizationId, phone, input.flowId, input.waitNodeId) as { id?: string } | undefined
+    if (previa && previa.id) return null
+    const id = 'wait_' + randomUUID()
+    this.db.prepare(
+      'INSERT INTO flow_waits (id, organization_id, contact_phone, flow_id, wait_node_id, next_node_id, due_at, status, attempts, context_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)'
+    ).run(id, input.organizationId, phone, input.flowId, input.waitNodeId, input.nextNodeId, input.dueAt, 'PENDING', JSON.stringify(input.context || {}), Date.now())
+    return id
+  }
+
+  /** Esperas ya vencidas a la hora `now` (de cualquier organización), con tope. */
+  dueFlowWaits(now = Date.now(), limit = 50): DueFlowWait[] {
+    this.ensureWaitStore()
+    const tope = Math.max(1, Math.min(500, Math.trunc(limit) || 1))
+    const filas = this.db.prepare(
+      "SELECT id, organization_id, contact_phone, flow_id, wait_node_id, next_node_id, due_at, attempts, context_json FROM flow_waits WHERE status = 'PENDING' AND due_at <= ? ORDER BY due_at ASC LIMIT ?"
+    ).all(now, tope) as Array<Record<string, unknown>>
+    return filas.map((f) => this.filaEspera(f))
+  }
+
+  /** Las esperas de un contacto (las últimas 20), para el panel y las pruebas. */
+  flowWaitsFor(organizationId: string, contactPhone: string): DueFlowWait[] {
+    this.ensureWaitStore()
+    const filas = this.db.prepare(
+      "SELECT id, organization_id, contact_phone, flow_id, wait_node_id, next_node_id, due_at, attempts, context_json FROM flow_waits WHERE organization_id = ? AND contact_phone = ? ORDER BY created_at DESC LIMIT 20"
+    ).all(organizationId, canonicalPhone(contactPhone)) as Array<Record<string, unknown>>
+    return filas.map((f) => this.filaEspera(f))
+  }
+
+  /**
+   * (ronda 23) Las esperas PENDIENTES de una organización, la más próxima primero:
+   * es lo que el panel necesita para decir «N contactos esperando, el próximo a las
+   * HH:MM» sin tener que abrir la base por su cuenta.
+   */
+  pendingFlowWaits(organizationId: string, limit = 20): DueFlowWait[] {
+    this.ensureWaitStore()
+    const tope = Math.max(1, Math.min(200, Math.trunc(limit) || 1))
+    const filas = this.db.prepare(
+      "SELECT id, organization_id, contact_phone, flow_id, wait_node_id, next_node_id, due_at, attempts, context_json FROM flow_waits WHERE organization_id = ? AND status = 'PENDING' ORDER BY due_at ASC LIMIT ?"
+    ).all(organizationId, tope) as Array<Record<string, unknown>>
+    return filas.map((f) => this.filaEspera(f))
+  }
+
+  /** Cuántas esperas pendientes tiene una organización y cuándo toca la siguiente. */
+  flowWaitStats(organizationId: string): { pending: number; nextAt: number | null } {
+    this.ensureWaitStore()
+    const fila = this.db.prepare(
+      "SELECT COUNT(*) AS n, MIN(due_at) AS next FROM flow_waits WHERE organization_id = ? AND status = 'PENDING'"
+    ).get(organizationId) as { n?: number; next?: number | null } | undefined
+    const pending = Number(fila?.n ?? 0)
+    const nextAt = fila && fila.next !== null && fila.next !== undefined ? Number(fila.next) : null
+    return { pending: Number.isFinite(pending) ? pending : 0, nextAt: Number.isFinite(nextAt as number) ? nextAt : null }
+  }
+
+  private filaEspera(f: Record<string, unknown>): DueFlowWait {
+    return {
+      id: String(f.id),
+      organizationId: String(f.organization_id),
+      contactPhone: String(f.contact_phone),
+      flowId: String(f.flow_id),
+      waitNodeId: String(f.wait_node_id),
+      nextNodeId: String(f.next_node_id),
+      dueAt: Number(f.due_at),
+      attempts: Number(f.attempts ?? 0),
+      context: this.parseWaitContext(f.context_json),
     }
   }
+
+  private parseWaitContext(raw: unknown): Record<string, string> {
+    if (typeof raw !== 'string') return {}
+    try {
+      const parsed = JSON.parse(raw)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+      const out: Record<string, string> = {}
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        out[k] = typeof v === 'string' ? v : String(v ?? '')
+      }
+      return out
+    } catch {
+      return {}
+    }
+  }
+
+  /** Toma la espera para sí: sólo la pasada que la toma puede reanudarla. */
+  claimFlowWait(waitId: string): boolean {
+    this.ensureWaitStore()
+    const r = this.db.prepare(
+      "UPDATE flow_waits SET status = 'RUNNING', attempts = attempts + 1 WHERE id = ? AND status = 'PENDING'"
+    ).run(waitId)
+    return Number(r.changes ?? 0) > 0
+  }
+
+  /**
+   * Cierra la espera con su resultado final. Con status PENDING la deja para otra
+   * pasada (se usa cuando falla algo temporal, para no perder el aviso).
+   */
+  settleFlowWait(waitId: string, status: 'DONE' | 'CANCELLED' | 'ABANDONED' | 'PENDING', now = Date.now()): boolean {
+    this.ensureWaitStore()
+    const settled = status === 'PENDING' ? null : now
+    const r = this.db.prepare(
+      'UPDATE flow_waits SET status = ?, settled_at = ? WHERE id = ?'
+    ).run(status, settled, waitId)
+    return Number(r.changes ?? 0) > 0
+  }
+
+  /**
+   * Reanuda un flujo dormido: recrea la sesión en el nodo siguiente a la espera y
+   * sigue ejecutando nodos por el MISMO bucle que un mensaje entrante. No inventa
+   * nada: si el flujo ya no existe o el nodo desapareció lo dice, y quien llama
+   * cierra la espera en vez de dejar al contacto colgado.
+   */
+  async resumeFlowWait(wait: DueFlowWait, now = Date.now()): Promise<FlowWaitResume> {
+    const flow = this.getFlow(wait.organizationId, wait.flowId)
+    if (!flow || !flow.isActive) return { status: 'flow_missing' }
+    const destino = flow.nodes.find((n) => n.id === wait.nextNodeId)
+    if (!destino) return { status: 'node_missing' }
+    if (this.getSession(wait.organizationId, wait.contactPhone)) return { status: 'session_busy' }
+    const session: FlowSession = {
+      contactPhone: wait.contactPhone,
+      flowId: flow.id,
+      currentNodeId: wait.nextNodeId,
+      waitingForInput: false,
+      context: wait.context || {},
+      lastActivity: now,
+    }
+    this.saveSession(wait.organizationId, session)
+    const result = await this.runNodeLoop(wait.organizationId, wait.contactPhone, flow, session, undefined)
+    return { status: 'resumed', flowId: flow.id, result }
+  }
+
 
   // =========================================================================
   // 4. SESIONES DE DIÁLOGO
@@ -470,6 +841,23 @@ export class FlowEngine {
       session.waitingForInput = false
     }
 
+    return await this.runNodeLoop(orgId, contactPhone, flow!, session!, contactInfo)
+  }
+
+  /**
+   * (ronda 22) Bucle de ejecución de nodos, sacado de evaluateStep para poderlo
+   * reanudar cuando vence una espera: así el camino «mensaje entrante» y el camino
+   * «despierta el planificador» ejecutan EL MISMO código, sin dos copias que se
+   * separen con el tiempo.
+   */
+  private async runNodeLoop(
+    orgId: string,
+    contactPhone: string,
+    flowIn: FlowDefinition,
+    session: FlowSession,
+    contactInfo?: { name?: string; clientId?: string | null },
+  ): Promise<FlowEvaluationResult> {
+    let flow: FlowDefinition = flowIn
     // EJECUCIÓN EN BUCLE DE NODOS SECUENCIALES
     const messagesToSend: FlowEvaluationResult['messagesToSend'] = []
     const actionsToExecute: FlowEvaluationResult['actionsToExecute'] = []
@@ -480,8 +868,11 @@ export class FlowEngine {
     let handoffReason: string | undefined
     let webhookToCall: FlowEvaluationResult['webhookToCall']
     let sequenceToEnroll: string | undefined
+    /** (ronda 22) Hasta cuándo quedó aparcado el flujo y en qué nodo de espera. */
+    let parkedUntil: number | undefined
+    let waitNodeId: string | undefined
 
-    let currentNode: FlowNode | undefined = flow!.nodes.find((n) => n.id === session!.currentNodeId)
+    let currentNode: FlowNode | undefined = flow.nodes.find((n) => n.id === session.currentNodeId)
 
     while (currentNode) {
       // --- NODO: SEND_MESSAGE ---
@@ -525,11 +916,11 @@ export class FlowEngine {
         const isMatch = this.evaluateConditionRules(orgId, contactPhone, rules, logic, session.context)
 
         const targetHandle = isMatch ? 'yes' : 'no'
-        const nextEdge = flow!.edges.find((e) => e.source === currentNode!.id && e.sourceHandle === targetHandle)
+        const nextEdge = flow.edges.find((e) => e.source === currentNode!.id && e.sourceHandle === targetHandle)
 
         if (nextEdge) {
           session.currentNodeId = nextEdge.target
-          currentNode = flow!.nodes.find((n) => n.id === nextEdge.target)
+          currentNode = flow.nodes.find((n) => n.id === nextEdge.target)
         } else {
           currentNode = undefined
         }
@@ -578,16 +969,16 @@ export class FlowEngine {
           const params = { ...(currentNode.data.crmParams || {}) }
           if (contactInfo?.clientId && !params.clientId) params.clientId = contactInfo.clientId
           if (!params.phone) params.phone = contactPhone
-          if (!params.title) params.title = `Lead desde ManyChat: ${flow!.name}`
+          if (!params.title) params.title = `Lead desde ManyChat: ${flow.name}`
 
           actionsToExecute.push({ action, params })
         }
 
         // Avanzar al siguiente nodo
-        const nextEdge = flow!.edges.find((e) => e.source === currentNode!.id)
+        const nextEdge = flow.edges.find((e) => e.source === currentNode!.id)
         if (nextEdge) {
           session.currentNodeId = nextEdge.target
-          currentNode = flow!.nodes.find((n) => n.id === nextEdge.target)
+          currentNode = flow.nodes.find((n) => n.id === nextEdge.target)
         } else {
           currentNode = undefined
         }
@@ -599,10 +990,10 @@ export class FlowEngine {
         const rand = Math.random() * 100
         const chosenHandle = rand < ratio ? 'a' : 'b'
 
-        const nextEdge = flow!.edges.find((e) => e.source === currentNode!.id && e.sourceHandle === chosenHandle)
+        const nextEdge = flow.edges.find((e) => e.source === currentNode!.id && e.sourceHandle === chosenHandle)
         if (nextEdge) {
           session.currentNodeId = nextEdge.target
-          currentNode = flow!.nodes.find((n) => n.id === nextEdge.target)
+          currentNode = flow.nodes.find((n) => n.id === nextEdge.target)
         } else {
           currentNode = undefined
         }
@@ -628,7 +1019,7 @@ export class FlowEngine {
       // --- NODO: HANDOFF (Human Takeover) ---
       else if (currentNode.type === 'handoff') {
         isHandoff = true
-        handoffReason = currentNode.data.handoffReason || `Transferencia activada en ManyChat: ${flow!.name}`
+        handoffReason = currentNode.data.handoffReason || `Transferencia activada en ManyChat: ${flow.name}`
         const farewell = '👤 Te estamos comunicando con un asesor de nuestro equipo comercial. El bot se ha pausado.'
         messagesToSend.push({ text: farewell })
         this.recordOutboundMessage(orgId, contactPhone, farewell)
@@ -642,7 +1033,7 @@ export class FlowEngine {
         // interpolado + contexto al proveedor configurado (inyectable/entorno),
         // con timeout y clasificación de errores. Sin IA configurada o con
         // fallo: aviso EXPLÍCITO de indisponibilidad (jamás texto fingido de IA).
-        const promptTemplate = currentNode.data.aiPrompt || 'Responde de forma concisa como asistente de ventas.'
+        const promptTemplate = currentNode.data.aiPrompt || currentNode.data.promptOverride || 'Responde de forma concisa como asistente de ventas.'
         const prompt = this.interpolateVariables(promptTemplate, session.context, contactPhone)
         let aiText: string
         try {
@@ -660,20 +1051,48 @@ export class FlowEngine {
         messagesToSend.push({ text: aiText })
         this.recordOutboundMessage(orgId, contactPhone, aiText)
 
-        const nextEdge = flow!.edges.find((e) => e.source === currentNode!.id)
+        const nextEdge = flow.edges.find((e) => e.source === currentNode!.id)
         if (nextEdge) {
           session.currentNodeId = nextEdge.target
-          currentNode = flow!.nodes.find((n) => n.id === nextEdge.target)
+          currentNode = flow.nodes.find((n) => n.id === nextEdge.target)
         } else {
           currentNode = undefined
         }
-      } else {
-        const nextEdge = flow!.edges.find((e) => e.source === currentNode!.id)
-        if (nextEdge) {
-          session.currentNodeId = nextEdge.target
-          currentNode = flow!.nodes.find((n) => n.id === nextEdge.target)
-        } else {
+      } else if (currentNode.type === 'delay' || currentNode.type === 'smart_delay') {
+        // (ronda 22) La espera es REAL: se guarda en la base a qué hora hay que
+        // volver y por qué nodo seguir, y la sesión se cierra para que un mensaje
+        // del contacto durante la espera no se salte el nodo (antes lo saltaba en
+        // silencio). Quien despierta el flujo es el planificador
+        // (src/engine/scheduler.ts), que llama a resumeFlowWait() a su hora.
+        const nodoEspera = currentNode
+        const minutosPedidos = nodoEspera.type === 'smart_delay'
+          ? (nodoEspera.data.smartDelayHours ?? 0) * 60 + (nodoEspera.data.delayMinutes ?? 0)
+          : (nodoEspera.data.delayMinutes ?? (nodoEspera.data.delaySeconds ?? 0) / 60)
+        const nextEdge = flow.edges.find((e) => e.source === nodoEspera.id)
+        if (!nextEdge) {
+          // Sin salida: el flujo termina aquí, no hay nada que esperar.
           currentNode = undefined
+        } else if (!(minutosPedidos > 0)) {
+          // Espera de cero minutos: no se aparca nada, se sigue (y se dice).
+          console.warn('[flow-engine] Nodo ' + nodoEspera.type + ' ("' + nodoEspera.title + '") sin minutos de espera: el flujo sigue ya.')
+          session.currentNodeId = nextEdge.target
+          currentNode = flow.nodes.find((n) => n.id === nextEdge.target)
+        } else {
+          const dueAt = Date.now() + Math.round(minutosPedidos * 60000)
+          parkedUntil = dueAt
+          waitNodeId = nodoEspera.id
+          const esperaId = this.parkFlowWait({
+            organizationId: orgId,
+            contactPhone,
+            flowId: flow.id,
+            waitNodeId: nodoEspera.id,
+            nextNodeId: nextEdge.target,
+            dueAt,
+            context: session.context,
+          })
+          this.clearSession(orgId, contactPhone)
+          console.log('[flow-engine] Flujo aparcado en "' + nodoEspera.title + '" hasta ' + new Date(dueAt).toISOString() + ' (' + Math.round(minutosPedidos) + ' min, espera ' + (esperaId || 'ya pendiente') + ')')
+          break
         }
       }
     }
@@ -684,7 +1103,7 @@ export class FlowEngine {
 
     return {
       handled: true,
-      flowId: flow!.id,
+      flowId: flow.id,
       currentNodeId: session?.currentNodeId,
       messagesToSend,
       actionsToExecute,
@@ -696,6 +1115,8 @@ export class FlowEngine {
       isHandoff,
       handoffReason,
       flowCompleted: !currentNode,
+      parkedUntil,
+      waitNodeId,
     }
   }
 
