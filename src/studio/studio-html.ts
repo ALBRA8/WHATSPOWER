@@ -84,6 +84,34 @@ export function renderStudioHtml(): string {
     .sim-input-box { padding: 10px; background: #202c33; display: flex; gap: 8px; }
     .sim-input { flex: 1; background: #2a3942; border: none; border-radius: 8px; padding: 8px 12px; color: #fff; font-size: 12px; outline: none; }
     .sim-send { background: #00a884; color: #fff; border: none; border-radius: 8px; width: 34px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-weight: bold; }
+    /* ---- Lienzo interactivo: arrastrar y conectar nodos ---- */
+    .node { cursor: grab; touch-action: none; }
+    body.is-dragging .node { cursor: grabbing; }
+    body.is-dragging * { user-select: none; }
+    .node.is-selected { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(37,99,235,.6), 0 10px 15px -3px rgba(0,0,0,.45); }
+    .node.is-moving { opacity: .96; }
+
+    /* Puertos: el punto de la derecha es el tirador para crear una flecha */
+    .port { position: absolute; border: none; background: transparent; padding: 0; z-index: 3; }
+    .port-out { right: -12px; display: flex; flex-direction: row-reverse; align-items: center; gap: 5px; cursor: crosshair; }
+    .port-dot { display: block; width: 14px; height: 14px; border-radius: 50%; background: #3b82f6; border: 2px solid #0b1220; box-shadow: 0 0 0 1px #60a5fa; transition: transform .12s; }
+    .port-out:hover .port-dot { background: #22d3ee; transform: scale(1.2); }
+    .port-alt .port-dot { background: #f59e0b; box-shadow: 0 0 0 1px #fbbf24; }
+    .port-label { font-size: 10px; color: #cbd5e1; opacity: 0; transition: opacity .12s; white-space: nowrap; }
+    .port-out:hover .port-label, .node.is-selected .port-label { opacity: 1; }
+    .port-in { left: -7px; top: 31px; width: 10px; height: 10px; border-radius: 50%; background: #111827; border: 2px solid #4b5563; pointer-events: none; }
+
+    /* Flechas */
+    .edge { fill: none; stroke: #3b82f6; stroke-width: 2; pointer-events: stroke; cursor: pointer; }
+    .edge:hover { stroke: #60a5fa; stroke-width: 3; }
+    .edge.is-selected { stroke: #f59e0b; stroke-width: 3; }
+    .edge-temp { fill: none; stroke: #22d3ee; stroke-width: 2; stroke-dasharray: 6 4; pointer-events: none; }
+
+    /* Aviso de uso y mensajes del lienzo */
+    .canvas-hint { position: absolute; left: 256px; bottom: 12px; z-index: 6; max-width: 620px; background: rgba(17,24,39,.94); border: 1px solid var(--panel-border); color: #9ca3af; font-size: 11px; line-height: 1.35; padding: 6px 10px; border-radius: 8px; pointer-events: none; }
+    .studio-toast { position: absolute; right: 356px; bottom: 12px; z-index: 16; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; pointer-events: none; }
+    .toast-line { background: #1e293b; border: 1px solid #334155; color: #e5e7eb; font-size: 12px; padding: 6px 10px; border-radius: 8px; }
+    .save-state { font-size: 11px; color: var(--text-muted); }
   </style>
 </head>
 <body>
@@ -99,11 +127,14 @@ export function renderStudioHtml(): string {
 
     <div class="actions-bar">
       <select id="flowSelect"></select>
+      <span class="save-state" id="saveState">Sin cambios</span>
       <button class="btn-primary" onclick="saveCurrentFlow()">💾 Guardar y Activar</button>
     </div>
   </header>
 
   <div class="workspace">
+    <div class="canvas-hint" id="canvasHint"></div>
+    <div class="studio-toast" id="studioToast"></div>
     <!-- Palette -->
     <div class="palette">
       <div class="palette-title">Catálogo de Nodos</div>
@@ -278,36 +309,43 @@ export function renderStudioHtml(): string {
       currentFlow.nodes.forEach(node => {
         const div = document.createElement('div');
         div.className = 'node node-' + node.type;
-        div.style.left = (node.position?.x || 100) + 'px';
-        div.style.top = (node.position?.y || 100) + 'px';
+        div.dataset.nodeId = node.id;
+        div.dataset.nodeType = node.type;
+        if (selectedNodeId === node.id) div.className += ' is-selected';
+        const npos = nodePos(node);
+        div.style.left = npos.x + 'px';
+        div.style.top = npos.y + 'px';
 
         let icon = '💬';
         let bodyHtml = '';
+        // Un nodo recién creado puede no traer data: sin esto la página entera
+        // se caía al pintar el lienzo ("reading 'keywords'").
+        const nd = node.data || {};
 
         if (node.type === 'trigger') {
           icon = '🚀';
-          bodyHtml = '<strong>Keywords:</strong> ' + (node.data.keywords || []).map(k => '<span style=\"background:#064e3b; padding:1px 5px; border-radius:3px; font-size:10px;\">' + esc(k) + '</span>').join(' ');
+          bodyHtml = '<strong>Keywords:</strong> ' + (nd.keywords || []).map(k => '<span style=\"background:#064e3b; padding:1px 5px; border-radius:3px; font-size:10px;\">' + esc(k) + '</span>').join(' ');
         } else if (node.type === 'send_message') {
           icon = '💬';
-          bodyHtml = '<div>' + escMultiline(node.data.messageText || '') + '</div>';
-          if (node.data.buttons && node.data.buttons.length > 0) {
-            bodyHtml += '<div class=\"node-buttons\">' + node.data.buttons.map((b, i) => '<div class=\"node-btn-opt\"><span>' + (i+1) + '. ' + esc(b) + '</span><span style=\"color:#60a5fa;\">Opción ' + (i+1) + '</span></div>').join('') + '</div>';
+          bodyHtml = '<div>' + escMultiline(nd.messageText || '') + '</div>';
+          if (nd.buttons && nd.buttons.length > 0) {
+            bodyHtml += '<div class=\"node-buttons\">' + nd.buttons.map((b, i) => '<div class=\"node-btn-opt\"><span>' + (i+1) + '. ' + esc(b) + '</span><span style=\"color:#60a5fa;\">Opción ' + (i+1) + '</span></div>').join('') + '</div>';
           }
         } else if (node.type === 'user_input') {
           icon = '📥';
-          bodyHtml = '<div>Prompt: <em>\"' + esc(node.data.inputPrompt || '') + '\"</em></div><div style=\"color:#38bdf8; margin-top:4px;\">Guardar en: <code>' + esc(node.data.saveToCustomField || '') + '</code></div>';
+          bodyHtml = '<div>Prompt: <em>\"' + esc(nd.inputPrompt || '') + '\"</em></div><div style=\"color:#38bdf8; margin-top:4px;\">Guardar en: <code>' + esc(nd.saveToCustomField || '') + '</code></div>';
         } else if (node.type === 'condition') {
           icon = '🔀';
-          bodyHtml = '<div>Reglas: ' + (node.data.rules || []).map(r => '<code>' + esc(r.type) + ': ' + esc(r.value) + '</code>').join('<br>') + '</div><div style=\"display:flex; justify-content:space-between; margin-top:6px;\"><span style=\"color:#10b981;\">✔ Sí</span><span style=\"color:#ef4444;\">✖ No</span></div>';
+          bodyHtml = '<div>Reglas: ' + (nd.rules || []).map(r => '<code>' + esc(r.type) + ': ' + esc(r.value) + '</code>').join('<br>') + '</div><div style=\"display:flex; justify-content:space-between; margin-top:6px;\"><span style=\"color:#10b981;\">✔ Sí</span><span style=\"color:#ef4444;\">✖ No</span></div>';
         } else if (node.type === 'action') {
           icon = '🏷️';
-          bodyHtml = '<div>Acción: <code>' + (node.data.actionType || '') + '</code></div><div style=\"color:#c084fc;\">Etiqueta: ' + esc(node.data.tag || '') + '</div>';
+          bodyHtml = '<div>Acción: <code>' + (nd.actionType || '') + '</code></div><div style=\"color:#c084fc;\">Etiqueta: ' + esc(nd.tag || '') + '</div>';
         } else if (node.type === 'crm_action') {
           icon = '⚡';
-          bodyHtml = '⚡ <strong>Acción ALBRA:</strong> <code>' + esc(node.data.crmAction || '') + '</code><br><span style=\"color:#c084fc;\">Monto: $' + esc(node.data.crmParams?.amount || 0) + '</span>';
+          bodyHtml = '⚡ <strong>Acción ALBRA:</strong> <code>' + esc(nd.crmAction || '') + '</code><br><span style=\"color:#c084fc;\">Monto: $' + esc(nd.crmParams?.amount || 0) + '</span>';
         } else if (node.type === 'ab_split') {
           icon = '🎲';
-          bodyHtml = '<div>Split Ratio: <strong>' + (node.data.splitRatio || 50) + '% / ' + (100 - (node.data.splitRatio || 50)) + '%</strong></div><div style=\"display:flex; justify-content:space-between; margin-top:6px;\"><span style=\"color:#f472b6;\">Rama A</span><span style=\"color:#38bdf8;\">Rama B</span></div>';
+          bodyHtml = '<div>Split Ratio: <strong>' + (nd.splitRatio || 50) + '% / ' + (100 - (nd.splitRatio || 50)) + '%</strong></div><div style=\"display:flex; justify-content:space-between; margin-top:6px;\"><span style=\"color:#f472b6;\">Rama A</span><span style=\"color:#38bdf8;\">Rama B</span></div>';
         } else if (node.type === 'handoff') {
           icon = '👤';
           bodyHtml = '🚨 <strong>Silenciar Bot</strong> y transferir a asesor comercial humano.';
@@ -320,6 +358,7 @@ export function renderStudioHtml(): string {
           </div>
           <div class="node-body">\${bodyHtml}</div>
         \`;
+        appendPorts(div, node);
         container.appendChild(div);
       });
 
@@ -355,6 +394,7 @@ export function renderStudioHtml(): string {
         };
         currentFlow = draft;
         flowsList.push(draft);
+        draftMode = true;
         const sel = document.getElementById('flowSelect');
         const opt = document.createElement('option');
         opt.value = draft.id;
@@ -370,13 +410,19 @@ export function renderStudioHtml(): string {
         position: { x: 40 + (index % 4) * 210, y: 40 + Math.floor(index / 4) * 150 },
         data: JSON.parse(JSON.stringify(def.data)),
       };
+      snapshot();
       currentFlow.nodes.push(node);
       renderCanvas();
+      scheduleSave('Nodo añadido');
     }
 
     function renderEdges() {
       const svg = document.getElementById('edgesSvg');
       svg.innerHTML = '';
+      // Cabeza de flecha: se dibuja una sola vez por pintado y la usan todas.
+      const defs = document.createElementNS(SVG_NS, 'defs');
+      defs.innerHTML = '<marker id="edgeArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3b82f6"></path></marker>';
+      svg.appendChild(defs);
       if (!currentFlow || !currentFlow.edges) return;
 
       currentFlow.edges.forEach(edge => {
@@ -384,16 +430,22 @@ export function renderStudioHtml(): string {
         const targetNode = currentFlow.nodes.find(n => n.id === edge.target);
         if (!sourceNode || !targetNode) return;
 
-        const x1 = (sourceNode.position?.x || 100) + 260;
-        const y1 = (sourceNode.position?.y || 100) + 35;
-        const x2 = (targetNode.position?.x || 100);
-        const y2 = (targetNode.position?.y || 100) + 35;
+        const spos = nodePos(sourceNode);
+        const tpos = nodePos(targetNode);
+        const x1 = spos.x + NODE_W;
+        const y1 = spos.y + PORT_TOP;
+        const x2 = tpos.x;
+        const y2 = tpos.y + PORT_TOP;
 
         const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
         const dx = Math.abs(x2 - x1) * 0.5;
         const d = \`M \${x1} \${y1} C \${x1 + dx} \${y1}, \${x2 - dx} \${y2}, \${x2} \${y2}\`;
         path.setAttribute('d', d);
+        const eid = edgeKey(edge);
+        path.setAttribute('class', 'edge' + (eid === selectedEdgeId ? ' is-selected' : ''));
+        path.dataset.edgeId = eid;
         path.setAttribute('stroke', '#3b82f6');
+        path.setAttribute('marker-end', 'url(#edgeArrow)');
         path.setAttribute('stroke-width', '2');
         path.setAttribute('fill', 'none');
         svg.appendChild(path);
@@ -417,6 +469,363 @@ export function renderStudioHtml(): string {
     }
 
     // Simulador
+    // ============================================================
+    // LIENZO INTERACTIVO: arrastrar nodos y conectarlos.
+    //  · Arrastrar la caja de un nodo mueve su posición y se guarda sola.
+    //  · Cada nodo tiene puertos de salida a la derecha; arrastrar desde un
+    //    puerto hasta otro nodo crea la flecha (edge) con el sourceHandle que
+    //    el motor espera: default, yes/no (condición) o a/b (split).
+    //  · Supr borra la flecha o el nodo seleccionado; Ctrl+Z deshace.
+    // Los manejadores van por delegación en #canvas, así que repintar el
+    // lienzo (renderCanvas) no los pierde nunca.
+    // ============================================================
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    const NODE_W = 260;
+    const PORT_TOP = 35;
+    let dragState = null;
+    let linkState = null;
+    let selectedNodeId = null;
+    let selectedEdgeId = null;
+    let undoStack = [];
+    let saveTimer = null;
+    let draftMode = false;
+
+    function nodeById(id) {
+      if (!currentFlow || !currentFlow.nodes) return null;
+      return currentFlow.nodes.find(function (n) { return n.id === id; }) || null;
+    }
+
+    function nodePos(node) {
+      const p = node && node.position ? node.position : {};
+      return { x: typeof p.x === 'number' ? p.x : 100, y: typeof p.y === 'number' ? p.y : 100 };
+    }
+
+    function edgeKey(edge) {
+      return edge.id || ('e_' + edge.source + '_' + edge.target);
+    }
+
+    function outPorts(node) {
+      if (node.type === 'condition') return [{ handle: 'yes', label: 'Sí' }, { handle: 'no', label: 'No' }];
+      if (node.type === 'ab_split') return [{ handle: 'a', label: 'A' }, { handle: 'b', label: 'B' }];
+      return [{ handle: 'default', label: 'Salida' }];
+    }
+
+    function curvePath(x1, y1, x2, y2) {
+      const dx = Math.max(40, Math.abs(x2 - x1) * 0.5);
+      return 'M ' + x1 + ' ' + y1 + ' C ' + (x1 + dx) + ' ' + y1 + ', ' + (x2 - dx) + ' ' + y2 + ', ' + x2 + ' ' + y2;
+    }
+
+    function canvasPoint(ev) {
+      const rect = document.getElementById('canvas').getBoundingClientRect();
+      return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+    }
+
+    function setSaveState(text) {
+      const el = document.getElementById('saveState');
+      if (el) el.textContent = text;
+    }
+
+    function toast(text) {
+      const box = document.getElementById('studioToast');
+      if (!box) return;
+      const line = document.createElement('div');
+      line.className = 'toast-line';
+      line.textContent = text;
+      box.appendChild(line);
+      setTimeout(function () { if (line.parentNode) line.parentNode.removeChild(line); }, 2800);
+    }
+
+    // Foto del flujo antes de cada cambio, para poder deshacer.
+    function snapshot() {
+      if (!currentFlow) return;
+      try {
+        undoStack.push(JSON.stringify({ nodes: currentFlow.nodes, edges: currentFlow.edges || [] }));
+        if (undoStack.length > 40) undoStack.shift();
+      } catch (e) {}
+    }
+
+    function undo() {
+      if (!currentFlow || undoStack.length === 0) { toast('No hay nada que deshacer'); return; }
+      const prev = JSON.parse(undoStack.pop());
+      currentFlow.nodes = prev.nodes || [];
+      currentFlow.edges = prev.edges || [];
+      selectedNodeId = null;
+      selectedEdgeId = null;
+      renderCanvas();
+      paintSelectionInfo();
+      scheduleSave('Cambio deshecho');
+    }
+
+    // Guardado automático con un pequeño retardo: mover o conectar no se
+    // pierde al recargar, y arrastrar no dispara una petición por píxel.
+    function scheduleSave(label) {
+      setSaveState('Guardando…');
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(function () { persistFlow(label); }, 700);
+    }
+
+    async function persistFlow(label) {
+      if (!currentFlow) return;
+      try {
+        const res = await fetch('/api/flows', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(currentFlow)
+        });
+        if (!res.ok) {
+          setSaveState('Sin guardar (HTTP ' + res.status + ')');
+          toast('No se pudo guardar: HTTP ' + res.status);
+          return;
+        }
+        setSaveState('Guardado ✓');
+        if (draftMode) {
+          draftMode = false;
+          const sel = document.getElementById('flowSelect');
+          if (sel) {
+            const opt = sel.options[sel.selectedIndex];
+            if (opt) opt.textContent = currentFlow.name;
+          }
+        }
+        if (label) toast(label);
+      } catch (err) {
+        setSaveState('Sin conexión con el servidor');
+        toast('No se pudo guardar: ' + err.message);
+      }
+    }
+
+    function appendPorts(div, node) {
+      outPorts(node).forEach(function (p, i) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'port port-out' + (p.handle === 'no' || p.handle === 'b' ? ' port-alt' : '');
+        btn.dataset.nodeId = node.id;
+        btn.dataset.handle = p.handle;
+        btn.title = 'Arrastra desde aquí hasta otro nodo para unirlos (' + p.label + ')';
+        btn.style.top = (PORT_TOP + i * 26) + 'px';
+        const dot = document.createElement('span');
+        dot.className = 'port-dot';
+        const lab = document.createElement('span');
+        lab.className = 'port-label';
+        lab.textContent = p.label;
+        btn.appendChild(dot);
+        btn.appendChild(lab);
+        div.appendChild(btn);
+      });
+      const inDot = document.createElement('span');
+      inDot.className = 'port port-in';
+      div.appendChild(inDot);
+    }
+
+    function paintSelectionInfo() {
+      const hint = document.getElementById('canvasHint');
+      if (!hint) return;
+      const node = selectedNodeId ? nodeById(selectedNodeId) : null;
+      if (node) { hint.textContent = 'Seleccionado: ' + node.title + ' · arrastra para moverlo · Supr lo borra con sus flechas'; return; }
+      if (selectedEdgeId) { hint.textContent = 'Flecha seleccionada · Supr la elimina'; return; }
+      hint.textContent = 'Arrastra un nodo para moverlo · arrastra desde un punto de la derecha hasta otro nodo para conectarlos · Supr borra · Ctrl+Z deshace';
+    }
+
+    function selectNode(id) {
+      selectedNodeId = id;
+      if (id) selectedEdgeId = null;
+      const layer = document.getElementById('nodesLayer');
+      if (layer) {
+        Array.prototype.forEach.call(layer.children, function (el) {
+          if (el.dataset && el.dataset.nodeId === id) el.classList.add('is-selected');
+          else el.classList.remove('is-selected');
+        });
+      }
+      paintSelectionInfo();
+    }
+
+    function selectEdge(id) {
+      selectedEdgeId = id;
+      if (id) selectedNodeId = null;
+      const svg = document.getElementById('edgesSvg');
+      if (svg) {
+        Array.prototype.forEach.call(svg.querySelectorAll('.edge'), function (el) {
+          if (el.dataset && el.dataset.edgeId === id) el.classList.add('is-selected');
+          else el.classList.remove('is-selected');
+        });
+      }
+      paintSelectionInfo();
+    }
+
+    function deleteEdge(id) {
+      if (!currentFlow || !currentFlow.edges) return;
+      const idx = currentFlow.edges.findIndex(function (e) { return edgeKey(e) === id; });
+      if (idx < 0) return;
+      snapshot();
+      currentFlow.edges.splice(idx, 1);
+      selectedEdgeId = null;
+      renderEdges();
+      paintSelectionInfo();
+      scheduleSave('Flecha eliminada');
+    }
+
+    function deleteNode(id) {
+      if (!currentFlow || !currentFlow.nodes) return;
+      if (!nodeById(id)) return;
+      snapshot();
+      currentFlow.nodes = currentFlow.nodes.filter(function (n) { return n.id !== id; });
+      currentFlow.edges = (currentFlow.edges || []).filter(function (e) { return e.source !== id && e.target !== id; });
+      selectedNodeId = null;
+      renderCanvas();
+      paintSelectionInfo();
+      scheduleSave('Nodo eliminado');
+    }
+
+    function startDrag(el, ev) {
+      const node = nodeById(el.dataset.nodeId);
+      if (!node) return;
+      const pos = nodePos(node);
+      node.position = { x: pos.x, y: pos.y };
+      const p = canvasPoint(ev);
+      snapshot();
+      dragState = { node: node, el: el, dx: p.x - pos.x, dy: p.y - pos.y, moved: false };
+      selectNode(node.id);
+      document.body.classList.add('is-dragging');
+      el.classList.add('is-moving');
+    }
+
+    function onDragMove(ev) {
+      if (!dragState) return;
+      const p = canvasPoint(ev);
+      const x = Math.max(0, Math.round(p.x - dragState.dx));
+      const y = Math.max(0, Math.round(p.y - dragState.dy));
+      if (x === dragState.node.position.x && y === dragState.node.position.y) return;
+      dragState.node.position = { x: x, y: y };
+      dragState.el.style.left = x + 'px';
+      dragState.el.style.top = y + 'px';
+      dragState.moved = true;
+      renderEdges();
+    }
+
+    function endDrag() {
+      const st = dragState;
+      dragState = null;
+      document.body.classList.remove('is-dragging');
+      if (!st) return;
+      if (st.el) st.el.classList.remove('is-moving');
+      if (!st.moved) {
+        // Un clic sin mover no es un cambio: se tira la foto para deshacer.
+        undoStack.pop();
+        return;
+      }
+      scheduleSave('Posición guardada');
+    }
+
+    function startLink(nodeId, handle, ev) {
+      const src = nodeById(nodeId);
+      if (!src) return;
+      const svg = document.getElementById('edgesSvg');
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('class', 'edge edge-temp');
+      svg.appendChild(path);
+      linkState = { sourceId: nodeId, handle: handle || 'default', path: path };
+      selectNode(nodeId);
+      onLinkMove(ev);
+    }
+
+    function onLinkMove(ev) {
+      if (!linkState) return;
+      const src = nodeById(linkState.sourceId);
+      if (!src) return;
+      const pos = nodePos(src);
+      const p = canvasPoint(ev);
+      linkState.path.setAttribute('d', curvePath(pos.x + NODE_W, pos.y + PORT_TOP, p.x, p.y));
+    }
+
+    function endLink(ev) {
+      const st = linkState;
+      linkState = null;
+      if (!st) return;
+      if (st.path && st.path.parentNode) st.path.parentNode.removeChild(st.path);
+      if (!ev) { renderEdges(); return; }
+      const under = document.elementFromPoint(ev.clientX, ev.clientY);
+      const targetEl = under && under.closest ? under.closest('.node') : null;
+      if (!targetEl) {
+        renderEdges();
+        toast('Suelta la flecha encima de otro nodo para unirlos');
+        return;
+      }
+      connectNodes(st.sourceId, targetEl.dataset.nodeId, st.handle);
+    }
+
+    function connectNodes(sourceId, targetId, handle) {
+      if (!currentFlow || !sourceId || !targetId) return;
+      if (sourceId === targetId) { renderEdges(); toast('Un nodo no puede unirse consigo mismo'); return; }
+      currentFlow.edges = currentFlow.edges || [];
+      const dup = currentFlow.edges.some(function (e) {
+        return e.source === sourceId && e.target === targetId && (e.sourceHandle || 'default') === handle;
+      });
+      if (dup) { renderEdges(); toast('Esos dos nodos ya están unidos por esa salida'); return; }
+      snapshot();
+      currentFlow.edges.push({
+        id: 'e_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
+        source: sourceId,
+        target: targetId,
+        sourceHandle: handle
+      });
+      renderEdges();
+      scheduleSave('Conexión creada');
+    }
+
+    (function wireCanvas() {
+      const canvas = document.getElementById('canvas');
+      if (!canvas) return;
+
+      canvas.addEventListener('pointerdown', function (ev) {
+        if (!currentFlow || ev.button !== 0) return;
+        const t = ev.target;
+        const portEl = t && t.closest ? t.closest('.port-out') : null;
+        if (portEl) {
+          ev.preventDefault();
+          startLink(portEl.dataset.nodeId, portEl.dataset.handle, ev);
+          return;
+        }
+        const nodeEl = t && t.closest ? t.closest('.node') : null;
+        if (nodeEl) {
+          ev.preventDefault();
+          startDrag(nodeEl, ev);
+          return;
+        }
+        const edgeEl = t && t.closest ? t.closest('.edge') : null;
+        if (edgeEl) { selectEdge(edgeEl.dataset.edgeId); return; }
+        selectNode(null);
+        selectEdge(null);
+      });
+
+      window.addEventListener('pointermove', function (ev) {
+        if (dragState) onDragMove(ev);
+        else if (linkState) onLinkMove(ev);
+      });
+
+      window.addEventListener('pointerup', function (ev) {
+        if (dragState) { endDrag(); return; }
+        if (linkState) endLink(ev);
+      });
+
+      window.addEventListener('pointercancel', function () {
+        if (dragState) endDrag();
+        if (linkState) endLink(null);
+      });
+
+      document.addEventListener('keydown', function (ev) {
+        const tag = (ev.target && ev.target.tagName) || '';
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+        if ((ev.ctrlKey || ev.metaKey) && (ev.key === 'z' || ev.key === 'Z')) { ev.preventDefault(); undo(); return; }
+        if (ev.key === 'Delete' || ev.key === 'Backspace') {
+          if (selectedEdgeId) { ev.preventDefault(); deleteEdge(selectedEdgeId); }
+          else if (selectedNodeId) { ev.preventDefault(); deleteNode(selectedNodeId); }
+          return;
+        }
+        if (ev.key === 'Escape') { selectNode(null); selectEdge(null); }
+      });
+
+      paintSelectionInfo();
+    })();
+
     let simPhone = '+573000000099';
 
     async function sendSimMessage() {
