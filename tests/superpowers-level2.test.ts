@@ -67,7 +67,7 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
   })
 
   it('SP2-03: Growth Tools genera Ref URLs y resuelve payload al recibir mensaje', () => {
-    const { growthManager } = createAgenticServer({ dbPath: ':memory:', businessPhone: '573017543786' })
+    const { growthManager } = createAgenticServer({ dbPath: ':memory:', businessPhone: '573001112233' })
 
     const link = growthManager.createGrowthLink('org_demo', {
       slug: 'promo-instagram',
@@ -79,7 +79,7 @@ describe('SUITE SUPERPODERES NIVEL 2: WHATSPOWER (ManyChat + Respond.io + Kommo)
 
     // Registrar clic
     const waLink = growthManager.registerClick('promo-instagram')
-    assert.ok(waLink?.includes('https://wa.me/573017543786?text='))
+    assert.ok(waLink?.includes('https://wa.me/573001112233?text='))
     assert.ok(waLink?.includes('Instagram'))
 
     // Validar conteo de clics

@@ -1,40 +1,43 @@
-# Ficha Técnica y Especificación Funcional: Capa 2A — Núcleo Agéntico y Conversacional (MVP)
+# Ficha Técnica y Especificación Funcional: WHATSPOWER — Núcleo Agéntico y Conversacional (Nivel 2)
 
-> **Documento de Especificación y Diseño Arquitectónico**  
-> **Ubicación:** `clones/albra-agentic-2a/FICHA.md`  
-> **Documento Maestro de Referencia:** [investigacion_camino/PROPUESTA_DISENO_CONTRATOS_2A_2B.md](file:///d:/NAS%20CLONADOR/investigacion_camino/PROPUESTA_DISENO_CONTRATOS_2A_2B.md)  
-> **Estado:** FASE DE DISEÑO EXCLUSIVO (Sin código funcional implementado).
+> **Documento de Especificación Funcional y Arquitectura**  
+> **Ubicación:** `WHATSPOWER/FICHA.md`  
+> **Estado:** PRODUCCIÓN REAL — Código 100% implementado, probado y auditado (250 tests pasando en sala limpia).
 
 ---
 
 ## 1. Arquitectura Física y Límites del Sistema
 
-La **Capa 2A** se concibe como un satélite desacoplado y autónomo. No se aloja dentro del árbol de código de `CRM-ALBRA/src/modules/` ni accede de manera directa a la base de datos `db/custom.db` del CRM.
+La **Capa 2A (WHATSPOWER)** se concibe como un satélite desacoplado y autónomo. No se aloja dentro del árbol de código de `CRM-ALBRA/src/modules/` ni accede de manera directa a la base de datos `db/custom.db` del CRM.
 
 ### 1.1 Estructura Física del Paquete
 ```text
-clones/albra-agentic-2a/
+WHATSPOWER/
 ├── FICHA.md                       <-- Este documento de especificación
 ├── package.json                   <-- Módulo Node.js 22+ / TypeScript independiente
 ├── tsconfig.json
 ├── db/
-│   └── operational.db             <-- SQLite operativa local privada (solo sesiones volátiles y locks)
+│   └── operational.db             <-- SQLite operativa local privada (sesiones, locks y consentimientos)
 └── src/
-    ├── server.ts                  <-- Servicio HTTP ligero (Fastify/Node HTTP) para recibir webhooks
+    ├── server.ts                  <-- Servicio HTTP con autenticación por organización
     ├── state/
     │   ├── machine.ts             <-- Máquina de estados finita de la conversación
     │   └── lock-manager.ts        <-- Adquisición y liberación atómica de locks por contacto con TTL
     ├── engine/
     │   ├── router.ts              <-- Enrutador determinista por palabras clave e intenciones
-    │   └── rules.ts               <-- Definición declarativa de reglas conversacionales mínimas
+    │   └── rules.ts               <-- Definición declarativa de reglas conversacionales
+    ├── safety/
+    │   ├── consent-store.ts       <-- Registro y auditoría de consentimiento (Ley 1581)
+    │   ├── messaging-window.ts    <-- Verificación de ventana de 24h Meta
+    │   └── template-registry.ts   <-- Registro y estado de plantillas Meta
     ├── suppression/
     │   └── suppression-store.ts   <-- Almacén local de bajas y consentimientos revocados
     ├── adapters/
-    │   ├── crm-actions-client.ts  <-- Cliente REST para POST /api/crm/actions de Capa 1
-    │   ├── crm-mcp-client.ts      <-- Cliente JSON-RPC para POST /api/mcp de Capa 1
-    │   └── wa-transport-client.ts <-- Cliente de transporte WhatsApp (proxy / daemon de Capa 1)
-    └── mock-transport/
-        └── transport-simulator.ts <-- Simulador de transporte para testing en sala limpia (sin envíos reales)
+    │   ├── crm-client.ts          <-- Cliente REST para integración con Capa 1
+    │   ├── meta-cloud-org-transport.ts <-- Transporte oficial Meta Cloud API por organización
+    │   └── transport.ts           <-- Transporte y mock para testing en sala limpia
+    └── studio/
+        └── studio-html.ts         <-- Flow Studio visual
 ```
 
 ### 1.2 Límites de Responsabilidad y No Invasión

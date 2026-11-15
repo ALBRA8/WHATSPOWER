@@ -1,7 +1,7 @@
 # Manual Operativo: Despliegue, Control y Reversión (Capa 1 + Daemon WA + Capa 2A)
 
 **Documento:** Procedimiento de Operación en Sala Limpia y Despliegue  
-**Ubicación:** `clones/albra-agentic-2a/MANUAL_DESPLIEGUE_Y_OPERACION.md`  
+**Ubicación:** `WHATSPOWER/MANUAL_DESPLIEGUE_Y_OPERACION.md`  
 **Estado:** Preparado para activación supervisada (Pendiente de Autorización de Tráfico Real)
 
 ---
@@ -58,7 +58,7 @@ Para garantizar que cuando el CRM o el daemon reciban tráfico todos los compone
   AGENTIC_2A_WEBHOOK_SECRET=albra_shared_webhook_secret_min32chars_hex
   
   # Allowlist estricta para el piloto: SOLO el número autorizado
-  AGENTIC_2A_PILOT_ALLOWLIST=3163301286
+  AGENTIC_2A_PILOT_ALLOWLIST=573000000001
 
   # Secretos internos del CRM y puertos
   INTERNAL_API_SECRET=albra_internal_secret_min24chars_hex
@@ -66,7 +66,7 @@ Para garantizar que cuando el CRM o el daemon reciban tráfico todos los compone
   WHATSAPP_DAEMON_URL="http://localhost:3002"
   ```
 
-- **En `clones/albra-agentic-2a/.env`:**
+- **En `WHATSPOWER/.env`:**
   ```env
   PORT=3003
   WEBHOOK_SECRET=albra_shared_webhook_secret_min32chars_hex
@@ -101,9 +101,9 @@ curl http://localhost:3002/status
 
 1. **Autoridad de Despacho Exclusiva:** Capa 2A **NO** tiene socket de WhatsApp ni conexión directa a Baileys.
 2. **Flujo de Respuesta:**
-   - Usuario (`3163301286`) envía mensaje a WhatsApp.
+   - Usuario (`573000000001`) envía mensaje a WhatsApp.
    - Baileys (Daemon, :3002) recibe el mensaje y llama a `POST /api/whatsapp/auto-reply` en el CRM (:3000).
-   - El CRM evalúa la allowlist: al coincidir `3163301286` y estar `AGENTIC_2A_ENABLED=true`, reenvía por HTTP firmado a Capa 2A (:3003).
+   - El CRM evalúa la allowlist: al coincidir `573000000001` y estar `AGENTIC_2A_ENABLED=true`, reenvía por HTTP firmado a Capa 2A (:3003).
    - Capa 2A procesa la regla y **retorna el texto en el cuerpo de la respuesta HTTP** (`{ handled: true, replyText: "..." }`).
    - El CRM inhibe su LLM local y entrega el texto al Daemon.
    - El Daemon ejecuta `sendWhatsAppMessage` al socket.
@@ -116,7 +116,7 @@ curl http://localhost:3002/status
 Si durante la prueba supervisada ocurre cualquier anomalía:
 
 1. **Acción Inmediata (0 segundos de downtime):**
-   En `audit_repos/CRM-ALBRA/.env`:
+   En `CRM-ALBRA/.env`:
    ```env
    AGENTIC_2A_ENABLED=false
    ```
@@ -127,7 +127,7 @@ Si durante la prueba supervisada ocurre cualquier anomalía:
 
 ## 5. Garantía de Silenciamiento Humano (`HANDOFF_HUMAN`)
 
-1. Cuando el cliente `3163301286` solicita un asesor o activa la regla de transferencia, el lock pasa a `HANDOFF_HUMAN`.
+1. Cuando el cliente `573000000001` solicita un asesor o activa la regla de transferencia, el lock pasa a `HANDOFF_HUMAN`.
 2. **Silenciamiento Estricto:** Cualquier mensaje posterior enviado mientras el lock esté activo es rechazado por el enrutador con `actionTaken: 'locked_busy'`. Capa 2A no despacha respuestas automáticas y deja la conversación a cargo del agente humano.
 
 ---
@@ -143,8 +143,8 @@ Si durante la prueba supervisada ocurre cualquier anomalía:
 
 ## 7. Checklist del Piloto Real Supervisado (Completado)
 
-- [x] Allowlist configurada exclusivamente para el cliente de prueba `3017543786` (canonizado `573017543786`).
-- [x] Teléfono emisor del daemon Baileys vinculado en vivo: `3163301286` (`573163301286`).
+- [x] Allowlist configurada exclusivamente para el cliente de prueba `573000000001`.
+- [x] Teléfono emisor del daemon Baileys vinculado en entorno de prueba: `573000000002`.
 - [x] Feature flag activado únicamente para la ventana de prueba supervisada (`AGENTIC_2A_ENABLED=true`).
 - [x] Autoridad de despacho restringida al CRM/Baileys (Capa 2A devolvió `replyText` por HTTP; cero despachos directos de socket desde 2A).
 - [x] Mensaje `"PRECIO"` procesado exitosamente por regla determinística sin invocar el LLM del CRM.
@@ -152,22 +152,21 @@ Si durante la prueba supervisada ocurre cualquier anomalía:
 
 ---
 
-## 8. Certificación y Cierre del Hito 2A: Piloto Real Supervisado
+## 8. Certificación y Cierre del Hito 2A: Piloto Supervisado
 
 * **Fecha de Ejecución:** 24 de Octubre de 2026.
 * **Actores de la Interacción:**
-  * **Cliente remitente:** Johan Bravo (`+57 301 754 3786`, E.164 canónico: `573017543786`).
-  * **Emisor empresarial (Daemon Baileys):** `+57 316 330 1286` (`573163301286`).
+  * **Cliente remitente:** Contacto de prueba (`573000000001`).
+  * **Emisor empresarial (Daemon Baileys):** Número de prueba (`573000000002`).
 * **Mensaje de Prueba:** `"PRECIO"`.
-* **Mapeo de Identidad WhatsApp (LID):** WhatsApp Web entregó el mensaje con LID `215779257634953@lid`. El daemon Baileys resolvió en disco `lid-mapping-215779257634953_reverse.json` obteniendo `573017543786`.
-* **Validación de Seguridad Allowlist:** El puente en `agentic-2a-bridge.ts` autorizó la petición al coincidir con `AGENTIC_2A_PILOT_ALLOWLIST="3017543786"`.
+* **Validación de Seguridad Allowlist:** El puente en `agentic-2a-bridge.ts` autorizó la petición al coincidir con allowlist.
 * **Firma HMAC & Timestamp:** Petición HTTP POST firmada con HMAC-SHA256 y verificada por Capa 2A dentro de la ventana de tolerancia de 300 segundos.
 * **Latencia Registrada:** `321 ms` de extremo a extremo (`POST /api/whatsapp/auto-reply 200 in 321ms`).
 * **Respuesta Generada y Despachada (Single-Responder):**
   * Capa 2A devolvió el catálogo determinista en el cuerpo JSON (`replyText`).
   * El CRM inhibió por completo su LLM local y entregó el texto al daemon.
   * El daemon Baileys ejecutó `sendWhatsAppMessage` al socket una sola vez (cero mensajes duplicados).
-* **Persistencia Atómica en `clones/albra-agentic-2a/db/operational.db`:**
+* **Persistencia Atómica en `WHATSPOWER/db/operational.db`:**
   * Lock conversacional adquirido: `state: 'IN_FLOW_2A'`, `expires_at: 1792831216` (TTL 15 min).
   * Clave de idempotencia registrada: `evt_crm_1792830316109_3cxot`.
 * **Observación Registrada para Aclaración:**

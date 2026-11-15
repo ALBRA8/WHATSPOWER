@@ -1,11 +1,11 @@
 # WHATSPOWER (Nivel 2 ALBRA) — Automatización Conversacional y Flujos Visuales
 
-> **Paridad 100% ManyChat para el Ecosistema CRM ALBRA**  
+> **Motor Conversacional y Automatizaciones Avanzadas para el Ecosistema CRM ALBRA**  
 > Diseñado bajo metodología Clean-Room / ClonaKit. Opera de forma modular como un "enchufe" ("anillo al dedo") con **CRM-ALBRA (Nivel 1)** y colabora de forma transparente con **WHATSPOWER-ULTRA (Nivel 3)**.
 
 ---
 
-## 🚀 Capacidades Principales (ManyChat 100% Parity)
+## 🚀 Capacidades Principales de Automatización Conversacional
 
 1. **Flow Builder Visual e Interactivo (`/studio`)**:
    - Constructor no-code de diagramas de flujo conversacionales tipo nodo.
@@ -68,4 +68,4 @@ Abrir en el navegador:
 ```bash
 npm test
 ```
-Ejecuta la suite completa de 31+ pruebas unitarias y de integración que verifican la paridad 100% ManyChat, persistencia SQLite, locks JIT y fallbacks fail-closed.
+Ejecuta la suite completa de 38 suites y 250 pruebas automatizadas que verifican flujos interactivos, persistencia SQLite, locks JIT, consentimiento Ley 1581 y fallbacks fail-closed.
