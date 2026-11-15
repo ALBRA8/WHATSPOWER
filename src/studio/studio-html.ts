@@ -4,7 +4,7 @@ export function renderStudioHtml(): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsPower Flow Studio — Clon ManyChat 100%</title>
+  <title>WhatsPower Flow Studio — Diseñador de Flujos</title>
   <style>
     :root {
       --bg: #090d16;
@@ -94,7 +94,7 @@ export function renderStudioHtml(): string {
       <div>
         <div class="brand-title">WhatsPower Flow Studio</div>
       </div>
-      <span class="brand-sub">Nivel 2 · Paridad ManyChat 100%</span>
+      <span class="brand-sub">Nivel 2 · Flujos conversacionales</span>
     </div>
 
     <div class="actions-bar">
@@ -106,7 +106,7 @@ export function renderStudioHtml(): string {
   <div class="workspace">
     <!-- Palette -->
     <div class="palette">
-      <div class="palette-title">Catálogo Nodos ManyChat</div>
+      <div class="palette-title">Catálogo de Nodos</div>
       <div class="palette-item" onclick="addNode('send_message')">
         <div class="palette-icon" style="background:#1e3a8a;">💬</div>
         <span>Enviar Mensaje</span>
@@ -154,7 +154,7 @@ export function renderStudioHtml(): string {
     <div class="simulator">
       <div class="sim-header">
         <div class="sim-title">
-          <span>📱 Simulador ManyChat</span>
+          <span>📱 Simulador de Conversación</span>
           <span class="sim-badge">En Vivo</span>
         </div>
         <button class="btn-secondary" style="padding:2px 6px; font-size:10px;" onclick="clearSim()">Reiniciar</button>
@@ -162,7 +162,7 @@ export function renderStudioHtml(): string {
 
       <div class="sim-phone" id="simPhone">
         <div class="sim-bubble sim-bubble-in" style="align-self:center; background:#182229; font-size:10px; color:#8696a0; text-align:center;">
-          🔒 Simulación ManyChat en vivo. Escribe <strong>"PRECIO"</strong> o <strong>"INFO"</strong> para iniciar.
+          🔒 Simulación de conversación en vivo. Escribe <strong>"PRECIO"</strong> o <strong>"INFO"</strong> para iniciar.
         </div>
       </div>
 
