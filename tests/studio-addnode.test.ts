@@ -31,6 +31,7 @@ test('STUDIO-ADDNODE-2: todo tipo de nodo creado por la paleta es un FlowNodeTyp
   // Tipos válidos según src/engine/flow-types.ts (FlowNodeType)
   const VALID_NODE_TYPES = new Set([
     'trigger', 'send_message', 'user_input', 'condition', 'action', 'crm_action', 'ab_split', 'handoff',
+    'delay', 'smart_delay', 'goto_flow', 'ai_response',
   ])
   // Extraer el mapeo clave → tipo servido:  '<clave>': { ... type: '<tipo>' ...
   for (const key of paletteCalls) {

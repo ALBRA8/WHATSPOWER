@@ -8,6 +8,22 @@ import type { TransportSender, TransportSendResult, DispatchOutcome, OutboundMed
  * se reporta en `degraded` para observabilidad.
  */
 export function renderMediaAsText(text: string, media?: OutboundMedia): { text: string; degraded: string[] } {
+  // (ronda 17, paso 1) Plantilla HSM: el proxy Baileys y el simulador NO soportan
+  // plantillas nativas. Se degrada EXPLÍCITAMENTE: el nombre + parámetros viajan
+  // como texto y se anota en degraded (nada se pierde silenciosamente).
+  if (media?.template) {
+    const t = media.template
+    // Siempre incluir el nombre de la plantilla aunque `text` no esté vacío: el
+    // transporte que recibe la degradación necesita saber qué plantilla era.
+    let out = text ? `${text}\n[plantilla: ${t.name}]` : `[plantilla: ${t.name}]`
+    const degraded: string[] = [`plantilla_hsm_degradada_a_texto (${t.name}): transporte sin soporte nativo de plantillas`]
+    if (t.languageCode) out += ` [lang: ${t.languageCode}]`
+    for (const c of t.components ?? []) {
+      const params = c.parameters.map((p) => String((p as { text?: string }).text ?? JSON.stringify(p))).join(', ')
+      out += `\n[${c.type}${typeof c.index === 'number' ? `/${c.index}` : ''}]: ${params}`
+    }
+    return { text: out, degraded }
+  }
   const hasMedia = Boolean(media?.mediaUrl)
   const buttons = media?.buttons ?? []
   if (!hasMedia && buttons.length === 0) return { text, degraded: [] }

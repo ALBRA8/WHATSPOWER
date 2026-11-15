@@ -19,7 +19,6 @@ export interface AgentAssignment {
 
 export class TeamManager {
   private db: DatabaseSync
-  private lastAssignedIndex: number = -1
 
   constructor(db: DatabaseSync) {
     this.db = db
@@ -64,7 +63,9 @@ export class TeamManager {
   }
 
   /**
-   * Asignación Round-Robin equitativa entre los agentes activos
+   * Asignación Round-Robin equitativa entre los agentes activos.
+   * Stateless: selecciona al agente con el MAX(assigned_at) más antiguo (o ninguno),
+   * así sobrevive restarts sin perder el orden de rotación.
    */
   assignRoundRobin(orgId: string, contactPhone: string): Agent | null {
     const existing = this.getAssignment(orgId, contactPhone)
@@ -87,10 +88,24 @@ export class TeamManager {
     const agents = this.getActiveAgents(orgId)
     if (agents.length === 0) return null
 
-    this.lastAssignedIndex = (this.lastAssignedIndex + 1) % agents.length
-    const selectedAgent = agents[this.lastAssignedIndex]
-    const now = Math.floor(Date.now() / 1000)
+    // Elige al agente cuya última asignación OPEN sea la más antigua
+    // (o sin asignaciones previas -> time 0). Empate: gana el primero en el orden
+    // de getActiveAgents (created_at ASC), reproduciendo round-robin estable.
+    let selectedAgent = agents[0]
+    let oldestTime = Infinity
 
+    for (const ag of agents) {
+      const last = this.db.prepare(`
+        SELECT MAX(assigned_at) AS last_time FROM agent_assignments WHERE agent_id = ?
+      `).get(ag.id) as { last_time: number | null } | undefined
+      const time = last?.last_time ?? 0
+      if (time < oldestTime) {
+        oldestTime = time
+        selectedAgent = ag
+      }
+    }
+
+    const now = Math.floor(Date.now() / 1000)
     this.db.prepare(`
       INSERT OR REPLACE INTO agent_assignments (organization_id, contact_phone, agent_id, assigned_at, status)
       VALUES (?, ?, ?, ?, 'OPEN')

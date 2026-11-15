@@ -8,7 +8,7 @@ import { MockCrmClient } from '../src/adapters/crm-client.ts'
 
 process.env.TRANSPORT = 'mock'
 process.env.ALLOW_MOCK_TRANSPORT = 'true'
-process.env.INTERNAL_API_SECRET = 'smoke_dashboard_internal_secret_24chars'
+process.env.INTERNAL_API_SECRET = 'smoke_dashboard_internal_secret_24chars' // scan-secrets:allow
 process.env.ORG_SERVICE_CREDENTIALS = 'org_smoke:org_smoke_service_credential_16ch'
 
 const transport = new MockTransportSender()

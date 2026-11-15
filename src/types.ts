@@ -87,11 +87,41 @@ export interface TransportSendResult {
  * transporte intenta entregar en formato NATIVO cuando el proveedor lo soporta.
  * Los campos son opcionales; un transporte que no soporte una característica
  * degrada EXPLÍCITAMENTE (degraded) sin perder el contenido.
+ *
+ * (ronda 17, paso 1 — transporte Meta real) `template` permite enviar plantillas
+ * HSM aprobadas por Meta (necesarias fuera de la ventana de 24h). Cuando está
+ * presente, el transporte Meta Cloud construye un payload `type: 'template'`
+ * con `name`, `language.code` y `components` (parámetros de header/body/buttons).
+ * Los transportes sin soporte nativo de plantillas (proxy Baileys, simulador)
+ * degradan explícitamente: el nombre y los parámetros viajan como texto y se
+ * anota en `degraded`.
  */
+export interface OutboundTemplate {
+  /** Nombre de la plantilla aprobada en el WABA de la organización. */
+  name: string
+  /** Código de idioma ISO (ej. 'es_CO', 'en_US'). Default: 'es_CO'. */
+  languageCode?: string
+  /** Parámetros por componente (header/body/button). Cada uno: { type: 'text'|'currency'|'date_time'|'image'|'document', text?: string, ... }. */
+  components?: Array<{
+    type: 'header' | 'body' | 'button'
+    sub_type?: 'url' | 'quick_reply' | 'catalog'
+    index?: number
+    parameters: Array<Record<string, unknown>>
+  }>
+}
+
 export interface OutboundMedia {
   mediaUrl?: string
   mediaType?: 'image' | 'audio' | 'video' | 'document'
   buttons?: Array<{ title: string; url?: string }>
+  /**
+   * (ronda 17, paso 1) Plantilla HSM aprobada por Meta. Si está presente, el
+   * transporte Meta Cloud construye el payload `type: 'template'` e ignora
+   * mediaUrl/buttons (la plantilla define su propio contenido). El `text`
+   * pasado a sendMessage se usa sólo como fallback para transportes que no
+   * soportan plantillas.
+   */
+  template?: OutboundTemplate
 }
 
 export interface TransportSender {
