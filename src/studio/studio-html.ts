@@ -326,6 +326,54 @@ export function renderStudioHtml(): string {
       renderEdges();
     }
 
+    // (producción real F6) La paleta anuncaba 7 nodos pero addNode NO existía:
+    // el clic lanzaba ReferenceError y jamás aparecía el nodo en el lienzo.
+    // Defaults por clave de paleta; el tipo debe ser un FlowNodeType válido del
+    // motor (la paleta usa 'action_tag' como clave comercial, el motor espera
+    // type 'action'). Si no hay flujo seleccionado se crea un borrador local
+    // (se persiste con "Guardar y Activar").
+    const NODE_PALETTE_DEFAULTS = {
+      'send_message': { title: 'Enviar Mensaje', data: { messageText: '' } },
+      'user_input': { title: 'Captura User Input', data: { inputPrompt: '', saveToCustomField: '' } },
+      'condition': { title: 'Bifurcación Condición', data: { rules: [] } },
+      'action_tag': { type: 'action', title: 'Etiquetar (Tag)', data: { actionType: 'add_tag', tag: '' } },
+      'crm_action': { title: 'Acción CRM ALBRA', data: { crmAction: 'add_note', crmParams: {} } },
+      'ab_split': { title: 'Split Test A/B', data: { splitRatio: 50 } },
+      'handoff': { title: 'Handoff a Asesor', data: {} },
+    };
+    function addNode(paletteKey) {
+      const def = NODE_PALETTE_DEFAULTS[paletteKey];
+      if (!def) return;
+      if (!currentFlow) {
+        const draft = {
+          id: 'flow_' + Date.now(),
+          name: 'Flujo sin título',
+          triggerKeywords: [],
+          isActive: false,
+          nodes: [],
+          edges: [],
+        };
+        currentFlow = draft;
+        flowsList.push(draft);
+        const sel = document.getElementById('flowSelect');
+        const opt = document.createElement('option');
+        opt.value = draft.id;
+        opt.textContent = draft.name + ' (borrador sin guardar)';
+        sel.appendChild(opt);
+        sel.value = draft.id;
+      }
+      const index = currentFlow.nodes.length;
+      const node = {
+        id: 'n' + (index + 1) + '_' + Math.random().toString(36).slice(2, 7),
+        type: def.type || paletteKey,
+        title: def.title,
+        position: { x: 40 + (index % 4) * 210, y: 40 + Math.floor(index / 4) * 150 },
+        data: JSON.parse(JSON.stringify(def.data)),
+      };
+      currentFlow.nodes.push(node);
+      renderCanvas();
+    }
+
     function renderEdges() {
       const svg = document.getElementById('edgesSvg');
       svg.innerHTML = '';
