@@ -1,5 +1,42 @@
 # AUDIT_REPORT — WHATSPOWER
 
+## Actualización 2026-11-15 — Producción real (rama `repair/produccion-real`)
+
+**Método:** línea base completa ejecutada sobre la rama (que ya traía FASE 1-4 de la sesión anterior re-verificadas en verde), hallazgos corregidos con prueba que falla antes y pasa después, E2E con los 3 servicios reales en simulación y prueba de studios en navegador real.
+
+### Línea base (ejecutada en esta sesión)
+| Verificación | Resultado |
+|---|---|
+| `tsc --noEmit` | 0 errores |
+| Suite (node:test) | **253/253** en 38 suites (incluye fase1 Meta Cloud, fase2 Ley 1581, ventana 24h, transporte por plan, H1-H6) |
+| `npm audit` | 0 vulnerabilidades |
+| `security:scan` (árbol) | LIMPIO (exit 0) |
+| `security:scan:history` | LIMPIO (exit 0): 91 hallazgos históricos verificados uno a uno como fixtures dummy de test; baseline + allowlist explícitas |
+
+### Hallazgos de esta sesión
+
+| ID | Severidad | Descripción | Estado | Evidencia |
+|---|---|---|---|---|
+| F6-W1 | ALTA | Flow Studio: paleta llamaba `addNode(...)` que no existía (ReferenceError; "addNode pendiente" de la orden original) | ✅ CORREGIDO | `tests/studio-addnode.test.ts` 3/3 (fallaban antes del fix); navegador real: nodo añadido al lienzo (8→9) |
+| F6-W2 | MEDIA | Tipo de nodo inválido `action_tag` (el motor espera `action`) | ✅ CORREGIDO | Mapeo en `NODE_PALETTE_DEFAULTS` verificado contra FlowNodeType (STUDIO-ADDNODE-2) |
+| F6-W3 | BAJA | Afirmaciones de paridad "ManyChat 100%" en el HTML del studio (contradecían la higiene de docs) | ✅ CORREGIDO | Título y etiquetas renombrados; suite 253/253 |
+| F6-W4 | BAJA | WP sin escáner de secretos propio | ✅ CORREGIDO | `scripts/scan-secrets.mjs` + npm scripts; árbol e historial en verde con baseline verificable |
+
+### E2E 3 servicios reales (18/18 PASS, simulación, cero envíos reales)
+- Inbound del puente CRM (webhook Meta firmado → CRM valida → HMAC v2 → `/api/inbound`) procesado por WP; el flujo con trigger keyword ejecutó `crm_action create_client` y el cliente quedó creado en el CRM real.
+- Lock `IN_FLOW_2A` creado por mensaje entrante real; el checker de ULTRA consultó `GET /api/internal/locks/:phone` y excluyó el contacto (`LOCK_EXCLUDED`).
+- Consentimiento por organización operativo (endpoint FASE 2 usado por el E2E: 201).
+- `SENT=0` en toda la campaña ULTRA (salvaguarda intacta).
+
+### Studios en navegador (Playwright/Chromium, 11/11 PASS)
+Flow Studio: carga 200, paleta 7 nodos, addNode funcional, móvil 390px sin desbordamiento. (Campaign Studio de ULTRA: Historial y métricas presentes.)
+
+### Pendientes (no bloqueados por código)
+- Docker compose en el PC del dueño (sin docker aquí) → `OWNER_TODO.md` §4.
+- Cuenta Meta Business + número oficial + plantillas aprobadas → `OWNER_TODO.md` §2.
+
+---
+
 ## Segunda reparación integral — 2026-11-06 (rama `fix/segunda-reparacion-integral`)
 
 Nueva orden de trabajo (fase 2). Causas raíz corregidas y evidencia por bloque:

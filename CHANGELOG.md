@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## 2026-11-15 — Producción real: verificación total, escáner de historial, addNode del studio (rama repair/produccion-real)
+
+### Corregido (con prueba ejecutada)
+- **Flow Studio `addNode` (hallazgo F6):** la paleta llamaba una función inexistente (ReferenceError; el nodo jamás aparecía). Implementada con defaults por tipo, mapeo `action_tag`→`action` (tipo inválido) y creación de borrador si no hay flujo. Pruebas `tests/studio-addnode.test.ts` (3, fallaban antes, pasan después); evidencia en navegador real: clic añade nodo al lienzo (8→9).
+- **Higiene studio:** retiradas las afirmaciones "Paridad ManyChat 100%" / "Clon ManyChat 100%" del título y etiquetas del Flow Studio.
+
+### Seguridad
+- **Escáner de secretos árbol+historial** portado desde CRM (`scripts/scan-secrets.mjs` + `npm run security:scan[:history]`): 91 hallazgos del historial verificados uno a uno como fixtures dummy de test (0 secretos reales) → baseline + allowlist explícitas; ambos modos exit 0.
+
+### Verificación total de esta sesión
+- Suite: **253/253** (38 suites, incluye fase1/fase2/consent/transporte/ventana/H1-H6) · tsc 0 errores · `npm audit` 0 vulnerabilidades.
+- **E2E de los 3 servicios reales juntos** (18/18 PASS): WP recibió el inbound del puente CRM (HMAC v2), ejecutó el flujo con crm_action y el cliente quedó creado en el CRM real; el checker de locks 2B→2A excluyó el contacto con lock (`LOCK_EXCLUDED`).
+- Studios en navegador (Playwright 11/11): carga, paleta, addNode real, Historial/métricas (ULTRA), vista móvil 390px sin desbordamiento.
+
+### Límites honestos
+- Docker compose NO ejecutado (sin docker en el entorno; OWNER_TODO §4). Ningún envío real; ALLOW_REAL_DISPATCH=false en todas las pruebas.
+
+
 ## 2026-11-15 — Preparación para Producción Real (rama repair/produccion-real)
 
 ### Fase 1 — Canal Oficial de WhatsApp
