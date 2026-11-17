@@ -32,15 +32,20 @@ interface Resp {
 function req(
   port: number,
   path: string,
-  method: 'GET' | 'POST' = 'GET'
+  method: 'GET' | 'POST' = 'GET',
+  opts: { cookie?: string; body?: string; headers?: Record<string, string> } = {}
 ): Promise<Resp> {
   return new Promise((resolve, reject) => {
-    const r = request(`http://127.0.0.1:${port}${path}`, { method }, (res) => {
+    const headers: Record<string, string> = { ...(opts.headers || {}) }
+    if (opts.cookie) headers['Cookie'] = opts.cookie
+    if (opts.body) headers['Content-Type'] = 'application/json'
+    const r = request(`http://127.0.0.1:${port}${path}`, { method, headers }, (res) => {
       let data = ''
       res.on('data', (c) => (data += c))
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }))
     })
     r.on('error', reject)
+    if (opts.body) r.write(opts.body)
     r.end()
   })
 }
@@ -50,9 +55,13 @@ function bootServer(): { server: ReturnType<typeof createAgenticServer>['server'
   const prevInternal = process.env.INTERNAL_API_SECRET
   const prevKeys = process.env.INTERNAL_API_KEYS
   const prevAllowMock = process.env.ALLOW_MOCK_TRANSPORT
+  const prevTransport = process.env.TRANSPORT
   process.env.INTERNAL_API_SECRET = INTERNAL_SECRET
   delete process.env.INTERNAL_API_KEYS
   process.env.ALLOW_MOCK_TRANSPORT = 'true'
+  // En producción el arranque exige una decisión explícita de TRANSPORT;
+  // el subtest de 403-en-producción la toma aquí (mock permitido solo para tests).
+  if (process.env.TRANSPORT === undefined) process.env.TRANSPORT = 'mock'
   const { server } = createAgenticServer({ dbPath: ':memory:' })
   return {
     server,
@@ -61,6 +70,7 @@ function bootServer(): { server: ReturnType<typeof createAgenticServer>['server'
       if (prevInternal === undefined) delete process.env.INTERNAL_API_SECRET; else process.env.INTERNAL_API_SECRET = prevInternal
       if (prevKeys === undefined) delete process.env.INTERNAL_API_KEYS; else process.env.INTERNAL_API_KEYS = prevKeys
       if (prevAllowMock === undefined) delete process.env.ALLOW_MOCK_TRANSPORT; else process.env.ALLOW_MOCK_TRANSPORT = prevAllowMock
+      if (prevTransport === undefined) delete process.env.TRANSPORT; else process.env.TRANSPORT = prevTransport
     },
   }
 }
@@ -176,6 +186,115 @@ test('ECOSISTEMA — /studio/login-ecosystem (canje SSO de un solo uso)', async 
       // sin cuerpo → credencial inválida, pero la ruta EXISTE y responde 401 (no 404)
       assert.equal(res.status, 401, 'el login clásico del Studio no se ve afectado')
     } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      restore()
+    }
+  })
+
+  await t.test('8. CADENA DE ACEPTACIÓN: canje → cookie → GET /api/flows responde 200 (no 401)', async () => {
+    const { server, restore } = bootServer()
+    process.env.ECOSYSTEM_SSO_SECRET = SSO_SECRET
+    const port = await listenEphemeral(server)
+    try {
+      const token = signEcosystemToken(SSO_SECRET)
+      const redemption = await req(port, `/studio/login-ecosystem?token=${encodeURIComponent(token)}`)
+      assert.equal(redemption.status, 302)
+      const cookiePair = String(redemption.headers['set-cookie']).split(';')[0]
+      assert.ok(cookiePair.startsWith('wp_2a_studio_session='), 'cookie de sesión emitida por el canje')
+      // Con la cookie del canje y org 'default' (lo que el Studio fija por SSO
+      // SIN preguntar), el listado de flujos responde 200 — este es exactamente
+      // el paso 5 del guion de aceptación del dueño.
+      const flows = await req(port, '/api/flows', 'GET', {
+        cookie: cookiePair,
+        headers: { 'X-Org-Id': 'default' },
+      })
+      assert.equal(flows.status, 200, 'la sesión del canje autoriza /api/flows')
+      assert.ok(Array.isArray(JSON.parse(flows.body)), 'el body es un listado JSON de flujos')
+      // Y sin cookie sigue 401: la sesión es la única llave, jamás el token suelto.
+      const anon = await req(port, '/api/flows', 'GET', { headers: { 'X-Org-Id': 'default' } })
+      assert.equal(anon.status, 401)
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      restore()
+    }
+  })
+
+  await t.test('9. Fallo del canje responde PÁGINA HTML con motivo y “Volver al CRM”', async () => {
+    const { server, restore } = bootServer()
+    process.env.ECOSYSTEM_SSO_SECRET = SSO_SECRET
+    const port = await listenEphemeral(server)
+    try {
+      // Reutilizado → 403 con HTML: motivo “ya fue utilizado” + botón volver.
+      const token = signEcosystemToken(SSO_SECRET)
+      await req(port, `/studio/login-ecosystem?token=${encodeURIComponent(token)}`)
+      const replay = await req(port, `/studio/login-ecosystem?token=${encodeURIComponent(token)}`)
+      assert.equal(replay.status, 403)
+      assert.ok(String(replay.headers['content-type']).includes('text/html'), 'la respuesta de fallo es HTML, no JSON crudo')
+      assert.ok(replay.body.includes('ya fue utilizado'), 'el motivo (enlace ya usado) es visible para el dueño')
+      assert.ok(replay.body.includes('Volver al CRM'), 'hay camino de salida hacia el CRM')
+      // Caducado → 403 con HTML: motivo “caducado”.
+      const expired = signEcosystemToken(SSO_SECRET, Date.now() - 10 * 60_000)
+      const exp = await req(port, `/studio/login-ecosystem?token=${encodeURIComponent(expired)}`)
+      assert.equal(exp.status, 403)
+      assert.ok(exp.body.includes('caducado'), 'el motivo (TTL de 90 s) es visible')
+      // Sin secreto → 404 con HTML: fail-closed explicado.
+      delete process.env.ECOSYSTEM_SSO_SECRET
+      const unconfigured = await req(port, '/studio/login-ecosystem?token=x')
+      assert.equal(unconfigured.status, 404)
+      assert.ok(String(unconfigured.headers['content-type']).includes('text/html'))
+      assert.ok(unconfigured.body.includes('no configurado'), 'el fail-closed se explica, no se oculta')
+      assert.equal(unconfigured.headers['set-cookie'], undefined, 'sin secreto jamás se emite sesión')
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      restore()
+    }
+  })
+
+  await t.test('10. POST /studio/login-demo (paridad 2B): habilitado SOLO fuera de producción', async () => {
+    const { server, restore } = bootServer()
+    const prevNodeEnv = process.env.NODE_ENV
+    const prevDemo = process.env.DEMO_MODE
+    try {
+      // (a) dev + DEMO_MODE=true → 200 + cookie HttpOnly + sesión operativa.
+      process.env.NODE_ENV = 'development'
+      process.env.DEMO_MODE = 'true'
+      let port = await listenEphemeral(server)
+      const ok = await req(port, '/studio/login-demo', 'POST', { body: '{}' })
+      assert.equal(ok.status, 200, 'demo concedido en dev con DEMO_MODE=true')
+      const cookiePair = String(ok.headers['set-cookie']).split(';')[0]
+      assert.ok(cookiePair.startsWith('wp_2a_studio_session='))
+      assert.ok(String(ok.headers['set-cookie']).includes('HttpOnly'))
+      const flows = await req(port, '/api/flows', 'GET', { cookie: cookiePair, headers: { 'X-Org-Id': 'default' } })
+      assert.equal(flows.status, 200, 'la sesión demo autoriza /api/flows')
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+
+      // (b) producción → 403 SIEMPRE (aunque DEMO_MODE=true): puerta intacta.
+      // La ruta comprueba NODE_ENV al recibir la petición: se arranca en dev y
+      // se pone NODE_ENV=production ANTES del POST (el arranque completo en
+      // producción ya se cubre en security-hardening / productionConfigProblems).
+      const { server: server2, restore: restore2 } = bootServer()
+      process.env.NODE_ENV = 'production'
+      process.env.DEMO_MODE = 'true'
+      port = await listenEphemeral(server2)
+      const blocked = await req(port, '/studio/login-demo', 'POST', { body: '{}' })
+      assert.equal(blocked.status, 403, 'el demo anónimo jamás entra en producción')
+      assert.equal(blocked.headers['set-cookie'], undefined)
+      process.env.NODE_ENV = 'development'
+      await new Promise<void>((resolve) => server2.close(() => resolve()))
+      restore2()
+
+      // (c) dev sin DEMO_MODE → 403.
+      process.env.NODE_ENV = 'development'
+      delete process.env.DEMO_MODE
+      const { server: server3, restore: restore3 } = bootServer()
+      port = await listenEphemeral(server3)
+      const off = await req(port, '/studio/login-demo', 'POST', { body: '{}' })
+      assert.equal(off.status, 403, 'sin DEMO_MODE=true el demo no se ofrece')
+      await new Promise<void>((resolve) => server3.close(() => resolve()))
+      restore3()
+    } finally {
+      if (prevNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = prevNodeEnv
+      if (prevDemo === undefined) delete process.env.DEMO_MODE; else process.env.DEMO_MODE = prevDemo
       await new Promise<void>((resolve) => server.close(() => resolve()))
       restore()
     }

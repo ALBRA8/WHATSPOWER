@@ -91,6 +91,16 @@ HMAC-SHA256, TTL 90 s) que se canjea en `GET /studio/login-ecosystem` (302 al St
 HttpOnly). Fail-closed: sin el secreto configurado la ruta NO existe (404). El login clásico
 (`/studio/login`) y sus reglas quedan intactos. Pruebas: `tests/ecosystem-login.test.ts`.
 
+### 3.c. Pantalla de acceso real y modo demo (2026-11-17)
+El Studio ya NO usa `window.prompt` bloqueante (antes dejaba el body vacío al cancelar y pedía
+la organización con un segundo prompt): ahora muestra una PANTALLA DE ACCESO con el secreto
+clásico, un botón "Probar en modo demo (sin registro)" —solo con `DEMO_MODE=true` y FUERA de
+producción, `POST /studio/login-demo` responde 403 SIEMPRE en producción— y un enlace
+"Volver al CRM" (`CRM_BASE_URL`). La organización SOLO se pide en el login clásico; por SSO o
+demo se fija `default` sin preguntar. Un fallo del canje SSO (403/404/429) responde una página
+HTML con el motivo (caducado / ya usado / no configurado) y el enlace para reintentar desde el
+CRM. Pruebas: `tests/ecosystem-login.test.ts` (cadena completa de aceptación incluida).
+
 ### 4. Pruebas Automatizadas
 ```bash
 npm test

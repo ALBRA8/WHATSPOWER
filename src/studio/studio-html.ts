@@ -1,4 +1,10 @@
 export function renderStudioHtml(): string {
+  // (2026-11-17) Config de la pantalla de acceso, inyectada desde el servidor:
+  // el enlace de vuelta al CRM (CRM_BASE_URL, por defecto 127.0.0.1:3000) y si
+  // el modo demo está disponible (DEMO_MODE=true FUERA de producción). Ningún
+  // valor secreto viaja al HTML.
+  const crmUrl = (process.env.CRM_BASE_URL || 'http://127.0.0.1:3000').replace(/[^A-Za-z0-9:/._\-?=&]/g, '').replace(/\/$/, '')
+  const demoEnabled = process.env.NODE_ENV !== 'production' && String(process.env.DEMO_MODE || '').toLowerCase() === 'true'
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -227,8 +233,14 @@ export function renderStudioHtml(): string {
   // responde con cookie HttpOnly + SameSite=Strict. El secreto JAMÁS toca
   // sessionStorage (antes un XSS podía leerlo). La org del operador NO es
   // secreto y viaja como X-Org-Id en toda llamada /api/.
+  // (2026-11-17) Pantalla de acceso REAL (fin del window.prompt bloqueante):
+  // el gate ofrece el secreto clásico, el modo demo (si está habilitado) y
+  // volver al CRM. La organización SOLO se pide en el login clásico; por SSO
+  // del ecosistema o demo se fija 'default' sin preguntar nada.
   // ============================================================
   (function () {
+    const CRM_URL = ${JSON.stringify(crmUrl)};
+    const DEMO_ENABLED = ${demoEnabled ? 'true' : 'false'};
     const _fetch = window.fetch.bind(window);
     window.fetch = function (input, init) {
       try {
@@ -241,31 +253,78 @@ export function renderStudioHtml(): string {
       } catch (e) {}
       return _fetch(input, init);
     };
-    async function studioLogin() {
-      const k = window.prompt('Introduce el secreto administrativo (se canjea UNA vez por una cookie HttpOnly; jamás se guarda en JS):');
-      if (!k) {
-        document.body.innerHTML = '<p style="font-family:system-ui;padding:24px">Se requiere el secreto administrativo para usar el studio.</p>';
-        return;
-      }
+    function gate() { return document.getElementById('gate'); }
+    function setGateMsg(text, isError) {
+      var el = document.getElementById('gateMsg');
+      if (el) { el.textContent = text; el.style.color = isError ? '#f87171' : '#9ca3af'; }
+    }
+    function showGate(text) {
+      var g = gate();
+      if (!g) return;
+      if (text) setGateMsg(text, false);
+      var d = document.getElementById('gateDemo');
+      if (d) d.style.display = DEMO_ENABLED ? 'block' : 'none';
+      g.style.display = 'flex';
+      var s = document.getElementById('gateSecret');
+      if (s) s.focus();
+    }
+    function hideGate() { var g = gate(); if (g) g.style.display = 'none'; }
+    async function loginWithSecret() {
+      var input = document.getElementById('gateSecret');
+      var k = input ? input.value : '';
+      if (!k) { setGateMsg('Introduce el secreto administrativo (se canjea UNA vez por una cookie HttpOnly; jamás se guarda en JS).', true); return; }
       try {
-        const res = await _fetch('/studio/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret: k }) });
+        var res = await _fetch('/studio/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret: k }) });
         if (!res.ok) {
-          document.body.innerHTML = '<p style="font-family:system-ui;padding:24px">Credencial inválida. Recarga e inténtalo de nuevo.</p>';
+          setGateMsg(res.status === 429 ? 'Demasiados intentos. Espera un minuto e inténtalo de nuevo.' : 'Credencial administrativa inválida. Inténtalo de nuevo.', true);
           return;
         }
+        if (input) input.value = '';
+        // Login clásico: aquí (y SOLO aquí) se pide la organización. Valor
+        // saneado: la org no es secreta pero solo admite [A-Za-z0-9_-].
+        var orgInput = document.getElementById('gateOrg');
+        var org = ((orgInput && orgInput.value) || 'default').replace(/[^a-zA-Z0-9_-]/g, '') || 'default';
+        sessionStorage.setItem('wp_org', org);
+        hideGate();
+        if (typeof loadFlows === 'function') loadFlows();
       } catch (e) {
-        document.body.innerHTML = '<p style="font-family:system-ui;padding:24px">Error de red en el login.</p>';
-        return;
+        setGateMsg('Error de red en el login.', true);
+      }
+    }
+    async function loginDemo() {
+      try {
+        var res = await _fetch('/studio/login-demo', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        if (!res.ok) {
+          var d = {};
+          try { d = await res.json(); } catch (e) {}
+          setGateMsg((d && d.error) ? d.error : 'Modo demo no disponible.', true);
+          return;
+        }
+        // SSO/demo: la organización se fija a 'default' SIN preguntar.
+        sessionStorage.setItem('wp_org', 'default');
+        hideGate();
+        if (typeof loadFlows === 'function') loadFlows();
+      } catch (e) {
+        setGateMsg('Error de red en el login demo.', true);
       }
     }
     window.addEventListener('DOMContentLoaded', async function () {
+      var enter = document.getElementById('gateEnter');
+      var demo = document.getElementById('gateDemo');
+      var secret = document.getElementById('gateSecret');
+      if (enter) enter.addEventListener('click', loginWithSecret);
+      if (demo) demo.addEventListener('click', loginDemo);
+      if (secret) secret.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') loginWithSecret(); });
       try { await _fetch('/api/health'); } catch (e) {}
       const probe = await _fetch('/api/flows');
-      if (probe.status === 401) { await studioLogin(); }
-      if (!sessionStorage.getItem('wp_org')) {
-        const org = window.prompt('Organización de trabajo (X-Org-Id):', 'default');
-        sessionStorage.setItem('wp_org', (org || 'default').replace(/[^a-zA-Z0-9_-]/g, '') || 'default');
+      if (probe.status === 401) {
+        // Sin sesión (ni canje SSO del CRM ni cookie vigente): pantalla de
+        // acceso real — jamás un prompt bloqueante ni un body vacío.
+        showGate('Sesión no iniciada. Abre el Studio desde el botón Ecosistema del CRM o entra abajo.');
+        return;
       }
+      // Sesión vigente (p. ej. canje SSO del CRM): org 'default' sin preguntar.
+      if (!sessionStorage.getItem('wp_org')) sessionStorage.setItem('wp_org', 'default');
       loadFlows();
     });
   })();
@@ -942,6 +1001,31 @@ export function renderStudioHtml(): string {
 
     loadFlows();
   </script>
+
+  <!-- (2026-11-17) Pantalla de ACCESO real — sustituye al window.prompt
+       bloqueante que dejaba el body vacío al cancelar. Tres caminos: el
+       enlace del ecosistema del CRM (automático), el modo demo (si está
+       habilitado) y el secreto clásico. El secreto jamás se guarda en
+       sessionStorage: se canjea una sola vez por cookie HttpOnly. -->
+  <div id="gate" style="display:none; position:fixed; inset:0; background:rgba(3,7,18,0.92); z-index:9999; align-items:center; justify-content:center;">
+    <div style="background:#111827; border:1px solid #1f2937; border-radius:12px; padding:32px; width:380px; max-width:92vw; text-align:center;">
+      <div style="width:40px;height:40px;background:linear-gradient(135deg,#10b981,#2563eb);border-radius:8px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;">W</div>
+      <h2 style="font-size:17px;margin:0 0 8px;color:#fff;">WhatsPower Flow Studio</h2>
+      <p id="gateMsg" style="font-size:13px;color:#9ca3af;line-height:1.6;margin:0 0 18px;">Sesión no iniciada.</p>
+      <div style="text-align:left;margin-bottom:12px;">
+        <label for="gateOrg" style="font-size:11px;color:#6b7280;display:block;margin-bottom:4px;">Organización de trabajo (login clásico; por defecto: default)</label>
+        <input id="gateOrg" value="default" style="width:100%;padding:9px 10px;border-radius:6px;border:1px solid #374151;background:#1f2937;color:#fff;font-size:13px;" />
+      </div>
+      <div style="text-align:left;margin-bottom:14px;">
+        <label for="gateSecret" style="font-size:11px;color:#6b7280;display:block;margin-bottom:4px;">Secreto administrativo (login clásico)</label>
+        <input id="gateSecret" type="password" autocomplete="off" placeholder="Se canjea UNA vez por cookie HttpOnly" style="width:100%;padding:9px 10px;border-radius:6px;border:1px solid #374151;background:#1f2937;color:#fff;font-size:13px;" />
+      </div>
+      <button id="gateEnter" class="btn-primary" style="width:100%;padding:10px;border-radius:6px;font-size:13px;font-weight:600;">Entrar con secreto</button>
+      <button id="gateDemo" class="btn-secondary" style="width:100%;padding:10px;border-radius:6px;font-size:13px;font-weight:600;margin-top:8px;display:none;">Probar en modo demo (sin registro)</button>
+      <a href="${crmUrl}" style="display:block;margin-top:14px;font-size:13px;color:#60a5fa;text-decoration:none;">← Volver al CRM</a>
+      <p style="font-size:11px;color:#4b5563;margin-top:12px;">El botón Ecosistema del CRM abre esta capa con sesión lista, sin teclear el secreto.</p>
+    </div>
+  </div>
 </body>
 </html>`;
 }

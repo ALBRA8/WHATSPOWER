@@ -7,6 +7,7 @@ import { MockTransportSender, HttpAlbraTransportSender } from './adapters/transp
 import { MetaCloudOrgTransport } from './adapters/meta-cloud-org-transport.ts'
 import { MockCrmClient, HttpCrmClient } from './adapters/crm-client.ts'
 import { renderStudioHtml } from './studio/studio-html.ts'
+import { renderEcosystemErrorHtml, ecosystemErrorCopy } from './studio/ecosystem-error-html.ts'
 import { renderDashboardHtml, dashboardAsset } from './dashboard/dashboard-html.ts'
 import { handleDashboardApi } from './dashboard/dashboard-api.ts'
 import { TeamManager } from './state/team-manager.ts'
@@ -293,17 +294,25 @@ export function createAgenticServer(options?: {
     }
 
     // ==========================================================
-    // Acceso directo al ECOSISTEMA (2026-11-17): el CRM (capa 1) emite un
-    // enlace firmado (HMAC-SHA256, TTL 90 s, un solo uso) SOLO a sesiones
-    // autenticadas; al abrirlo aquí se concede la MISMA sesión de operador
-    // del Studio. NO es el login-demo anónimo (esa puerta queda intacta).
-    // Fail-closed: sin ECOSYSTEM_SSO_SECRET la ruta NO existe (404).
+    // Login DEMO del Studio (2026-11-17, paridad con 2B): entrada sin registro
+    // para probar la capa 2A desde la pantalla de acceso. Endurecida EXACTAMENTE
+    // igual que la de 2B: 403 SIEMPRE en producción (aunque DEMO_MODE=true),
+    // exige DEMO_MODE=true y credenciales administrativas configuradas, y
+    // comparte el MISMO rate limiter que el login clásico. Emite la MISMA
+    // cookie HttpOnly de sesión de operador (jamás expone el secreto).
     // ==========================================================
-    if (req.method === 'GET' && url.pathname === '/studio/login-ecosystem') {
-      const ssoSecret = process.env.ECOSYSTEM_SSO_SECRET
-      if (!ssoSecret) {
-        res.writeHead(404, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Not Found' }))
+    if (req.method === 'POST' && url.pathname === '/studio/login-demo') {
+      if (process.env.NODE_ENV === 'production') {
+        console.warn('[Seguridad 2A ALERTA] Intento de login-demo en PRODUCCIÓN (bloqueado)')
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Forbidden: el login demo está prohibido en producción' }))
+        return
+      }
+      const internalSecret = process.env.INTERNAL_API_SECRET
+      const demoEnabled = String(process.env.DEMO_MODE || '').toLowerCase() === 'true'
+      if (!demoEnabled || !internalSecret) {
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Modo demo no habilitado. Configura DEMO_MODE=true en .env' }))
         return
       }
       if (!studioLoginRate.allow(`studiologin:${clientKey(req)}`)) {
@@ -311,11 +320,47 @@ export function createAgenticServer(options?: {
         res.end(JSON.stringify({ error: 'Demasiados intentos. Inténtalo más tarde.' }))
         return
       }
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Set-Cookie': issueStudioSession(internalSecret),
+      })
+      res.end(JSON.stringify({ ok: true, sessionTtlSeconds: 3600, demo: true }))
+      return
+    }
+
+    // ==========================================================
+    // Acceso directo al ECOSISTEMA (2026-11-17): el CRM (capa 1) emite un
+    // enlace firmado (HMAC-SHA256, TTL 90 s, un solo uso) SOLO a sesiones
+    // autenticadas; al abrirlo aquí se concede la MISMA sesión de operador
+    // del Studio. NO es el login-demo anónimo (esa puerta queda intacta).
+    // Fail-closed: sin ECOSYSTEM_SSO_SECRET la ruta NO existe (404).
+    // (2026-11-17 bis) Los fallos (403/404/429) ahora responden UNA PÁGINA
+    // HTML con el motivo (caducado / ya usado / no configurado) y el enlace
+    // para reintentar desde el CRM: jamás un JSON crudo ni un body vacío.
+    // ==========================================================
+    if (req.method === 'GET' && url.pathname === '/studio/login-ecosystem') {
+      const ssoSecret = process.env.ECOSYSTEM_SSO_SECRET
+      if (!ssoSecret) {
+        const copy = ecosystemErrorCopy('ECOSYSTEM_SSO_SECRET no configurado (ruta deshabilitada)', false)
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(renderEcosystemErrorHtml(copy))
+        return
+      }
+      if (!studioLoginRate.allow(`studiologin:${clientKey(req)}`)) {
+        res.writeHead(429, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(renderEcosystemErrorHtml({
+          title: 'Demasiados intentos',
+          detail: 'Se alcanzó el límite de canjes por minuto (protección anti-abuso). Espera un momento y vuelve a abrir la capa desde el botón Ecosistema del CRM.',
+        }))
+        return
+      }
       const verdict = verifyEcosystemToken(String(url.searchParams.get('token') || ''), ssoSecret)
       if (!verdict.ok || !ecosystemJti.claim(verdict.payload.jti)) {
+        const jtiUsed = verdict.ok // verdict.ok=true aquí significa que el jti ya se había canjeado
         console.warn(`[Seguridad 2A ALERTA] Canje ecosystem rechazado: ${verdict.ok ? 'jti ya utilizado' : verdict.reason} (IP: ${req.socket.remoteAddress})`)
-        res.writeHead(403, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Enlace de ecosistema inválido, expirado o ya utilizado' }))
+        const copy = ecosystemErrorCopy(verdict.ok ? 'jti ya utilizado' : verdict.reason, jtiUsed)
+        res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(renderEcosystemErrorHtml(copy))
         return
       }
       const internalSecret = process.env.INTERNAL_API_SECRET
