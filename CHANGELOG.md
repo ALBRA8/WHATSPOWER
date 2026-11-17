@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-11-17 — Acceso directo al ecosistema (SSO de un solo uso)
+
+- **`feat(studio)` (84d7232)**: `GET /studio/login-ecosystem` canjea enlaces SSO emitidos por el
+  CRM (capa 1) para abrir el studio con sesión de operador sin repetir credenciales:
+  - Token `v1.<payload>.<hmac>` — HMAC-SHA256 con `ECOSYSTEM_SSO_SECRET` compartido, TTL 90 s,
+    `jti` de UN SOLO USO (registro en memoria con purga perezosa), verificación timing-safe.
+  - Concesión: 302 a `/` con cookie HttpOnly de sesión del Studio (misma identidad que
+    `/studio/login` con `INTERNAL_API_SECRET`).
+  - Fail-closed: sin `ECOSYSTEM_SSO_SECRET` la ruta NO existe (404); sin credenciales
+    administrativas 503; rate limit compartido con el login del studio (10/min por IP).
+  - El login clásico y las puertas `/api/*` quedan intactos.
+  - Pruebas: `tests/ecosystem-login.test.ts` (8 aserciones). Suite: **318/318**.
+  - Docs: README §3.b, `.env.example` (`ECOSYSTEM_SSO_SECRET`).
+
+
 ## 2026-11-17 — Reparación de producción real (FASE 1.E + higiene + arquitectura)
 
 ### Seguridad / Privacidad — IA desactivada por defecto
