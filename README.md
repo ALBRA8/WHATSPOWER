@@ -57,6 +57,24 @@ WHATSAPP_DAEMON_URL=http://localhost:3002
 ALLOW_REAL_DISPATCH=false
 ```
 
+### 2.b. Inteligencia Artificial (nodo AI_RESPONSE) — DESACTIVADA POR DEFECTO
+
+El nodo `AI_RESPONSE` del Flow Builder puede generar respuestas con un proveedor de completions compatible con la API de OpenAI.
+
+> **Advertencia de privacidad**: al activar la IA, el **texto de las conversaciones de clientes** (prompt del nodo + contexto del contacto) se **transmite a un proveedor externo** (`AI_API_URL`, por defecto la API de OpenAI). Evalúa esta transmisión contra tu política de tratamiento de datos (Ley 1581 / Habeas Data) antes de activarla.
+
+La IA permanece **apagada por defecto** y **ninguna llamada HTTP a terceros ocurre** sin configuración explícita:
+
+```ini
+AI_API_KEY=          # credencial del proveedor — sin ella el nodo no llama a nadie (fallback honesto)
+AI_ENABLED=          # false apaga la IA aunque exista credencial
+AI_API_URL=          # endpoint chat/completions (default OpenAI)
+AI_MODEL=            # modelo por defecto (default gpt-4o-mini)
+AI_TIMEOUT_MS=       # timeout (default 20000)
+```
+
+Con la IA sin configurar, el nodo AI_RESPONSE continúa el flujo con un aviso explícito de indisponibilidad (jamás simula ser IA).
+
 ### 3. Ejecutar el Servidor y Flow Studio
 ```bash
 npm start

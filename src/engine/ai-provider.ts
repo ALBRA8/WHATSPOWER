@@ -121,11 +121,29 @@ export class UnconfiguredAiProvider implements AiCompletionProvider {
   }
 }
 
+/**
+ * (reparación 2026-11-17, FASE 1.E) La IA está DESACTIVADA POR DEFECTO.
+ *
+ * Regla de activación (todas deben cumplirse):
+ *  1. AI_ENABLED no está explícitamente en 'false' (el switch maestro puede
+ *     apagar la IA aunque exista credencial).
+ *  2. Existe credencial (AI_API_KEY no vacía).
+ *
+ * Sin ambas, el nodo AI_RESPONSE usa UnconfiguredAiProvider: CERO llamadas
+ * HTTP a terceros (el texto de las conversaciones de clientes jamás sale del
+ * servidor por descuido). Al activarla, el texto conversacional se transmite
+ * al proveedor externo configurado en AI_API_URL (ver .env.example y README).
+ */
+export function isAiEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  if (String(env.AI_ENABLED ?? '').trim().toLowerCase() === 'false') return false
+  const apiKey = env.AI_API_KEY
+  return Boolean(apiKey && typeof apiKey === 'string' && apiKey.trim() !== '')
+}
+
 /** Resuelve el proveedor por configuración de entorno (inyección para pruebas aparte). */
 export function resolveAiProvider(env: Record<string, string | undefined> = process.env): AiCompletionProvider {
-  const apiKey = env.AI_API_KEY
-  if (!apiKey || typeof apiKey !== 'string' || apiKey.trim() === '') {
+  if (!isAiEnabled(env)) {
     return new UnconfiguredAiProvider()
   }
-  return new OpenAiCompatibleProvider({ apiKey })
+  return new OpenAiCompatibleProvider({ apiKey: String(env.AI_API_KEY) })
 }
