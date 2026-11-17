@@ -35,6 +35,7 @@ import {
   productionConfigProblems,
   type InternalIdentity,
 } from './security.ts'
+import { verifyEcosystemToken, SingleUseJti } from './ecosystem-sso.ts'
 import {
   verifyOrgServiceCredential,
   extractOrgServiceAuth,
@@ -230,6 +231,8 @@ export function createAgenticServer(options?: {
   // limiter en memoria equivalentes eran código muerto con límites duplicados.
   const refRate = new RateLimiter(300, 60_000)
   const studioLoginRate = new RateLimiter(10, 60_000)
+  // (ecosistema 2026-11-17) jti de enlaces SSO del CRM: un solo canje por enlace
+  const ecosystemJti = new SingleUseJti()
   const qrRate = new RateLimiter(30, 60_000) // (integral §7): /qr/data 30/min por IP
   // (integral) Rate limiting deslizante para la puerta /api/* + purga periódica
   const rateLimiter = new SlidingRateLimiter()
@@ -286,6 +289,46 @@ export function createAgenticServer(options?: {
         'Set-Cookie': issueStudioSession(internalSecret),
       })
       res.end(JSON.stringify({ ok: true, sessionTtlSeconds: 3600 }))
+      return
+    }
+
+    // ==========================================================
+    // Acceso directo al ECOSISTEMA (2026-11-17): el CRM (capa 1) emite un
+    // enlace firmado (HMAC-SHA256, TTL 90 s, un solo uso) SOLO a sesiones
+    // autenticadas; al abrirlo aquí se concede la MISMA sesión de operador
+    // del Studio. NO es el login-demo anónimo (esa puerta queda intacta).
+    // Fail-closed: sin ECOSYSTEM_SSO_SECRET la ruta NO existe (404).
+    // ==========================================================
+    if (req.method === 'GET' && url.pathname === '/studio/login-ecosystem') {
+      const ssoSecret = process.env.ECOSYSTEM_SSO_SECRET
+      if (!ssoSecret) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Not Found' }))
+        return
+      }
+      if (!studioLoginRate.allow(`studiologin:${clientKey(req)}`)) {
+        res.writeHead(429, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Demasiados intentos. Inténtalo más tarde.' }))
+        return
+      }
+      const verdict = verifyEcosystemToken(String(url.searchParams.get('token') || ''), ssoSecret)
+      if (!verdict.ok || !ecosystemJti.claim(verdict.payload.jti)) {
+        console.warn(`[Seguridad 2A ALERTA] Canje ecosystem rechazado: ${verdict.ok ? 'jti ya utilizado' : verdict.reason} (IP: ${req.socket.remoteAddress})`)
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Enlace de ecosistema inválido, expirado o ya utilizado' }))
+        return
+      }
+      const internalSecret = process.env.INTERNAL_API_SECRET
+      if (!internalSecret) {
+        res.writeHead(503, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Service Unavailable: sin credenciales administrativas (fail-closed)' }))
+        return
+      }
+      res.writeHead(302, {
+        'Set-Cookie': issueStudioSession(internalSecret),
+        Location: '/',
+      })
+      res.end()
       return
     }
 

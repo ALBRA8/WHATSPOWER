@@ -84,6 +84,13 @@ npm start
 Abrir en el navegador:
 👉 **`http://localhost:3003/studio`**
 
+### 3.b. Acceso directo al ecosistema desde el CRM (SSO de un solo uso)
+El botón **Ecosistema** del CRM (capa 1) abre este studio con sesión de operador, sin repetir
+credenciales: el CRM emite un enlace firmado de UN SOLO USO (`ECOSYSTEM_SSO_SECRET` compartido,
+HMAC-SHA256, TTL 90 s) que se canjea en `GET /studio/login-ecosystem` (302 al Studio con cookie
+HttpOnly). Fail-closed: sin el secreto configurado la ruta NO existe (404). El login clásico
+(`/studio/login`) y sus reglas quedan intactos. Pruebas: `tests/ecosystem-login.test.ts`.
+
 ### 4. Pruebas Automatizadas
 ```bash
 npm test
