@@ -35,13 +35,13 @@ test('FASE 1.E — IA desactivada por defecto (sin transmisión a terceros)', as
   })
 
   await t.test('1.E.3 con credencial provista la IA activa (comportamiento documentado)', () => {
-    assert.equal(isAiEnabled({ AI_API_KEY: 'sk_test_credencial_ficticia_000000' }), true)
-    const provider = resolveAiProvider({ AI_API_KEY: 'sk_test_credencial_ficticia_000000' })
+    assert.equal(isAiEnabled({ AI_API_KEY: 'sk_test_credencial_ficticia_000000' }), true) // dummy — scan-secrets:allow
+    const provider = resolveAiProvider({ AI_API_KEY: 'sk_test_credencial_ficticia_000000' }) // dummy — scan-secrets:allow
     assert.ok(provider instanceof OpenAiCompatibleProvider)
   })
 
   await t.test('1.E.4 AI_ENABLED=false apaga la IA aunque exista credencial', async () => {
-    const env = { AI_API_KEY: 'sk_test_credencial_ficticia_000000', AI_ENABLED: 'false' }
+    const env = { AI_API_KEY: 'sk_test_credencial_ficticia_000000', AI_ENABLED: 'false' } // dummy — scan-secrets:allow
     assert.equal(isAiEnabled(env), false)
     const provider = resolveAiProvider(env)
     const res = await provider.complete('Hola', {})
@@ -54,7 +54,7 @@ test('FASE 1.E — IA desactivada por defecto (sin transmisión a terceros)', as
       seenUrls.push(String(url))
       return new Response(JSON.stringify({ choices: [{ message: { content: 'respuesta de prueba' } }] }), { status: 200 })
     }) as typeof fetch
-    const provider = new OpenAiCompatibleProvider({ apiKey: 'sk_test_ficticia', apiUrl: 'https://tercero.ejemplo/v1/chat/completions', fetchImpl })
+    const provider = new OpenAiCompatibleProvider({ apiKey: 'sk_test_ficticia', apiUrl: 'https://tercero.ejemplo/v1/chat/completions', fetchImpl }) // dummy — scan-secrets:allow
     const res = await provider.complete('Hola', { nombre: 'Usuario Demo' })
     assert.equal(res.ok, true)
     assert.deepEqual(seenUrls, ['https://tercero.ejemplo/v1/chat/completions'])

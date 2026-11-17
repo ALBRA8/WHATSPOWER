@@ -3,6 +3,8 @@
 > **Motor Conversacional y Automatizaciones Avanzadas para el Ecosistema CRM ALBRA**  
 > Diseñado bajo metodología Clean-Room / ClonaKit. Opera de forma modular como un "enchufe" ("anillo al dedo") con **CRM-ALBRA (Nivel 1)** y colabora de forma transparente con **WHATSPOWER-ULTRA (Nivel 3)**.
 
+> ⚠️ **Aviso Importante — Canal no oficial de WhatsApp**: el daemon de WhatsApp conecta por **Baileys**, un canal **no oficial** basado en emulación de WhatsApp Web. Su uso conlleva **riesgo inherente de bloqueo o suspensión del número por parte de Meta**. Se recomienda **calentar líneas** (envíos graduales, respetando locks y ventanas) y usar **números secundarios**, nunca el número principal del negocio. Para producción comercial, usa el transporte oficial **Meta Cloud API** disponible en los adaptadores del proyecto.
+
 ---
 
 ## 🚀 Capacidades Principales de Automatización Conversacional
@@ -86,4 +88,4 @@ Abrir en el navegador:
 ```bash
 npm test
 ```
-Ejecuta la suite completa de 38 suites y 250 pruebas automatizadas que verifican flujos interactivos, persistencia SQLite, locks JIT, consentimiento Ley 1581 y fallbacks fail-closed.
+Ejecuta la suite completa de pruebas automatizadas (38+ suites) que verifican flujos interactivos, persistencia SQLite, locks JIT, consentimiento Ley 1581, motor de automatización y fallbacks fail-closed. El conteo exacto vigente lo imprime el runner.

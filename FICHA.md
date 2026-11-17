@@ -2,7 +2,7 @@
 
 > **Documento de Especificación Funcional y Arquitectura**  
 > **Ubicación:** `WHATSPOWER/FICHA.md`  
-> **Estado:** PRODUCCIÓN REAL — Código 100% implementado, probado y auditado (250 tests pasando en sala limpia).
+> **Estado:** PRODUCCIÓN REAL — Código 100% implementado, probado y auditado (suite completa en verde: `npm test`; el conteo exacto vigente lo imprime el runner y se registra en CHANGELOG.md).
 
 ---
 
@@ -197,6 +197,23 @@ Para evitar condiciones de carrera, doble respuesta y colisión con Capa 2B, la 
 | **Variables temporales de sesión de diálogo** | **Capa 2A (`operational.db`)** | Estado en vuelo (ej. qué opción eligió en el menú). |
 | **Registro de deduplicación e idempotencia** | **Capa 2A (`operational.db`)** | Logs operativos con rotación cada 7 días. |
 | **Lista de supresión y bajas locales** | **Capa 2A (`operational.db`)** | Caché de seguridad de consentimientos revocados. |
+
+---
+
+## 7.b Motor de Automatización (Implementado y Documentado)
+
+La Capa 2A incluye un **motor de automatización por reglas** que reacciona a cambios del CRM sin intervención humana. Existe en el código y está cubierto por pruebas (ver `src/engine/crm-triggers.ts`, `src/db.ts` y suites de persistencia):
+
+| Componente | Ubicación | Descripción |
+| :--- | :--- | :--- |
+| **`automation_rules`** | `operational.db` (schema en `src/db.ts`) | Reglas declarativas por organización: disparador (`trigger`), condición (`condition`), acción (`action`) y estado (`enabled`). |
+| **`automation_events`** | `operational.db` | Eventos disparados (auditoría de cada ejecución con resultado y error clasificado). |
+| **`stage_change_dedup`** | `operational.db` | Deduplicación de cambios de etapa: la misma transición de un mismo cliente solo dispara UNA vez (ventana temporal). |
+| **`/api/crm/stage-change`** | `src/server.ts` | Endpoint firmado que recibe el cambio de etapa del CRM y evalúa las reglas de la organización. |
+| **Disparadores soportados** | `src/engine/crm-triggers.ts` | Etapa cambiada (con dedup), primera respuesta del contacto (`isFirstContact`), respuesta de IA (`AI_RESPONSE` con proveedor real si está configurado — ver §IA en README). |
+| **Acciones** | `src/engine/crm-triggers.ts` | Asignar/remover etiqueta, mover oportunidad, inscribir en secuencia, notificar webhook externo (ejecutor real con timeout y reintentos clasificados). |
+
+El CRM invoca el endpoint en cada cambio de pipeline; las reglas se gestionan desde el panel de WP (`/studio` → automatizaciones). Ninguna acción despacha WhatsApp sin pasar por los locks y la ventana de mensajería (§3 y §6).
 
 ---
 
