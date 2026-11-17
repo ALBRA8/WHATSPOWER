@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## 2026-11-17 — Reparación de producción real (FASE 1.E + higiene + arquitectura)
+
+### Seguridad / Privacidad — IA desactivada por defecto
+- **`fix(ai)` (53cb61f)**: `resolveAiProvider` reforzado con `isAiEnabled()`:
+  - Sin `AI_API_KEY` → `UnconfiguredAiProvider` (CERO llamadas HTTP a terceros).
+  - `AI_ENABLED=false` apaga la IA AUNQUE exista credencial (switch maestro).
+  - Con credencial (y sin `AI_ENABLED=false`) la IA activa (compatibilidad).
+- Documentación de privacidad: `.env.example` (bloque de IA con advertencia) y
+  README §2.b: al activar la IA, el TEXTO DE LAS CONVERSACIONES DE CLIENTES se
+  transmite al proveedor externo (`AI_API_URL`); evaluar contra Ley 1581.
+- Prueba: `tests/ai-disabled-by-default.test.ts` (6 casos, fetch inyectado que
+  verifica que solo sale al endpoint configurado y nada sale sin config).
+
+### Higiene y documentación
+- **`docs(hygiene)` (acd532f)**: aviso de canal NO oficial Baileys en README;
+  **motor de automatización DOCUMENTADO** en `FICHA.md` §7.b (automation_rules,
+  automation_events, stage_change_dedup, /api/crm/stage-change, disparadores y
+  acciones — código existente en `src/engine/crm-triggers.ts` que faltaba en
+  docs); conteos de pruebas sin número rígido que envejece; dummies de prueba
+  marcados `scan-secrets:allow`.
+- **`docs(architecture)` (a6cf359)**: `DOCS/DECISION_SQLITE_TYPES.md` (postura
+  `node:sqlite` + `--experimental-strip-types`: riesgos, mitigaciones,
+  comportamiento esperado y plan de migración por escenario).
+
+### Números de la sesión
+- Suite: **316/316** PASS (`npm test`, runner sin `--test-isolation` para
+  estabilidad Windows/Node 22.23) · `security:scan`: 0 secretos en el árbol.
+
+---
+
+
 ## 2026-11-15 — Producción real: verificación total, escáner de historial, addNode del studio (rama repair/produccion-real)
 
 ### Corregido (con prueba ejecutada)

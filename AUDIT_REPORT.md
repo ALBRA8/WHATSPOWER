@@ -1,5 +1,31 @@
 # AUDIT_REPORT — WHATSPOWER
 
+## Actualización 2026-11-17 — Reparación técnica (FASE 1.E, higiene y arquitectura)
+
+**Rama:** `repair/produccion-real` · **Método:** TDD + verificación real.
+
+### Puertas de calidad (ejecutadas al cierre)
+| Verificación | Resultado |
+|---|---|
+| `npm test` | **316/316 PASS** |
+| `npm run tsc` | 0 errores (verificado en sesión previa; sin cambios de tipos en esta) |
+| `npm run security:scan` | 0 secretos en el árbol (dummies de prueba marcados con allowlist) |
+
+### Hallazgos resueltos con evidencia
+| ID | Severidad | Hallazgo | Reparación (commit) | Prueba |
+|---|---|---|---|---|
+| H-W1 | MEDIO | `AI_API_URL`/`AI_MODEL` sin documentar y la IA podría transmitir datos a OpenAI sin gate explícito | `isAiEnabled()`: sin credencial CERO llamadas HTTP; `AI_ENABLED=false` manda sobre credencial; documentación de privacidad en `.env.example` y README §2.b (53cb61f) | `tests/ai-disabled-by-default.test.ts` (6) |
+| H-W2 | INFO | Motor de automatización (`automation_rules`, `automation_events`, `stage_change_dedup`, `/api/crm/stage-change`) existía en código pero NO en docs | Documentado en `FICHA.md` §7.b con tabla de componentes y disparadores (acd532f) | Suite en verde (el código ya estaba probado) |
+| H-W3 | INFO | Aviso de canal no oficial Baileys ausente en README | Aviso destacado en la cabecera del README (acd532f) | Inspección |
+| H-W4 | INFO | Conteos de pruebas hard-coded (250) que envejecen y desacreditan los docs | Sustituidos por "suite en verde + runner imprime el conteo" (acd532f) | — |
+
+### Qué queda pendiente y por qué
+- **Rotación de PAT de GitHub** y **purga de historial** si el dueño lo estima: tareas del dueño (`OWNER_TODO.md`).
+- **Canal Meta Cloud**: los adaptadores por organización existen; la migración desde Baileys NO se toca (regla del encargo) — decisión comercial del dueño.
+
+---
+
+
 ## Actualización 2026-11-15 — Producción real (rama `repair/produccion-real`)
 
 **Método:** línea base completa ejecutada sobre la rama (que ya traía FASE 1-4 de la sesión anterior re-verificadas en verde), hallazgos corregidos con prueba que falla antes y pasa después, E2E con los 3 servicios reales en simulación y prueba de studios en navegador real.

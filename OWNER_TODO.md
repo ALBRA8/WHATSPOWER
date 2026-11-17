@@ -1,6 +1,16 @@
 # OWNER_TODO — Acciones que SOLO el dueño puede ejecutar
 
-**Actualizado:** 2026-11-15 · **Rama:** `repair/produccion-real`
+**Actualizado:** 2026-11-17 · **Rama:** `repair/produccion-real`
+
+## 0. Nuevas tareas de esta sesión (reparación 2026-11-17)
+- [ ] **Rotar el PAT de GitHub** usado en esta sesión (estuvo en texto de chat) tras validar el push.
+- [ ] **Decidir la política de IA**: si se activa el nodo AI_RESPONSE, aceptar explícitamente que el texto de conversaciones de clientes se transmite al proveedor externo (configurar `AI_API_KEY`, `AI_API_URL`, `AI_MODEL`) y revisarlo contra la política de tratamiento de datos.
+- [ ] **Docker build en el PC** si se despliega en contenedor (no ejecutable en el entorno de trabajo remoto).
+
+---
+
+
+
 
 ## 1. Credenciales y seguridad
 - [ ] **Rotar el PAT de GitHub** compartido en chat para operar los repos (tras el merge, revocar y crear uno con alcance mínimo).

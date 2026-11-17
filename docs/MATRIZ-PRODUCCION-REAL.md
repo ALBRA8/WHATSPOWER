@@ -1,4 +1,24 @@
-# MATRIZ DE PRODUCCIÓN REAL — WHATSPOWER (2026-11-15)
+# MATRIZ DE PRODUCCIÓN REAL — WHATSPOWER (2026-11-17)
+
+**Rama:** `repair/produccion-real` · **Método:** evidencia EJECUTADA en la sesión.
+
+## Veredicto final transparente (sesión reparación 2026-11-17)
+
+| Área | Veredicto | Evidencia |
+|---|---|---|
+| IA del motor de flujos apagada por defecto | ✅ CERRADO | `isAiEnabled()`: sin credencial CERO llamadas HTTP; AI_ENABLED=false manda — 316/316 |
+| Transmisión a terceros documentada | ✅ CERRADO | `.env.example` + README §2.b con advertencia Ley 1581 |
+| Motor de automatización documentado | ✅ CERRADO | FICHA §7.b: automation_rules/events, stage_change_dedup, /api/crm/stage-change |
+| Aviso canal no oficial Baileys | ✅ DOCUMENTADO | Cabecera del README |
+| Node 22 / runtime | ✅ ALINEADO | engines >=22.12.0 + .nvmrc 22.14 (igual que CRM y ULTRA) |
+| `npm test` en Node 22.23 aislado y limpio | ✅ OPERATIVO | runner propio sin --test-isolation=process (316/316) |
+| Postura node:sqlite / strip-types | ✅ DOCUMENTADA | DOCS/DECISION_SQLITE_TYPES.md |
+| Secretos en el árbol | ✅ LIMPIO | security:scan 0 hallazgos (dummies allowlisted) |
+| Migración a Meta Cloud | 🟦 DECISIÓN DEL DUEÑO | Adaptadores por organización existen; Baileys NO se toca (regla del encargo) |
+
+---
+
+# MATRIZ DE PRODUCCIÓN REAL — WHATSPOWER (histórico 2026-11-15)
 
 **Rama:** `repair/produccion-real` · **Método:** cada casilla con evidencia EJECUTADA (comando y resultado real), no declaraciones.
 
