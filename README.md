@@ -107,6 +107,12 @@ npm test
 ```
 Ejecuta la suite completa de pruebas automatizadas (38+ suites) que verifican flujos interactivos, persistencia SQLite, locks JIT, consentimiento Ley 1581, motor de automatización y fallbacks fail-closed. El conteo exacto vigente lo imprime el runner.
 
+**E2E del ecosistema completo (autocontenido y multiplataforma):**
+```bash
+npm run e2e:3
+```
+Levanta CRM + WHATSPOWER + ULTRA con bases de datos temporales y secretos efímeros, ejecuta el flujo completo (webhook firmado → puente → flujo → cliente en CRM; lock; consentimiento; campaña) y verifica SENT=0. Limpieza automática al terminar. Los repos hermanos se autodescubren por `package.json` (o usa `E2E_CRM_DIR` / `E2E_ULTRA_DIR`).
+
 ## Denylist de PII con pepper (HMAC)
 
 `npm run check:pii` escanea el árbol rastreado por git y bloquea valores prohibidos y teléfonos colombianos no autorizados. Los valores prohibidos del operador no se publican ni en texto plano ni como hash adivinable: viven SOLO como **HMAC-SHA256** en `scripts/pii-hashlist.json`, firmados con una clave secreta (**pepper**) que **nunca se compromete**. Sin la clave no se puede calcular el HMAC de un candidato, así que la hashlist publicada no permite verificar ni un solo intento de adivinación (a diferencia de un `sha256(sal+valor)` simple, que cualquiera puede comparar contra sus candidatos).

@@ -1955,7 +1955,11 @@ if (process.argv[1]?.includes('server.ts')) {
     }
   }
   const PORT = Number(process.env.PORT || 3003)
-  const { server, router, transport } = createAgenticServer()
+  const { server, router, transport } = createAgenticServer({
+    // Rutas de BD configurables por entorno (E2E autocontenido con bases temporales)
+    dbPath: process.env.WP_DB_PATH || undefined,
+    replayDbPath: process.env.WP_REPLAY_DB_PATH || undefined,
+  })
 // (A5-08, auditoría 2026-11-11) Umbrales de proceso: sin muerte silenciosa.
 process.on('unhandledRejection', (reason) => {
   console.error('[wp-server] unhandledRejection:', reason instanceof Error ? reason.message : reason)
