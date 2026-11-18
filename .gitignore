@@ -20,3 +20,6 @@ questions.json
 
 # Lista local de PII prohibida (NUNCA se compromete; ver scripts/check-pii.mjs)
 scripts/pii-denylist.local.*
+
+# Pepper secreto del denylist de PII (NUNCA se compromete; ver scripts/check-pii.mjs)
+scripts/pii-pepper.local

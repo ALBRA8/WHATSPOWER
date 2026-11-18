@@ -4,35 +4,55 @@
  *
  * Este archivo NO contiene datos reales. Diseño:
  *
- * 1) DENYLIST con hashes: los valores prohibidos del operador no viven aquí en texto
- *    plano. Se guardan SOLO como hashes SHA-256 con sal aleatoria por entrada en
- *    scripts/pii-hashlist.json (comprometido; funciona igual en CI). Cada candidato
- *    encontrado se normaliza, se le calcula el hash con la sal de cada entrada y se
- *    compara: coincidencia => violación "DATO_PROHIBIDO".
+ * 1) DENYLIST CON HMAC: los valores prohibidos del operador no viven aquí en texto plano
+ *    ni como hash verificable sin clave. scripts/pii-hashlist.json (comprometido) guarda
+ *    SOLO HMAC-SHA256(sal_aleatoria + valor_normalizado), firmados con una clave secreta
+ *    ("pepper") que NUNCA se compromete: variable de entorno PII_PEPPER o archivo local
+ *    scripts/pii-pepper.local (en .gitignore). Sin la clave NO se puede calcular el HMAC
+ *    de un candidato, así que un intento de adivinación no es verificable offline y la
+ *    hashlist publicada, sin el pepper, no revela ningún valor (a diferencia de un
+ *    sha256(sal+valor) simple, que cualquiera puede comparar contra sus candidatos).
  *
- * 2) Lista local opcional (NUNCA se compromete): scripts/pii-denylist.local.txt con
- *    líneas "tipo:valor" (name|handle|lid|phone), o la ruta que apunte la variable de
- *    entorno PII_DENYLIST_FILE. Si falta la lista local no pasa nada; si no hay
- *    ninguna fuente de denylist, se avisa y se aplican solo los patrones genéricos.
+ * 2) Estado del pepper (se informa SIEMPRE en voz alta; ver README):
+ *    ok          → comprobación completa (hashlist + genéricos + lista local).
+ *    ausente     → la comprobación de VALORES PROHIBIDOS de la hashlist queda DESACTIVADA;
+ *                  se aplican solo los patrones genéricos (teléfonos no autorizados /
+ *                  whitelist exacta) y la lista local opcional. NO falla (exit 0 si el
+ *                  árbol está limpio), pero emite un aviso prominente y una anotación
+ *                  ::warning:: visible en GitHub Actions.
+ *    no-coincide → el pepper configurado NO corresponde a esta hashlist (se verifica con
+ *                  la entrada pepperCheck, sin revelar la clave); mismo comportamiento que
+ *                  "ausente", con un aviso que lo indica explícitamente en el reporte.
+ *    hashlist-no-disponible / hashlist-obsoleta → avisos equivalentes; regenerar.
  *
- * 3) WHITELIST EXACTA de números ficticios documentados (ver FICTITIOUS_*). Cualquier
- *    otro número colombiano de 10 dígitos que empiece por 3 se reporta. Las violaciones
- *    se imprimen SIEMPRE redactadas: nunca se muestra el valor que disparó la alerta.
+ * 3) Lista local opcional (NUNCA se compromete): scripts/pii-denylist.local.txt con líneas
+ *    "tipo:valor" (name|handle|lid|phone), o la ruta que apunte PII_DENYLIST_FILE. Es texto
+ *    plano privado del operador: se compara en memoria y funciona incluso sin pepper.
  *
- * Reconstrucción local de la lista sin publicar valores:
- *   node scripts/pii-denylist-build.mjs --from-git "scripts/check-pii.mjs@<revision-antigua>" --out scripts/pii-hashlist.json
+ * 4) WHITELIST EXACTA de números ficticios documentados (ver FICTITIOUS_*). Cualquier otro
+ *    número colombiano de 10 dígitos que empiece por 3 se reporta. Las violaciones se
+ *    imprimen SIEMPRE redactadas: nunca se muestra el valor que disparó la alerta.
+ *    El pepper jamás se imprime ni queda en reportes o mensajes de commit.
+ *
+ * Reconstrucción local de la hashlist sin publicar valores:
+ *   PII_PEPPER="<secreto>" node scripts/pii-denylist-build.mjs \
+ *     --from-git "scripts/check-pii.mjs@<revision-antigua>" --out scripts/pii-hashlist.json
+ *   (mismo pepper que usará el escáner; vea README "Denylist de PII con pepper (HMAC)")
  *
  * Tipos: name (nombre), handle (usuario de red), lid (LID de WhatsApp), phone (teléfono de 10 dígitos).
  */
 import { execSync } from 'node:child_process'
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url))
 const HASHLIST_PATH = path.join(SCRIPTS_DIR, 'pii-hashlist.json')
+const PEPPER_FILE = path.join(SCRIPTS_DIR, 'pii-pepper.local')
 const LOCAL_DENYLIST_DEFAULT = path.join(SCRIPTS_DIR, 'pii-denylist.local.txt')
+// Mensaje canónico de verificación del pepper (debe coincidir con pii-denylist-build.mjs)
+const PEPPER_VERIFY_MSG = 'pii-hashlist:verificacion-de-pepper:v2'
 
 // ——— Normalización (debe coincidir con pii-denylist-build.mjs) ———
 const stripAccents = (s) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
@@ -55,6 +75,45 @@ const normValue = (type, value) => {
 }
 
 const sha256Hex = (salt, value) => createHash('sha256').update(salt + value, 'utf8').digest('hex')
+const hmacHex = (pepper, salt, value) => createHmac('sha256', pepper).update(salt + value, 'utf8').digest('hex')
+
+// ——— Pepper: variable de entorno PII_PEPPER o archivo local git-ignorado ———
+// Nunca se imprime ni se registra; solo se usa como clave HMAC.
+function loadPepper() {
+  const env = (process.env.PII_PEPPER || '').trim()
+  if (env) return env
+  try {
+    for (const raw of fs.readFileSync(PEPPER_FILE, 'utf8').split(/\r?\n/)) {
+      let line = raw.trim()
+      if (!line || line.startsWith('#')) continue
+      if (/^PII_PEPPER=/i.test(line)) line = line.slice('PII_PEPPER='.length).trim()
+      if (line) return line
+    }
+  } catch {
+    /* archivo ausente: normal */
+  }
+  return null
+}
+
+// ——— Hashlist comprometida (formato v2: HMAC-SHA256 + pepperCheck) ———
+function loadHashlist() {
+  let doc
+  try {
+    doc = JSON.parse(fs.readFileSync(HASHLIST_PATH, 'utf8'))
+  } catch {
+    return null
+  }
+  const algo = String((doc && doc.algorithm) || '')
+  const entries = Array.isArray(doc && doc.entries) ? doc.entries.filter((e) => e && e.type && e.hmac) : []
+  if (algo.startsWith('hmac-sha256')) {
+    const pc = doc.pepperCheck
+    if (entries.length > 0 && pc && pc.salt && pc.hmac) return { obsolete: false, entries, pepperCheck: pc }
+    return null
+  }
+  // Formato antiguo (sha256 con sal pública): detectable pero inseguro; exigir regeneración
+  if (entries.length > 0 || algo.includes('sha256')) return { obsolete: true, entries: [], pepperCheck: null }
+  return null
+}
 
 // ——— WHITELIST EXACTA de números ficticios (documentados, sin datos reales) ———
 // Rango de fábrica reservado para ejemplos y pruebas: 573000000000–573000000099
@@ -93,19 +152,7 @@ function isWhitelistedPhone(normalized10) {
   return FICTITIOUS_EXACT.has(normalized10)
 }
 
-// ——— Denylist: fuentes ———
-function loadHashlist() {
-  try {
-    const j = JSON.parse(fs.readFileSync(HASHLIST_PATH, 'utf8'))
-    if (Array.isArray(j.entries)) {
-      return j.entries.filter((e) => e && e.type && e.salt && e.hash)
-    }
-  } catch {
-    /* archivo ausente o corrupto */
-  }
-  return null
-}
-
+// ——— Lista local opcional (texto plano privado; se compara en memoria) ———
 function addLocalValue(arr, type, raw) {
   if (!['name', 'handle', 'lid', 'phone'].includes(type)) {
     console.warn(`[check:pii] AVISO: tipo "${type}" desconocido en lista local; ignorado`)
@@ -203,26 +250,77 @@ const EXCLUDE_EXTS = new Set([
 const EXCLUDE_FILES = new Set(['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock'])
 
 function main() {
-  // 1) Cargar denylist (hashlist comprometida + lista local opcional)
-  const hashEntries = loadHashlist()
+  // 1) Cargar pepper, hashlist comprometida y lista local opcional
+  const pepper = loadPepper()
+  const hashlist = loadHashlist()
   const localPath = process.env.PII_DENYLIST_FILE || LOCAL_DENYLIST_DEFAULT
   const localEntries = loadLocalDenylist(localPath)
-  const entries = [...(hashEntries || []), ...(localEntries || [])]
 
-  if (!hashEntries) {
-    console.warn('[check:pii] AVISO: no se pudo cargar scripts/pii-hashlist.json; se usan solo los patrones genéricos' + (localEntries ? ' y la lista local' : ''))
-  } else if (!localEntries && process.env.PII_DENYLIST_FILE) {
-    console.warn(`[check:pii] AVISO: PII_DENYLIST_FILE apunta a un archivo inexistente o ilegible; se continúa con la hashlist comprometida`)
-  }
-  if (entries.length === 0) {
-    console.warn('[check:pii] AVISO: sin denylist cargada; se aplican SOLO los patrones genéricos')
-  }
-  const byType = { name: [], handle: [], lid: [], phone: [] }
-  for (const e of entries) {
-    if (byType[e.type]) byType[e.type].push(e)
+  let hashStatus = 'hashlist-no-disponible'
+  if (hashlist) {
+    hashStatus = hashlist.obsolete
+      ? 'hashlist-obsoleta'
+      : (!pepper
+          ? 'ausente'
+          : (hmacHex(pepper, hashlist.pepperCheck.salt, PEPPER_VERIFY_MSG) === hashlist.pepperCheck.hmac ? 'ok' : 'no-coincide'))
   }
 
-  // 2) Archivos rastreados
+  // 2) Avisos SIEMPRE en voz alta (banner en stderr + anotación ::warning:: en Actions)
+  const inCI = process.env.GITHUB_ACTIONS === 'true'
+  const banner = (lines) => {
+    const edge = '─'.repeat(74)
+    console.error(`[check:pii] ┌${edge}`)
+    for (const l of lines) console.error(`[check:pii] │ ${l}`)
+    console.error(`[check:pii] └${edge}`)
+  }
+  const genericOnly = 'Se aplican solo los patrones genéricos (teléfonos no autorizados / whitelist exacta)' + (localEntries ? ' y la lista local.' : '.')
+  switch (hashStatus) {
+    case 'ausente':
+      banner([
+        'AVISO: pepper NO configurado (variable de entorno PII_PEPPER o archivo scripts/pii-pepper.local).',
+        'La comprobación de VALORES PROHIBIDOS de la hashlist quedó DESACTIVADA.',
+        genericOnly,
+        'Active el pepper (secreto de GitHub Actions en CI, archivo local en desarrollo) para la comprobación completa.',
+      ])
+      if (inCI) console.log('::warning::check:pii sin PII_PEPPER: comprobación de valores prohibidos (hashlist) desactivada')
+      break
+    case 'no-coincide':
+      banner([
+        'AVISO: el pepper configurado NO corresponde a esta hashlist (falla la verificación pepperCheck).',
+        'La comprobación de VALORES PROHIBIDOS de la hashlist quedó DESACTIVADA; este reporte lo indica.',
+        genericOnly,
+        'Causas típicas: pepper rotado sin regenerar la hashlist, o hashlist construida con otro pepper.',
+        'Regenere la hashlist con scripts/pii-denylist-build.mjs usando el pepper correcto.',
+      ])
+      if (inCI) console.log('::warning::check:pii: PII_PEPPER no corresponde a esta hashlist: comprobación de valores prohibidos desactivada')
+      break
+    case 'hashlist-obsoleta':
+      banner([
+        'AVISO: scripts/pii-hashlist.json usa el formato antiguo sha256(sal+valor), adivinable sin clave.',
+        'La comprobación de VALORES PROHIBIDOS quedó DESACTIVADA.',
+        'Regenere con scripts/pii-denylist-build.mjs (requiere pepper; ver README).',
+      ])
+      if (inCI) console.log('::warning::check:pii: hashlist en formato antiguo sha256: regenerar con pii-denylist-build.mjs')
+      break
+    case 'hashlist-no-disponible':
+      console.warn('[check:pii] AVISO: no se pudo cargar scripts/pii-hashlist.json (formato v2 HMAC); se usan solo los patrones genéricos' + (localEntries ? ' y la lista local' : ''))
+      break
+  }
+  if (localEntries === null && process.env.PII_DENYLIST_FILE && hashStatus === 'ok') {
+    console.warn('[check:pii] AVISO: PII_DENYLIST_FILE apunta a un archivo inexistente o ilegible; se continúa con la hashlist comprometida')
+  }
+  if (!localEntries && hashStatus !== 'ok') {
+    console.warn('[check:pii] AVISO: sin denylist activa; se aplican SOLO los patrones genéricos')
+  }
+
+  const hashByType = { name: [], handle: [], lid: [], phone: [] }
+  const localByType = { name: [], handle: [], lid: [], phone: [] }
+  if (hashStatus === 'ok') {
+    for (const e of hashlist.entries) if (hashByType[e.type]) hashByType[e.type].push(e)
+  }
+  for (const e of localEntries || []) if (localByType[e.type]) localByType[e.type].push(e)
+
+  // 3) Archivos rastreados
   let trackedFiles = []
   try {
     const stdout = execSync('git ls-files', { cwd: process.cwd(), encoding: 'utf-8' })
@@ -232,9 +330,19 @@ function main() {
     process.exit(1)
   }
 
-  // 3) Escaneo
+  // 4) Escaneo
   const violations = []
-  const memo = new Map() // "tipo|norm" -> true (coincide con denylist)
+  const memo = new Map() // "tipo|norm" -> true (coincide con denylist activa)
+  function isDenied(type, norm) {
+    const key = `${type}|${norm}`
+    let d = memo.get(key)
+    if (d === undefined) {
+      d = (hashStatus === 'ok' && hashByType[type].some((e) => hmacHex(pepper, e.salt || '', norm) === e.hmac)) ||
+          localByType[type].some((e) => sha256Hex(e.salt, norm) === e.hash)
+      memo.set(key, d)
+    }
+    return d
+  }
 
   for (const relPath of trackedFiles) {
     const ext = path.extname(relPath).toLowerCase()
@@ -255,13 +363,7 @@ function main() {
       if (!line) continue
       const lineNum = i + 1
       for (const c of collectCandidates(line)) {
-        const key = `${c.type}|${c.norm}`
-        let isDeny = memo.get(key)
-        if (isDeny === undefined) {
-          isDeny = byType[c.type].some((e) => sha256Hex(e.salt, c.norm) === e.hash)
-          memo.set(key, isDeny)
-        }
-        if (isDeny) {
+        if (isDenied(c.type, c.norm)) {
           violations.push({ file: relPath, line: lineNum, rule: `DATO_PROHIBIDO:${c.type}`, spans: [{ start: c.start, end: c.end }], text: line })
         } else if (c.type === 'phone' && c.norm.startsWith('3') && !isWhitelistedPhone(c.norm)) {
           violations.push({ file: relPath, line: lineNum, rule: 'TELEFONO_NO_AUTORIZADO', spans: [{ start: c.start, end: c.end }], text: line })
@@ -270,7 +372,7 @@ function main() {
     }
   }
 
-  // 4) Reporte (siempre redactado)
+  // 5) Reporte (siempre redactado; nunca se muestran valores ni el pepper)
   if (violations.length > 0) {
     console.error(`\n[check:pii] SE ENCONTRARON ${violations.length} VIOLACIONES DE PII / TELÉFONOS NO AUTORIZADOS:\n`)
     for (const v of violations) {
@@ -280,8 +382,16 @@ function main() {
     process.exit(1)
   }
 
-  const counts = Object.fromEntries(Object.entries(byType).map(([k, v]) => [k, v.length]))
-  console.log(`[check:pii] OK: árbol limpio (denylist con sal: ${entries.length} entradas ${JSON.stringify(counts)}; whitelist: rango ${FICTITIOUS_RANGE_START}-${FICTITIOUS_RANGE_END} + ${FICTITIOUS_EXACT.size} exactos).`)
+  const hCounts = Object.fromEntries(Object.entries(hashByType).map(([k, v]) => [k, v.length]))
+  const lCount = Object.values(localByType).reduce((a, v) => a + v.length, 0)
+  const pepperLabel = {
+    'ok': 'ok',
+    'ausente': 'ausente — comprobación de valores prohibidos desactivada',
+    'no-coincide': 'no coincide con la hashlist — comprobación desactivada',
+    'hashlist-obsoleta': 'hashlist obsoleta (regenerar)',
+    'hashlist-no-disponible': 'hashlist no disponible',
+  }[hashStatus]
+  console.log(`[check:pii] OK: árbol limpio (denylist HMAC: ${hashStatus === 'ok' ? hashlist.entries.length : 0} entradas ${JSON.stringify(hCounts)}${lCount ? ` + ${lCount} locales` : ''}; pepper: ${pepperLabel}; whitelist: rango ${FICTITIOUS_RANGE_START}-${FICTITIOUS_RANGE_END} + ${FICTITIOUS_EXACT.size} exactos).`)
 }
 
 main()

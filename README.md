@@ -106,3 +106,38 @@ CRM. Pruebas: `tests/ecosystem-login.test.ts` (cadena completa de aceptación in
 npm test
 ```
 Ejecuta la suite completa de pruebas automatizadas (38+ suites) que verifican flujos interactivos, persistencia SQLite, locks JIT, consentimiento Ley 1581, motor de automatización y fallbacks fail-closed. El conteo exacto vigente lo imprime el runner.
+
+## Denylist de PII con pepper (HMAC)
+
+`npm run check:pii` escanea el árbol rastreado por git y bloquea valores prohibidos y teléfonos colombianos no autorizados. Los valores prohibidos del operador no se publican ni en texto plano ni como hash adivinable: viven SOLO como **HMAC-SHA256** en `scripts/pii-hashlist.json`, firmados con una clave secreta (**pepper**) que **nunca se compromete**. Sin la clave no se puede calcular el HMAC de un candidato, así que la hashlist publicada no permite verificar ni un solo intento de adivinación (a diferencia de un `sha256(sal+valor)` simple, que cualquiera puede comparar contra sus candidatos).
+
+Comportamiento del escáner según el pepper:
+
+| Estado del pepper | Comprobación de valores prohibidos | Árbol limpio |
+| --- | --- | --- |
+| `ok` | Completa: hashlist + patrones genéricos + lista local | exit 0 |
+| `ausente` | Desactivada: genéricos + lista local, con **aviso prominente** (y `::warning::` en Actions) | exit 0 |
+| `no coincide` | Desactivada: genéricos + lista local, con **aviso prominente** que lo indica | exit 0 |
+
+**Generar un pepper nuevo** (una sola vez; guárdelo en su gestor de contraseñas):
+
+```bash
+openssl rand -hex 32   # nunca lo comitee ni lo pegue en issues, logs o chats
+```
+
+**Cargarlo:**
+
+- **Local**: guarde el hex en `scripts/pii-pepper.local` (ya está en `.gitignore`; admite `# comentarios`, el prefijo `PII_PEPPER=` o el hex solo en la primera línea).
+- **CI**: `gh secret set PII_PEPPER --body "<hex>"` (o *Settings → Secrets and variables → Actions → New repository secret*). El workflow ya lo pasa al escáner.
+
+**Regenerar la hashlist sin publicar valores** (requiere el pepper; no imprime valores):
+
+```bash
+PII_PEPPER="<hex>" node scripts/pii-denylist-build.mjs \
+  --from-git "scripts/check-pii.mjs@<revision-antigua>" \
+  --out scripts/pii-hashlist.json
+```
+
+`--from-file <archivo-privado>` y `--from-stdin` aceptan líneas `tipo:valor` (`name|handle|lid|phone`). El pepper jamás aparece en la hashlist ni en la salida del comando.
+
+**Rotación**: genere un pepper nuevo, regenere la hashlist, haga commit de la hashlist y actualice el secreto de Actions y su `scripts/pii-pepper.local` en cada máquina. Los valores reales nunca salen de su equipo: al repo solo llega el HMAC.
