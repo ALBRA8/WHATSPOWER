@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "algorithm": "sha256(sal+valor_normalizado)",
+  "note": "Solo hashes con sal aleatoria por entrada; los valores en claro NO se publican. Regenerar con scripts/pii-denylist-build.mjs.",
+  "entries": [
+    {
+      "type": "name",
+      "salt": "bca921df8768dde1e0bbc3d0bbd7885a",
+      "hash": "c46e73a6e2420163d881de495711121315dd2140920c791bcb0606f58e49abe0"
+    },
+    {
+      "type": "handle",
+      "salt": "126c9975e9a9f7afd81b77d152450a27",
+      "hash": "45de7b669976cb3b1f344dd2951d6a6a111c5b8d4b8ef55462aca3f52b95af57"
+    },
+    {
+      "type": "lid",
+      "salt": "052ae917dfd330977d2fc0d21e4001fa",
+      "hash": "03a724a8a4c1fb3c376bdfa54eced9ac3db6347793fec849e5f47ef787dfc3e6"
+    },
+    {
+      "type": "phone",
+      "salt": "5b1426899edba1aa8ea1be2deeacd1ae",
+      "hash": "48756178f08a05e3c7c97ddaf44b78d6dae45ef66d405df8dfe5c89736ee4b6e"
+    },
+    {
+      "type": "phone",
+      "salt": "16f35f98e9a530bba7923f6abedee910",
+      "hash": "f427afdf3e6d5b270eaf50d0928cb88f31e07d04309abf11a2bb05b4cf76bea3"
+    },
+    {
+      "type": "phone",
+      "salt": "39133599489e69903d1ebad1c6236be2",
+      "hash": "b11e5af0e0adf7f9979d72e5406200859421d6a86440f9e5b9ce3519715303ac"
+    }
+  ]
+}

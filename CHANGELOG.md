@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 2026-11-17 — check:pii sin datos reales (hashes con sal, denylist local y whitelist exacta)
+
+- **`fix(pii)`**:
+  - **El escáner ya no contiene valores reales**: `scripts/check-pii.mjs` dejó de incrustar los datos prohibidos en texto plano (antes se detectaba a sí mismo: 6 violaciones y exit != 0 al correr `npm run check:pii`). Ahora los valores prohibidos viven SOLO como hashes SHA-256 con sal aleatoria por entrada en `scripts/pii-hashlist.json` (comprometido; funciona igual en CI).
+  - **`scripts/pii-denylist-build.mjs`**: constructor de la hashlist. Reconstrucción local sin publicar valores: `node scripts/pii-denylist-build.mjs --from-git "scripts/check-pii.mjs@<revision-antigua>" --out scripts/pii-hashlist.json` — extrae de la historia de git y nunca imprime ni guarda valores en claro.
+  - **Lista local opcional**: `scripts/pii-denylist.local.txt` (gitignored) o la ruta en `PII_DENYLIST_FILE`; si no hay ninguna denylist, se aplican solo los patrones genéricos con aviso explícito (CI no se rompe).
+  - **Whitelist exacta documentada**: rango ficticio 573000000000–573000000099 (normalizado 3000000000–3000000099) + 117 números exactos usados en pruebas (unión verificada de los 3 repos, 2026-11-17). Cualquier otro número colombiano de 10 dígitos iniciando en 3 se reporta.
+  - **Reporte redactado**: las violaciones se imprimen con el valor sustituido por `[REDACTADO]` y dígitos enmascarados; el número que dispara la alerta jamás aparece en el log.
+  - **Verificación**: exit 0 en los 3 repos; negativas: número no autorizado -> exit 1 (`TELEFONO_NO_AUTORIZADO`); valor real plantado -> exit 1 (`DATO_PROHIBIDO:phone`); lista local vía `PII_DENYLIST_FILE` -> exit 1 (`DATO_PROHIBIDO:name`); hashlist ausente -> avisos y exit 0.
+
 ## 2026-11-17 — Higiene PII y blindaje de SSO Ecosistema
 
 - **`fix(pii)`**:

@@ -17,3 +17,6 @@ usage.json
 dist/
 checks/
 questions.json
+
+# Lista local de PII prohibida (NUNCA se compromete; ver scripts/check-pii.mjs)
+scripts/pii-denylist.local.*
