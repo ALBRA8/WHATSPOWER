@@ -593,6 +593,10 @@ export class RateLimiter {
   public get size(): number {
     return this.buckets.size
   }
+
+  public reset(): void {
+    this.buckets.clear()
+  }
 }
 /**
  * Guard de entorno fail-fast para producción.
@@ -649,6 +653,12 @@ export function productionConfigProblems(env: NodeJS.ProcessEnv = process.env): 
     problems.push('PAYMENTS_MODE=simulator: el simulador NO se admite como modo de producción (jamás se presenta como cobro real)')
   } else if (mode === 'production' && !env.PAYMENTS_WEBHOOK_SECRET) {
     problems.push('PAYMENTS_MODE=production exige PAYMENTS_WEBHOOK_SECRET configurado (fail-closed)')
+  }
+  if (env.NODE_ENV === 'production' && String(env.DEMO_MODE || '').toLowerCase() === 'true') {
+    problems.push('DEMO_MODE: activo en producción — el acceso admin sin registro (/studio/login-demo) está prohibido; úsalo solo en desarrollo local')
+  }
+  if (env.NODE_ENV === 'production' && env.ECOSYSTEM_SSO_SECRET) {
+    problems.push('ECOSYSTEM_SSO_SECRET: configurado en producción — el acceso directo SSO del ecosistema sin credenciales está prohibido en producción (fail-closed)')
   }
   return problems
 }

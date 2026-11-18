@@ -7,8 +7,9 @@
 ### Puertas de calidad (ejecutadas al cierre)
 | Verificación | Resultado |
 |---|---|
-| `npm test` | **316/316 PASS** |
-| `npm run tsc` | 0 errores (verificado en sesión previa; sin cambios de tipos en esta) |
+| `npm test` | **324/324 PASS** (38 suites) |
+| `npm run check:pii` | **0 violaciones** (árbol rastreado limpio de PII y números reales) |
+| `npm run tsc` | 0 errores |
 | `npm run security:scan` | 0 secretos en el árbol (dummies de prueba marcados con allowlist) |
 
 ### Hallazgos resueltos con evidencia
@@ -18,10 +19,13 @@
 | H-W2 | INFO | Motor de automatización (`automation_rules`, `automation_events`, `stage_change_dedup`, `/api/crm/stage-change`) existía en código pero NO en docs | Documentado en `FICHA.md` §7.b con tabla de componentes y disparadores (acd532f) | Suite en verde (el código ya estaba probado) |
 | H-W3 | INFO | Aviso de canal no oficial Baileys ausente en README | Aviso destacado en la cabecera del README (acd532f) | Inspección |
 | H-W4 | INFO | Conteos de pruebas hard-coded (250) que envejecen y desacreditan los docs | Sustituidos por "suite en verde + runner imprime el conteo" (acd532f) | — |
+| H-W5 | CRÍTICO | SSO Ecosistema (`/studio/login-ecosystem`) vulnerable a escalada si se expone fuera de desarrollo | Fail-closed: bloqueado con 403 cuando `NODE_ENV=production` y `DEMO_MODE=false`; tokens HMAC con TTL 90s, anti-replay jti y validación multi-tenant | `tests/ecosystem-login.test.ts` (14 aserciones PASS) |
+| H-W6 | ALTO | Prevención de fuga de PII en árbol público de código y documentación | Guardián `scripts/check-pii.mjs` y comando `npm run check:pii` integrado en CI (`ci.yml`) | `npm run check:pii` (0 violaciones) |
 
 ### Qué queda pendiente y por qué
+- **Canal Meta Cloud oficial**: Sigue siendo un **pendiente diferido**. Baileys es el canal activo; la integración oficial de Meta requiere registro empresarial y línea oficial por parte del cliente.
+- **Rotación de claves y credenciales externas**: **NO fue verificada**, únicamente recomendada en `OWNER_TODO.md` para ejecución por el dueño.
 - **Rotación de PAT de GitHub** y **purga de historial** si el dueño lo estima: tareas del dueño (`OWNER_TODO.md`).
-- **Canal Meta Cloud**: los adaptadores por organización existen; la migración desde Baileys NO se toca (regla del encargo) — decisión comercial del dueño.
 
 ---
 

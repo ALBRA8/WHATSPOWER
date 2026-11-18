@@ -28,12 +28,15 @@ export interface EcosystemTokenPayload {
   jti: string
   iat: number
   exp: number
+  orgId?: string
+  role?: string
 }
 
 export function signEcosystemToken(
   secret: string,
   nowMs: number = Date.now(),
-  ttlMs: number = ECOSYSTEM_SSO_TTL_MS
+  ttlMs: number = ECOSYSTEM_SSO_TTL_MS,
+  extra?: { orgId?: string; role?: string }
 ): string {
   if (!secret || secret.length < 16) {
     throw new Error('ECOSYSTEM_SSO_SECRET ausente o demasiado corto (mínimo 16 caracteres)')
@@ -43,6 +46,8 @@ export function signEcosystemToken(
     jti: randomBytes(16).toString('hex'),
     iat: nowMs,
     exp: nowMs + ttlMs,
+    ...(extra?.orgId ? { orgId: extra.orgId } : {}),
+    ...(extra?.role ? { role: extra.role } : {}),
   }
   const body = `v1.${Buffer.from(JSON.stringify(payload)).toString('base64url')}`
   const mac = createHmac('sha256', secret).update(body).digest()
@@ -56,7 +61,8 @@ export type EcosystemVerification =
 export function verifyEcosystemToken(
   token: string,
   secret: string | undefined,
-  nowMs: number = Date.now()
+  nowMs: number = Date.now(),
+  expectedOrgId?: string
 ): EcosystemVerification {
   if (!secret) return { ok: false, reason: 'ECOSYSTEM_SSO_SECRET no configurado (ruta deshabilitada)' }
   const parts = typeof token === 'string' ? token.split('.') : []
@@ -82,6 +88,9 @@ export function verifyEcosystemToken(
     return { ok: false, reason: 'payload inválido' }
   }
   if (payload.exp <= nowMs) return { ok: false, reason: 'token expirado' }
+  if (expectedOrgId && payload.orgId && payload.orgId !== expectedOrgId) {
+    return { ok: false, reason: 'organización no autorizada' }
+  }
   return { ok: true, payload }
 }
 

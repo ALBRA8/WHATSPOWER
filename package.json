@@ -15,7 +15,8 @@
     "waits:run": "node --experimental-strip-types scripts/run-waits.ts",
     "tsc": "tsc --noEmit -p tsconfig.json",
     "security:scan": "node scripts/scan-secrets.mjs",
-    "security:scan:history": "node scripts/scan-secrets.mjs --history"
+    "security:scan:history": "node scripts/scan-secrets.mjs --history",
+    "check:pii": "node scripts/check-pii.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.15",

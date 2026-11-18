@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-11-17 — Higiene PII y blindaje de SSO Ecosistema
+
+- **`fix(pii)`**:
+  - **Guardián de PII (`scripts/check-pii.mjs`)**: Implementación del script de auditoría estricta para números reales y nombres en archivos rastreados; añadido `npm run check:pii`.
+  - **Integración en CI (`.github/workflows/ci.yml`)**: Validación automática en el pipeline de CI contra regresiones de datos personales en el repositorio público.
+- **`security(sso)`**:
+  - Endurecimiento de `/studio/login-ecosystem` en modo producción: rechazo incondicional con HTTP 403 cuando `NODE_ENV=production` y `DEMO_MODE=false`.
+  - Inclusión de validación multi-tenant en el token HMAC y revocación en `productionConfigProblems`. Suite: **324/324 PASS**.
+
 ## 2026-11-17 — Acceso directo al ecosistema (SSO de un solo uso)
 
 - **`feat(studio)` (84d7232)**: `GET /studio/login-ecosystem` canjea enlaces SSO emitidos por el

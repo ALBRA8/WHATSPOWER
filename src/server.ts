@@ -339,6 +339,25 @@ export function createAgenticServer(options?: {
     // para reintentar desde el CRM: jamás un JSON crudo ni un body vacío.
     // ==========================================================
     if (req.method === 'GET' && url.pathname === '/studio/login-ecosystem') {
+      if (process.env.NODE_ENV === 'production') {
+        console.warn(`[Seguridad 2A ALERTA] Intento de login-ecosystem en PRODUCCIÓN (IP: ${clientIp(req)})`)
+        res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(renderEcosystemErrorHtml({
+          title: 'Acceso Prohibido en Producción',
+          detail: 'El acceso directo SSO del ecosistema está estrictamente restringido a entornos de prueba/desarrollo y no se permite en producción.',
+        }))
+        return
+      }
+      const demoEnabled = String(process.env.DEMO_MODE || '').toLowerCase() === 'true'
+      if (!demoEnabled) {
+        console.warn(`[Seguridad 2A ALERTA] Intento de login-ecosystem con DEMO_MODE inactivo (IP: ${clientIp(req)})`)
+        res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(renderEcosystemErrorHtml({
+          title: 'Modo Demo No Habilitado',
+          detail: 'El acceso directo SSO del ecosistema requiere DEMO_MODE=true.',
+        }))
+        return
+      }
       const ssoSecret = process.env.ECOSYSTEM_SSO_SECRET
       if (!ssoSecret) {
         const copy = ecosystemErrorCopy('ECOSYSTEM_SSO_SECRET no configurado (ruta deshabilitada)', false)
@@ -354,7 +373,8 @@ export function createAgenticServer(options?: {
         }))
         return
       }
-      const verdict = verifyEcosystemToken(String(url.searchParams.get('token') || ''), ssoSecret)
+      const requestedOrg = url.searchParams.get('orgId') || undefined
+      const verdict = verifyEcosystemToken(String(url.searchParams.get('token') || ''), ssoSecret, Date.now(), requestedOrg)
       if (!verdict.ok || !ecosystemJti.claim(verdict.payload.jti)) {
         const jtiUsed = verdict.ok // verdict.ok=true aquí significa que el jti ya se había canjeado
         console.warn(`[Seguridad 2A ALERTA] Canje ecosystem rechazado: ${verdict.ok ? 'jti ya utilizado' : verdict.reason} (IP: ${req.socket.remoteAddress})`)
